@@ -1,10 +1,14 @@
 import serial
 import time
 import json
+import queue
+import threading
+import subprocess
+
 
 class Rover:
     """
-    Simple high-level controller for an ESP32-based UGV rover.
+    Simple high-level controller for an ESP32-selfd UGV rover.
 
     Supports movement commands like forward, backward, left, right
     with configurable distance (m) and speed (slow/medium/fast).
@@ -15,12 +19,44 @@ class Rover:
         time.sleep(2)  # wait for the serial connection to initialize
         self.speeds = {'slow': 0.2, 'medium': 0.4, 'fast': 0.7}
         self.last_status = {}  # Store last received status data
+        self.command_queue = queue.Queue()
+        self.command_thread = threading.Thread(target=self.process_commands, daemon=True)
+        self.command_thread.start()
         print(f"[Rover] Connected on {port} at {baudrate} baud.")
+        
+    def _voltage_to_percentage(voltage: float | None) -> int:
+        """Convert a battery voltage reading to a percentage."""
+
+        if voltage is None:
+            return 0
+
+        # Heuristic mapping for a 3S LiPo pack commonly used on the rover.
+        empty_voltage = 9.0
+        full_voltage = 12.6
+
+        percent = (voltage - empty_voltage) / (full_voltage - empty_voltage)
+        percent = max(0.0, min(1.0, percent))
+        return int(round(percent * 100))
 
     def _send(self, L, R):
         """Send a single JSON movement command to the rover."""
         cmd = f'{{"T":1,"L":{L:.2f},"R":{R:.2f}}}\r\n'
         self.ser.write(cmd.encode())
+        
+    def send_command(self, data):
+        self.command_queue.put(data)
+        
+    def process_commands(self):
+        while True:
+            data = self.command_queue.get()
+            self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
+            
+    def base_json_ctrl(self, input_json):
+        self.send_command(input_json)
+            
+    def gimbal_emergency_stop(self):
+        data = {"T":0}
+        self.send_command(data)
 
     def _stop(self):
         """Send stop command."""
@@ -70,6 +106,47 @@ class Rover:
         """Manually stop the rover."""
         self._stop()
         print("[Rover] Emergency stop.")
+        
+    def gimbal_ctrl(self, input_x, input_y, input_speed, input_acceleration):
+        data = {"T":133,"X":input_x,"Y":input_y,"SPD":input_speed,"ACC":input_acceleration}
+        self.send_command(data)
+
+    def gimbal_ctrl_sync(self, input_x, input_y, input_speed, input_acceleration):
+        """Send gimbal command synchronously (bypass queue)."""
+        data = {"T":133,"X":input_x,"Y":input_y,"SPD":input_speed,"ACC":input_acceleration}
+        print(f"[Rover] Sending gimbal command: {json.dumps(data)}")
+        self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
+        time.sleep(0.01)
+    
+    def gimbal_self_ctrl(self, input_x, input_y, input_speed):
+        data = {"T":141,"X":input_x,"Y":input_y,"SPD":input_speed}
+        self.send_command(data)
+    
+    def gimbal_unlock(self):
+        """
+        Send T:135 (CMD_GIMBAL_CTRL_STOP) to unlock/reset gimbal servos.
+        This should be called before sending position commands if gimbal isn't responding.
+        """
+        data = '{"T":135}\n'
+        self.ser.write(data.encode("utf-8"))
+        time.sleep(0.1)
+    
+    def gimbal_ctrl_move(self, input_x, input_y, input_speed_x=300, input_speed_y=300):
+        """
+        Send gimbal move command (T:134 CMD_GIMBAL_CTRL_MOVE).
+        This seems more reliable than T:133 for absolute positioning.
+        
+        Args:
+            input_x: Pan angle (-180 to 180, 0=center, negative=left, positive=right)
+            input_y: Tilt angle (-30 to 90, 0=forward, positive=up)
+            input_speed_x: Pan movement speed (1-2500, default 300)
+            input_speed_y: Tilt movement speed (1-2500, default 300)
+        """
+        data = {"T":134,"X":input_x,"Y":input_y,"SX":input_speed_x,"SY":input_speed_y}
+        print(f"[Rover] Sending gimbal move command: {json.dumps(data)}")
+        self.ser.write((json.dumps(data) + '\n').encode("utf-8"))
+        time.sleep(0.01)
+
     
     def set_camera_servo(self, pan=90, tilt=15):
         """
@@ -85,8 +162,77 @@ class Rover:
         cmd = f'{{"T":133,"X":{pan},"Y":{tilt},"SPD":0,"ACC":0}}\r\n'
         self.ser.write(cmd.encode())
         time.sleep(0.05)  # Small delay for servo movement
+        
+    def nod(self, times: int = 3, center_tilt: int = 15, delta: int = 15,
+            pan: int = 90, delay: float = 0.35):
+        """
+        Perform a nodding motion with the camera gimbal.
 
-    def display_text(self, line_num, text):
+        Args:
+            times: how many nod cycles
+            center_tilt: neutral tilt angle (default ~looking forward)
+            delta: how much to move up/down from center (degrees)
+            pan: pan angle to keep during nod (default center)
+            delay: pause between movements (seconds)
+        """
+        # Clamp angles
+        center_tilt = max(0, min(180, int(center_tilt)))
+        delta = max(0, int(delta))
+
+        up = max(0, min(180, center_tilt + delta))
+        down = max(0, min(180, center_tilt - delta))
+
+        # Go to neutral first
+        self.set_camera_servo(pan=pan, tilt=center_tilt)
+        time.sleep(0.4)
+
+        for _ in range(times):
+            # look up
+            self.set_camera_servo(pan=pan, tilt=up)
+            time.sleep(delay)
+            # look down
+            self.set_camera_servo(pan=pan, tilt=down)
+            time.sleep(delay)
+
+        # back to neutral
+        self.set_camera_servo(pan=pan, tilt=center_tilt)
+
+    def yes_nod(self, repetitions=3, nod_speed=0, pause_duration=0.5):
+        """
+        Perform a 'yes' nodding animation with the pan-tilt mechanism.
+        
+        Parameters:
+        - repetitions: Number of times to nod (default: 3)
+        - nod_speed: Speed of the nodding motion (0 = position control, default: 0)
+        - pause_duration: Pause time between nods in seconds (default: 0.5)
+        """
+        
+        # Reset to center position first
+        print("Resetting to center position...")
+        self.gimbal_ctrl(0, 0, nod_speed, 0)  # Use actual center values from set_camera_servo
+        time.sleep(pause_duration*4)
+        
+        print(f"Starting 'yes' nod animation ({repetitions} repetitions)...")
+        
+        for i in range(repetitions):
+            # Nod down (tilt forward)
+            print(f"  Nod {i+1}: Looking down...")
+            self.gimbal_ctrl(0, -45, nod_speed, 0)  # Pan center, tilt down
+            time.sleep(pause_duration)
+            
+            # Nod up (tilt back)
+            print(f"  Nod {i+1}: Looking up...")
+            self.gimbal_ctrl(0, 45, nod_speed, 0)  # Pan center, tilt up
+            time.sleep(pause_duration)
+        
+        # Return to center position
+        print("Returning to center position...")
+        self.gimbal_ctrl_sync(0, 0, nod_speed, 0)  # Back to forward-looking position
+        time.sleep(pause_duration*2)
+        
+        print("Yes nod animation complete!")
+
+    def display_text(self, input_line, input_text):
         """
         Display custom text on the OLED screen.
         
@@ -96,15 +242,13 @@ class Rover:
             line_num (int): Line number 0-3 (top to bottom)
             text (str): Text to display on the line
         """
-        if not 0 <= line_num <= 3:
-            print(f"[Rover] Invalid line number {line_num}. Must be 0-3.")
+        if not 0 <= input_line <= 3:
+            print(f"[Rover] Invalid line number {input_line}. Must be 0-3.")
             return
         
         # Truncate text if too long (max ~21 chars per line for 128px width)
-        text = str(text)[:21]
-        cmd = f'{{"T":3,"lineNum":{line_num},"Text":"{text}"}}\r\n'
-        self.ser.write(cmd.encode())
-        time.sleep(0.01)
+        data = {"T":3,"lineNum":input_line,"Text":input_text}
+        self.send_command(data)
     
     def display_multiline(self, lines):
         """
@@ -121,12 +265,52 @@ class Rover:
     
     def display_reset(self):
         """
-        Reset the OLED display to default mode.
-        Shows system info like WiFi status and voltage.
+        Reset OLED to ROVY's custom status screen.
+        Shows:
+        line 0: ROVY
+        line 1: battery %
+        line 2: WiFi SSID
+        line 3: IP address
         """
-        cmd = '{"T":-3}\r\n'
-        self.ser.write(cmd.encode())
-        print("[Rover] Display reset to default mode.")
+        # --- Battery ---
+        try:
+            status = self.get_status()
+            voltage = status.get('voltage', 0.0)
+            battery_line = f"Bat: {self._voltage_to_percentage(voltage)}%"
+        except:
+            battery_line = "Bat: ---%"
+
+        # --- WiFi SSID ---
+        try:
+            ssid = subprocess.check_output(["iwgetid", "-r"]).decode().strip()
+            if not ssid:
+                ssid = "no wifi"
+        except:
+            ssid = "no wifi"
+
+        # --- IP address ---
+        try:
+            ip = subprocess.check_output(["hostname", "-I"]).decode().strip().split()[0]
+        except:
+            ip = "no ip"
+
+        # --- Display all lines ---
+        lines = [
+            "ROVY",
+            battery_line,
+            f"WiFi: {ssid}",
+            f"IP: {ip}",
+        ]
+
+        self.display_multiline(lines)
+        print("[Rover] Display reset → custom ROVY screen.")
+
+        
+    def lights_ctrl(self, pwmA, pwmB):
+        data = {"T":132,"IO4":pwmA,"IO5":pwmB}
+        self.send_command(data)
+        self.self_light_status = pwmA
+        self.head_light_status = pwmB
     
     def read_feedback(self):
         """
@@ -153,7 +337,7 @@ class Rover:
                 if line:
                     data = json.loads(line)
                     # Update last status cache
-                    if data.get('T') == 650:  # Base info feedback
+                    if data.get('T') == 1001:  # self info feedback
                         self.last_status = data
                     return data
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -163,7 +347,7 @@ class Rover:
     
     def get_status(self):
         """
-        Get the latest rover status.
+        Get the latest rover status by requesting fresh data.
         
         Returns dict with keys like:
         - voltage: Battery voltage in volts
@@ -171,11 +355,25 @@ class Rover:
         - left_speed, right_speed: Wheel speeds
         - roll, pitch, yaw: IMU orientation
         """
-        # Try to get fresh data
-        feedback = self.read_feedback()
+        # Request status update from rover
+        cmd = '{"T":130}\r\n'
+        self.ser.write(cmd.encode())
         
-        # Use last known status or fresh feedback
-        status_data = feedback if feedback and feedback.get('T') == 650 else self.last_status
+        # Wait a bit for response
+        time.sleep(0.5)
+        
+        # Try to read fresh feedback (with multiple attempts)
+        max_attempts = 5
+        for _ in range(max_attempts):
+            feedback = self.read_feedback()
+            if feedback and feedback.get('T') == 1001:
+                # Got fresh self info feedback
+                self.last_status = feedback
+                break
+            time.sleep(0.02)  # Small delay between read attempts
+        
+        # Use last known status (either fresh or cached)
+        status_data = self.last_status
         
         # Parse into friendly format
         status = {
@@ -188,7 +386,30 @@ class Rover:
             'yaw': status_data.get('y', 0.0),
         }
         return status
+    
+    def change_breath_light_flag(self, input_cmd):
+        self.breath_light_flag = input_cmd;
 
+
+    def breath_light(self, input_time):
+        self.change_breath_light_flag(True)
+        breath_start_time = time.monotonic()
+        while time.monotonic() - breath_start_time < input_time:
+            for i in range(0, 128, 10):
+                if not self.breath_light_flag:
+                    self.lights_ctrl(0, 0)
+                    return
+                self.lights_ctrl(i, 128-i)
+                time.sleep(0.1)
+            for i in range(0, 128, 10):
+                if not self.breath_light_flag:
+                    self.lights_ctrl(0, 0)
+                    return
+                self.lights_ctrl(128-i, i)
+            time.sleep(0.1)
+        self.lights_ctrl(0, 0)
+    
+    
     def cleanup(self):
         """Release serial port safely."""
         self._stop()

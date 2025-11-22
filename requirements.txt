@@ -85,6 +85,18 @@ sentence-transformers==5.1.2
 protobuf==4.25.8
 
 # ============================================================================
+# Face Recognition - High Accuracy (InsightFace ArcFace)
+# ============================================================================
+
+# InsightFace for state-of-the-art face recognition (ArcFace model)
+insightface==0.7.3
+
+# ONNX Runtime for efficient model inference (supports CUDA on Jetson)
+onnxruntime-gpu==1.18.0
+# Alternative: onnxruntime (CPU-only) if GPU version doesn't work
+# onnxruntime==1.18.0
+
+# ============================================================================
 # Notes:
 # ============================================================================
 # - Some packages may have system-level dependencies (e.g., PyAudio requires

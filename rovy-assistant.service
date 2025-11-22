@@ -11,7 +11,7 @@ Group=jetson
 WorkingDirectory=/home/jetson/rovy
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 /home/jetson/rovy/smart_assistant.py --no-wake-word
+ExecStart=/usr/bin/python3 /home/jetson/rovy/smart_assistant.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

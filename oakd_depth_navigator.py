@@ -1,6 +1,7 @@
 """
 Oak-D Depth-based Navigator
 Uses stereo depth information for precise obstacle detection
+Also supports person detection using MobileNet-SSD
 """
 import depthai as dai
 import cv2
@@ -10,18 +11,20 @@ import random
 
 class OakDDepthCamera:
     """
-    Oak-D camera with stereo depth for 3D perception.
+    Oak-D camera with stereo depth for 3D perception and person detection.
     """
     
-    def __init__(self, resolution=(640, 480)):
+    def __init__(self, resolution=(640, 480), enable_person_detection=False):
         self.resolution = resolution
         self.device = None
         self.rgb_queue = None
         self.depth_queue = None
+        self.detection_queue = None
         self.pipeline = None
+        self.enable_person_detection = enable_person_detection
         
     def start(self):
-        """Start camera with RGB and depth streams."""
+        """Start camera with RGB and depth streams, and optionally person detection."""
         if self.device is None:
             self.pipeline = dai.Pipeline()
             
@@ -41,8 +44,17 @@ class OakDDepthCamera:
             monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
             monoRight.setBoardSocket(dai.CameraBoardSocket.RIGHT)
             
-            # Stereo config
-            stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+            # Stereo config - use best available preset
+            # Try different preset modes based on depthai version
+            if hasattr(dai.node.StereoDepth.PresetMode, 'HIGH_ACCURACY'):
+                stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+            elif hasattr(dai.node.StereoDepth.PresetMode, 'FAST_ACCURACY'):
+                stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_ACCURACY)
+            else:
+                stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+            
+            # Align depth to RGB camera for spatial detection (fixes warning)
+            stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
             stereo.setLeftRightCheck(True)
             stereo.setExtendedDisparity(False)
             stereo.setSubpixel(False)
@@ -61,12 +73,56 @@ class OakDDepthCamera:
             xout_depth.setStreamName("depth")
             stereo.depth.link(xout_depth.input)
             
+            # Person Detection (YOLOv8 Spatial)
+            if self.enable_person_detection:
+                try:
+                    import os
+                    
+                    # Use YOLOv8 model from capstone (proven to work!)
+                    blob_path = os.path.join(os.path.dirname(__file__), "models", "yolov8n_coco_640x352.blob")
+                    
+                    if not os.path.exists(blob_path):
+                        print(f"[Oak-D] ⚠️  YOLOv8 model not found at {blob_path}")
+                        print("[Oak-D] Continuing without person detection...")
+                        self.enable_person_detection = False
+                    else:
+                        # Create YOLOv8 Spatial Detection Network (with depth)
+                        detectionNetwork = self.pipeline.create(dai.node.YoloSpatialDetectionNetwork)
+                        detectionNetwork.setBlobPath(blob_path)
+                        detectionNetwork.setConfidenceThreshold(0.4)
+                        detectionNetwork.setNumClasses(80)  # COCO has 80 classes
+                        detectionNetwork.setCoordinateSize(4)
+                        detectionNetwork.setIouThreshold(0.5)
+                        detectionNetwork.setDepthLowerThreshold(100)  # 100mm minimum
+                        detectionNetwork.setDepthUpperThreshold(4000)  # 4m maximum
+                        detectionNetwork.input.setBlocking(False)
+                        
+                        # Link RGB camera and depth to detection network
+                        camRgb.preview.link(detectionNetwork.input)
+                        stereo.depth.link(detectionNetwork.inputDepth)
+                        
+                        # Detection output
+                        xout_detection = self.pipeline.create(dai.node.XLinkOut)
+                        xout_detection.setStreamName("detections")
+                        detectionNetwork.out.link(xout_detection.input)
+                        
+                        print(f"[Oak-D] ✅ YOLOv8 person detection enabled (spatial + depth)")
+                    
+                except Exception as e:
+                    print(f"[Oak-D] ⚠️  Could not load person detection: {e}")
+                    print("[Oak-D] Continuing without person detection...")
+                    self.enable_person_detection = False
+            
             # Start device
             self.device = dai.Device(self.pipeline)
             self.rgb_queue = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
             self.depth_queue = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
             
-            print("[Oak-D Depth] Camera started with stereo depth")
+            if self.enable_person_detection:
+                self.detection_queue = self.device.getOutputQueue(name="detections", maxSize=4, blocking=False)
+                print("[Oak-D] Camera started with stereo depth + person detection")
+            else:
+                print("[Oak-D Depth] Camera started with stereo depth")
     
     def capture_frames(self):
         """
@@ -85,6 +141,100 @@ class OakDDepthCamera:
         depth_frame = depth_msg.getFrame()
         
         return rgb_frame, depth_frame
+    
+    def detect_person(self, debug=False):
+        """
+        Detect persons in the camera view using YOLOv8.
+        
+        Args:
+            debug: If True, print all detections for debugging
+        
+        Returns:
+            list: List of person detections. Each detection is a dict with:
+                  - 'bbox': (x, y, w, h) bounding box (normalized 0-1)
+                  - 'confidence': detection confidence (0-1)
+                  - 'center': (x, y) center of bounding box
+                  - 'depth': distance in millimeters (if spatial detection available)
+            Returns empty list if no persons detected or detection not enabled.
+        """
+        if not self.enable_person_detection or self.detection_queue is None:
+            return []
+        
+        detections = []
+        
+        try:
+            # Get latest detections (wait up to 100ms for data)
+            det_msg = self.detection_queue.get() if hasattr(self.detection_queue, 'get') else self.detection_queue.tryGet()
+            
+            if det_msg is None:
+                if debug:
+                    print("[Oak-D Debug] No detection message available")
+                return []
+            
+            # YOLO COCO dataset: Class 0 is 'person'
+            PERSON_CLASS_ID = 0
+            
+            if debug and len(det_msg.detections) > 0:
+                print(f"[Oak-D Debug] Got {len(det_msg.detections)} total detections")
+            
+            for detection in det_msg.detections:
+                if debug:
+                    print(f"[Oak-D Debug] Detection: label={detection.label}, confidence={detection.confidence:.2f}")
+                
+                # Filter for person class only
+                if detection.label == PERSON_CLASS_ID:
+                    # Normalize coordinates (detection gives normalized 0-1 coordinates)
+                    x = detection.xmin
+                    y = detection.ymin
+                    w = detection.xmax - detection.xmin
+                    h = detection.ymax - detection.ymin
+                    
+                    # Calculate center
+                    center_x = x + w / 2
+                    center_y = y + h / 2
+                    
+                    # Get spatial coordinates (depth) if available
+                    depth_mm = None
+                    if hasattr(detection, 'spatialCoordinates'):
+                        depth_mm = detection.spatialCoordinates.z  # Z is depth in millimeters
+                    
+                    detections.append({
+                        'bbox': (x, y, w, h),
+                        'confidence': detection.confidence,
+                        'center': (center_x, center_y),
+                        'depth': depth_mm
+                    })
+            
+            if detections:
+                print(f"[Oak-D] 👤 Detected {len(detections)} person(s)")
+            elif debug:
+                print("[Oak-D Debug] No person detections in this frame")
+            
+        except Exception as e:
+            print(f"[Oak-D] ⚠️  Detection error: {e}")
+        
+        return detections
+    
+    def get_person_direction(self, person_bbox):
+        """
+        Determine which direction a detected person is relative to camera center.
+        
+        Args:
+            person_bbox: Bounding box (x, y, w, h) in normalized coordinates (0-1)
+        
+        Returns:
+            str: 'center', 'left', or 'right'
+        """
+        x, y, w, h = person_bbox
+        center_x = x + w / 2
+        
+        # Divide frame into 3 regions
+        if center_x < 0.33:
+            return 'left'
+        elif center_x > 0.67:
+            return 'right'
+        else:
+            return 'center'
     
     def close(self):
         """Clean up."""
