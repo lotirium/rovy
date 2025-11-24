@@ -24,6 +24,10 @@ class Rover:
         self.command_thread.start()
         print(f"[Rover] Connected on {port} at {baudrate} baud.")
         
+        # Turn off flashlights on startup
+        self.lights_ctrl(0, 0)
+        print("[Rover] Flashlights turned off.")
+        
     def _voltage_to_percentage(voltage: float | None) -> int:
         """Convert a battery voltage reading to a percentage."""
 

@@ -5,7 +5,8 @@ from rover_controller import Rover
 
 base = Rover('/dev/ttyACM0', 115200)
 
-threading.Thread(target=lambda: base.breath_light(20), daemon=True).start()
+# Breathing light disabled - lights stay off on startup
+# threading.Thread(target=lambda: base.breath_light(20), daemon=True).start()
 
 base.display_text(0, "ROVY")
 base.display_text(1, f"sbc_version: 0.93")
