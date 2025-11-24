@@ -1,6 +1,8 @@
 """
 Smart Assistant for Rover
-Integrates ReSpeaker mic array, speech recognition, and LLaVa vision-language model
+Integrates ReSpeaker mic array, speech recognition, and dual model system:
+- Gemma for text/chat tasks (fast, lightweight)
+- Phi-Vision for image understanding
 """
 import os
 import sys
@@ -15,6 +17,9 @@ import json
 import tempfile
 import wave
 from contextlib import contextmanager
+
+# Import dual model assistant
+from dual_model_assistant import DualModelAssistant
 
 # Suppress ALSA warnings
 os.environ['ALSA_CARD'] = 'ArrayUAC10'
@@ -1342,20 +1347,33 @@ class TextToSpeech:
         elif engine == 'piper':
             try:
                 from piper import PiperVoice
-                # Load LIBRITTS HIGH QUALITY - premium audiobook quality, most natural Piper voice
-                print("[TTS] Loading LIBRITTS HIGH QUALITY voice (premium natural voice)...")
-                voice_path = os.path.expanduser("~/.local/share/piper-voices/en_US-libritts-high.onnx")
-                # Fallback to lessac if libritts not available
-                if not os.path.exists(voice_path):
-                    voice_path = os.path.expanduser("~/.local/share/piper-voices/en_US-lessac-high.onnx")
-                    if not os.path.exists(voice_path):
-                        print(f"⚠️  High quality voice not found")
-                        print("⚠️  Falling back to espeak")
-                        self.engine = 'espeak'
-                        return
-                    print("[TTS] Using Lessac High (LibriTTS not found)")
-                else:
-                    print("[TTS] Using LibriTTS High (premium quality)")
+                # Load HFC MALE MEDIUM - clear, professional male voice for robot assistant
+                print("[TTS] Loading professional voice (HFC Male Medium)...")
+                
+                # Priority order: HFC Male as default, then fallbacks
+                voice_options = [
+                    ("~/.local/share/piper-voices/en_US-hfc_male-medium.onnx", "HFC Male Medium (professional)"),
+                    ("~/.local/share/piper-voices/en_US-danny-low.onnx", "Danny Low (most natural)"),
+                    ("~/.local/share/piper-voices/en_US-ryan-high.onnx", "Ryan High"),
+                    ("~/.local/share/piper-voices/en_US-libritts_r-medium.onnx", "LibriTTS_r Medium (improved)"),
+                ]
+                
+                voice_path = None
+                voice_name = None
+                for path, name in voice_options:
+                    full_path = os.path.expanduser(path)
+                    if os.path.exists(full_path):
+                        voice_path = full_path
+                        voice_name = name
+                        break
+                
+                if not voice_path:
+                    print(f"⚠️  No Piper voices found")
+                    print("⚠️  Falling back to espeak")
+                    self.engine = 'espeak'
+                    return
+                
+                print(f"[TTS] Using {voice_name}")
                 
                 self.piper_voice = PiperVoice.load(
                     voice_path,
@@ -1749,26 +1767,37 @@ class SmartAssistant:
     Smart assistant combining speech recognition, vision, and LLaVa.
     """
     
-    def __init__(self, camera=None, motor_controller=None, llava_model_path=None, llava_mmproj_path=None, print_only=False, weather_api_key=None):
+    def __init__(self, camera=None, motor_controller=None, text_model_path=None, vision_model_path=None, vision_mmproj_path=None, print_only=False, weather_api_key=None, llava_model_path=None, llava_mmproj_path=None):
         """
-        Initialize smart assistant.
+        Initialize smart assistant with dual model system.
         
         Args:
             camera: Camera object with capture_frames() method (e.g., OakDDepthCamera)
             motor_controller: Motor controller object for movement commands
-            llava_model_path: Path to LLaVa model
-            llava_mmproj_path: Path to LLaVa multimodal projector
+            text_model_path: Path to text model (Gemma) for chat/Q&A
+            vision_model_path: Path to vision model (Phi-Vision) for image understanding
+            vision_mmproj_path: Path to vision projector for Phi
             print_only: If True, print responses instead of speaking (no speakers)
+            weather_api_key: API key for weather information
+            llava_model_path: (deprecated, for compatibility) Maps to vision_model_path
+            llava_mmproj_path: (deprecated, for compatibility) Maps to vision_mmproj_path
         """
         self.motor_controller = motor_controller
         self.print_only = print_only
+        
+        # Handle legacy parameter names for backward compatibility
+        if llava_model_path is not None and vision_model_path is None:
+            vision_model_path = llava_model_path
+        if llava_mmproj_path is not None and vision_mmproj_path is None:
+            vision_mmproj_path = llava_mmproj_path
         
         # Initialize camera if not provided
         if camera is None:
             try:
                 from oakd_depth_navigator import OakDDepthCamera
                 print("[Assistant] Initializing Oak-D camera...")
-                self.camera = OakDDepthCamera(resolution=(640, 480))
+                # Use 640x352 to match YOLOv8 model resolution (avoids warnings)
+                self.camera = OakDDepthCamera(resolution=(640, 352), enable_person_detection=True)
                 self.camera.start()
                 print("[Assistant] ✅ Camera initialized")
             except Exception as e:
@@ -1779,34 +1808,22 @@ class SmartAssistant:
             self.camera = camera
         
         # Initialize components
-        print("[Assistant] Initializing smart assistant...")
-        
-        # Auto-detect model paths if not provided - ONLY LLaVA 7B
-        if llava_model_path is None:
-            possible_paths = [
-                "/home/jetson/.cache/llava-v1.5-7b-q4.gguf",
-                "/home/jetson/.cache/llava-v1.5-7b-q5.gguf",
-                "/home/jetson/models/llava-v1.5-7b-Q4_K_M.gguf",
-            ]
-            for path in possible_paths:
-                if os.path.exists(path):
-                    llava_model_path = path
-                    break
-        
-        if llava_mmproj_path is None:
-            possible_paths = [
-                "/home/jetson/.cache/llava-mmproj-fixed.gguf",
-                "/home/jetson/.cache/llava-mmproj-f16.gguf",
-                "/home/jetson/models/mmproj-model-f16.gguf",
-            ]
-            for path in possible_paths:
-                if os.path.exists(path) and os.path.getsize(path) > 1000:  # Not empty
-                    llava_mmproj_path = path
-                    break
+        print("[Assistant] Initializing smart assistant with dual model system...")
+        print("[Assistant] 💬 Text model: Gemma (fast chat/Q&A)")
+        print("[Assistant] 👁️  Vision model: Phi-Vision (image understanding)")
         
         # Disable Whisper for faster recognition - use Google Speech Recognition (cloud-based, much faster)
         self.respeaker = ReSpeakerInterface(use_whisper=False)
-        self.llava = LLaVaAssistant(llava_model_path, llava_mmproj_path)
+        
+        # Initialize dual model assistant (Gemma for text, Phi for vision)
+        # DualModelAssistant will auto-detect model paths if not provided
+        self.llava = DualModelAssistant(
+            text_model_path=text_model_path,
+            vision_model_path=vision_model_path,
+            vision_mmproj_path=vision_mmproj_path,
+            lazy_load_vision=True  # Load vision model only when needed
+        )
+        
         # Use piper for natural human voice, falls back to espeak if piper unavailable
         self.tts = TextToSpeech(engine='print' if print_only else 'piper', print_only=print_only)
         # Real-time information helper
@@ -1839,8 +1856,8 @@ class SmartAssistant:
         self.auto_nav_process = None
         self.auto_nav_script_path = os.path.join(os.path.dirname(__file__), 'depth_llava_nav.py')
         
-        # Face recognition
-        self.face_recognition_service = None
+        # Face recognition - use simple FaceRecognizer (ageitgey/face_recognition library)
+        self.face_recognizer = None
         self.recognized_person = None  # Store the last recognized person's name
         self._initialize_face_recognition()
         
@@ -1849,13 +1866,9 @@ class SmartAssistant:
             print("[Assistant] 💡 Running in print-only mode (no speakers)")
     
     def _initialize_face_recognition(self):
-        """Initialize face recognition service."""
+        """Initialize face recognition using ageitgey/face_recognition library."""
         try:
-            from api.app.face_recognition_service import FaceRecognitionService, INSIGHTFACE_AVAILABLE
-            
-            if not INSIGHTFACE_AVAILABLE:
-                print("[Assistant] ⚠️  Face recognition not available (InsightFace not installed)")
-                return
+            from face_recognizer import FaceRecognizer
             
             # Get known faces directory
             known_faces_dir = os.path.join(os.path.dirname(__file__), "known-faces")
@@ -1863,18 +1876,15 @@ class SmartAssistant:
                 print(f"[Assistant] ⚠️  Known faces directory not found: {known_faces_dir}")
                 return
             
-            self.face_recognition_service = FaceRecognitionService(
-                known_faces_dir=known_faces_dir,
-                model_name="arcface_r100_v1",
-                threshold=0.6,
-            )
+            self.face_recognizer = FaceRecognizer(known_dir=known_faces_dir)
             print("[Assistant] ✅ Face recognition initialized")
-            known_faces = self.face_recognition_service.get_known_faces()
-            if known_faces:
-                print(f"[Assistant] 📸 Loaded {len(known_faces)} known face(s): {', '.join(known_faces)}")
+            if self.face_recognizer.known_names:
+                print(f"[Assistant] 📸 Loaded {len(self.face_recognizer.known_names)} known face(s): {', '.join(self.face_recognizer.known_names)}")
         except Exception as e:
             print(f"[Assistant] ⚠️  Could not initialize face recognition: {e}")
-            self.face_recognition_service = None
+            import traceback
+            traceback.print_exc()
+            self.face_recognizer = None
     
     def _recognize_user_face(self):
         """
@@ -1883,7 +1893,7 @@ class SmartAssistant:
         Returns:
             str: Recognized person's name or None
         """
-        if not self.face_recognition_service:
+        if not self.face_recognizer:
             return None
         
         if not self.camera:
@@ -1894,24 +1904,20 @@ class SmartAssistant:
             print("[Assistant] 📸 Capturing image for face recognition...")
             
             # Capture frame from camera
-            rgb_frame, _ = self.camera.capture_frames()
+            # OAK-D outputs BGR (not RGB despite setColorOrder setting)
+            bgr_frame, _ = self.camera.capture_frames()
             
-            # Recognize faces
-            recognitions = self.face_recognition_service.recognize_faces(
-                rgb_frame,
-                return_locations=True
-            )
+            # Recognize faces using ageitgey/face_recognition
+            recognitions = self.face_recognizer.recognize_face(bgr_frame, is_rgb=False)
             
             if not recognitions:
                 print("[Assistant] 👤 No face detected")
                 return None
             
-            # Get the best match (highest confidence)
-            best_match = max(recognitions, key=lambda r: r['confidence'])
-            name = best_match['name']
-            confidence = best_match['confidence']
+            # Get the best match - format: (name, confidence, bbox)
+            name, confidence, bbox = recognitions[0]
             
-            if name != "Unknown" and confidence >= 0.6:
+            if name != "Unknown":
                 print(f"[Assistant] 👤 Recognized: {name} (confidence: {confidence:.1%})")
                 self.recognized_person = name
                 return name
@@ -1936,7 +1942,7 @@ class SmartAssistant:
         Returns:
             bool: True if face was successfully added, False otherwise
         """
-        if not self.face_recognition_service:
+        if not self.face_recognizer:
             return False
         
         if not self.camera:
@@ -1944,10 +1950,11 @@ class SmartAssistant:
         
         try:
             # Capture current frame
-            rgb_frame, _ = self.camera.capture_frames()
+            # OAK-D outputs BGR (not RGB despite setColorOrder setting)
+            bgr_frame, _ = self.camera.capture_frames()
             
             # Add face to database
-            success = self.face_recognition_service.add_known_face(name, rgb_frame)
+            success = self.face_recognizer.add_face(name, bgr_frame)
             
             if success:
                 print(f"[Assistant] ✅ Added face for '{name}' to database")
@@ -2060,6 +2067,69 @@ class SmartAssistant:
                 # Small delay to avoid busy waiting
                 time.sleep(0.1)
     
+    def _check_camera_command(self, text):
+        """
+        Check if text contains a camera control command.
+        
+        Returns:
+            dict: {'action': str, 'pan': int, 'tilt': int} or None
+        """
+        if not text:
+            return None
+        
+        text_lower = text.lower()
+        
+        # Camera position commands
+        camera_commands = {
+            'center': ['look center', 'look straight', 'look forward', 'center camera', 'camera center'],
+            'up': ['look up', 'tilt up', 'camera up'],
+            'down': ['look down', 'tilt down', 'camera down'],
+            'left': ['look left', 'pan left', 'camera left'],
+            'right': ['look right', 'pan right', 'camera right'],
+        }
+        
+        # Check for commands
+        for action, keywords in camera_commands.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    # Map to pan/tilt values
+                    if action == 'center':
+                        return {'action': 'center', 'pan': 0, 'tilt': 0}
+                    elif action == 'up':
+                        return {'action': 'up', 'pan': 0, 'tilt': 40}
+                    elif action == 'down':
+                        return {'action': 'down', 'pan': 0, 'tilt': -20}
+                    elif action == 'left':
+                        return {'action': 'left', 'pan': -90, 'tilt': 0}
+                    elif action == 'right':
+                        return {'action': 'right', 'pan': 90, 'tilt': 0}
+        
+        return None
+    
+    def _execute_camera_control(self, command):
+        """Execute a camera control command."""
+        action = command['action']
+        pan = command['pan']
+        tilt = command['tilt']
+        
+        if not self.motor_controller:
+            return "I don't have camera control available."
+        
+        try:
+            print(f"[Camera] 📹 Moving camera: {action} (pan={pan}°, tilt={tilt}°)")
+            
+            # Move camera
+            self.motor_controller.gimbal_ctrl_move(pan, tilt, input_speed_x=500, input_speed_y=500)
+            
+            # Wait for movement
+            time.sleep(1.5)
+            
+            return f"Camera moved {action}"
+            
+        except Exception as e:
+            print(f"[Camera] ❌ Error: {e}")
+            return f"Camera control error: {str(e)}"
+    
     def _check_movement_command(self, text):
         """
         Check if text contains a movement command.
@@ -2089,7 +2159,7 @@ class SmartAssistant:
         
         # Movement command patterns
         commands = {
-            'forward': ['forward', 'go forward', 'move forward', 'go ahead', 'straight'],
+            'forward': ['forward', 'go forward', 'move forward', 'go ahead'],
             'backward': ['backward', 'back', 'go back', 'move back', 'reverse'],
             'left': ['left', 'turn left', 'go left'],
             'right': ['right', 'turn right', 'go right'],
@@ -2294,6 +2364,45 @@ class SmartAssistant:
             return ". ".join(result_messages) + "."
         else:
             return "Nothing to stop."
+    
+    def _handle_voice_localization(self):
+        """
+        Handle voice localization - turn camera to face the speaker.
+        Uses the exact logic from voice_localization_demo.py
+        
+        Returns:
+            str: Response message to speak
+        """
+        print("\n[Voice Localization] 🎯 Starting voice localization...")
+        
+        # Check if DOA is available
+        if not self.respeaker.doa_available:
+            return "I don't have voice localization available."
+        
+        # Check if motor controller is available
+        if not self.motor_controller:
+            return "I don't have camera control available."
+        
+        try:
+            # Import and use the exact logic from voice_localization_demo.py
+            from voice_localization import locate_speaker
+            
+            # Use the face_recognizer directly (already uses ageitgey/face_recognition)
+            result = locate_speaker(
+                respeaker=self.respeaker,
+                rover=self.motor_controller,
+                camera=self.camera,
+                face_recognizer=self.face_recognizer,
+                tts=None  # We'll speak the message ourselves
+            )
+            
+            return result['message']
+            
+        except Exception as e:
+            print(f"[Voice Localization] ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"Sorry, I had trouble with voice localization: {str(e)}"
     
     def process_question(self, question, use_vision=True, max_tokens=100, conversation_context=None):
         """
@@ -2653,6 +2762,23 @@ class SmartAssistant:
                         # Stay in conversation after recognition
                         continue
                     
+                    # Check for camera control commands first (before movement commands)
+                    camera_cmd = self._check_camera_command(question)
+                    if camera_cmd:
+                        # LED: Thinking/Processing
+                        self.respeaker.set_led('think')
+                        response = self._execute_camera_control(camera_cmd)
+                        total_time = time.time() - total_start
+                        
+                        print(f"[Assistant] 💬 Response: {response}")
+                        print(f"[Assistant] ⏱️  Total time: {total_time:.2f}s")
+                        # LED: Speaking response
+                        self.respeaker.set_led('speak')
+                        self.tts.speak(response)
+                        self.respeaker.set_led('off')
+                        # Stay in conversation after camera command
+                        continue
+                    
                     # Check for movement commands (faster than LLM)
                     movement_cmd = self._check_movement_command(question)
                     if movement_cmd:
@@ -2668,6 +2794,26 @@ class SmartAssistant:
                         self.tts.speak(response)
                         self.respeaker.set_led('off')
                         # Stay in conversation after movement command
+                        continue
+                    
+                    # Check for voice localization commands ("look at me")
+                    voice_loc_keywords = ['look at me', 'turn to me', 'face me', 'find me', 
+                                         'where am i', 'locate me', 'turn towards me']
+                    is_voice_localization = any(kw in question_lower for kw in voice_loc_keywords)
+                    
+                    if is_voice_localization:
+                        # LED: Processing
+                        self.respeaker.set_led('think')
+                        response = self._handle_voice_localization()
+                        total_time = time.time() - total_start
+                        
+                        print(f"[Assistant] 💬 Response: {response}")
+                        print(f"[Assistant] ⏱️  Total time: {total_time:.2f}s")
+                        # LED: Speaking response
+                        self.respeaker.set_led('speak')
+                        self.tts.speak(response)
+                        self.respeaker.set_led('off')
+                        # Stay in conversation after voice localization
                         continue
                     
                     # Check for vision-related keywords - be more specific to avoid false positives

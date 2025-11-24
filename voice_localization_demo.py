@@ -3,24 +3,14 @@
 Voice Localization Demo (Lightweight)
 Demonstrates using ReSpeaker DOA to locate voice and OAK-D to detect person
 No LLaVA - for faster testing!
+
+Note: Core logic has been extracted to voice_localization.py module for reuse
 """
 import time
-import cv2
 from smart_assistant import ReSpeakerInterface, TextToSpeech, WakeWordDetector
 from rover_controller import Rover
 from oakd_depth_navigator import OakDDepthCamera
 from face_recognizer import FaceRecognizer
-
-# ============================================================================
-# CALIBRATION CONFIGURATION
-# ============================================================================
-# Angle offset between ReSpeaker microphone and camera servo mounting positions
-# If your microphone is tilted/rotated relative to the camera, adjust this value
-# Example: If mic's 90° (left) should map to camera's 120°, set offset to 30
-MICROPHONE_TO_CAMERA_OFFSET = -121  # Degrees to add to DOA angle before converting to servo angle
-# Manual calibration based on two test points:
-# LEFT: Mic ~203° → Camera -90° (LEFT) ✅
-# RIGHT: Mic ~31° → Camera 90° (RIGHT) - adjusted offset to -121°
 
 def main():
     print("\n" + "="*70)
@@ -48,7 +38,7 @@ def main():
     from smart_assistant import ReSpeakerInterface, TextToSpeech, WakeWordDetector
     
     respeaker = ReSpeakerInterface(use_whisper=False)
-    tts = TextToSpeech(print_only=False)
+    tts = TextToSpeech(engine='piper', print_only=False)  # Use professional voice
     wake_detector = WakeWordDetector(device_index=respeaker.device_index)
     
     print("[Setup] Initializing face recognition...")
@@ -89,180 +79,42 @@ def main():
                 print("✅ Wake word detected! Capturing voice direction...")
                 tts.speak("Yes?")
                 
-                # Get voice direction - listen a bit to capture their voice direction
-                doa = respeaker.get_voice_direction(listen_duration=0.5)
+                # Use the reusable voice localization module
+                from voice_localization import locate_speaker
                 
-                if doa is not None:
-                    # Use the built-in locate_and_detect_person with voice-guided direction
-                    print(f"🎯 Voice detected at {doa}°, turning camera and scanning for person...")
+                result = locate_speaker(
+                    respeaker=respeaker,
+                    rover=rover,
+                    camera=camera,
+                    face_recognizer=face_recognizer,
+                    tts=tts
+                )
+                
+                # Show results
+                if result['success']:
+                    print("\n" + "-"*70)
+                    print("RESULTS:")
+                    print("-"*70)
+                    print(f"✅ Voice Direction: {result['doa']}° (0°=front, 90°=left, 180°=back, 270°=right)")
                     
-                    # Apply calibration offset for microphone mounting position
-                    calibrated_doa = (doa + MICROPHONE_TO_CAMERA_OFFSET) % 360
-                    if calibrated_doa != doa:
-                        print(f"   📐 Applying {MICROPHONE_TO_CAMERA_OFFSET}° offset: {doa}° → {calibrated_doa}°")
-                    
-                    # Get pan angle from voice direction
-                    servo_angles = respeaker.doa_to_servo_angles(calibrated_doa, tilt_angle=0)
-                    
-                    if servo_angles:
-                        # Turn towards voice
-                        pan = servo_angles['pan']  # Use direct servo angle (no inversion)
-                        print(f"   Turning to direction: {pan}°")
-                        
-                        # Try multiple tilt angles to find person with YOLOv8
-                        person_found = False
-                        found_tilt = 0
-                        tilt_angles = [0, 15, 30, 40]  # Start straight, then scan up
-                        
-                        for tilt in tilt_angles:
-                            print(f"   Scanning at tilt={tilt}°...")
-                            
-                            # Send movement command with timestamp
-                            start_time = time.time()
-                            print(f"   🔵 APPLE - Camera starting to move NOW")
-                            rover.gimbal_ctrl_move(pan, tilt, input_speed_x=500, input_speed_y=500)
-                            
-                            # Calculate wait time based on angle distance (for first move from center)
-                            if tilt == tilt_angles[0]:
-                                angle_distance = abs(pan)
-                                wait_time = 7.0 if angle_distance > 90 else 5.0
-                                print(f"   🟡 BANANA - Waiting {wait_time}s for pan movement ({angle_distance}°)...")
-                                time.sleep(wait_time)
-                                print(f"   🟢 CHERRY - Camera should be stopped after {wait_time}s wait")
-                            else:
-                                print(f"   🟡 BANANA - Waiting 1.5s for tilt change...")
-                                time.sleep(1.5)  # Subsequent tilt changes are smaller
-                                print(f"   🟢 CHERRY - Tilt should be complete")
-                            
-                            # Fast detection with 3 frame checks (camera warm-up)
-                            print(f"   🟣 DRAGON - Stabilizing 1.5s...")
-                            time.sleep(1.5)  # Longer stabilization
-                            print(f"   🔴 EAGLE - Checking 3 frames...")
-                            
-                            # OPTIMIZATION: Try 3 frames but stop early if confident detection found
-                            detections = None
-                            best_detections = []
-                            for check in range(3):
-                                time.sleep(0.3)  # Quick wait between frames
-                                current_detections = camera.detect_person(debug=(check == 0))
-                                
-                                if current_detections:
-                                    # Collect all detections across frames
-                                    best_detections.extend(current_detections)
-                                    print(f"      ✓ Detected in frame {check+1}/3")
-                                    
-                                    # OPTIMIZATION: If we found high-confidence detection, stop early
-                                    if current_detections[0]['confidence'] > 0.7:
-                                        detections = current_detections
-                                        print(f"      ✓ High confidence detection - stopping early")
-                                        break
-                            
-                            # Use best detection across all frames
-                            if not detections and best_detections:
-                                # Sort by confidence and use best one
-                                best_detections.sort(key=lambda x: x['confidence'], reverse=True)
-                                detections = [best_detections[0]]
-                            
-                            # Debug: Show what we found
-                            if detections:
-                                print(f"   [Debug] Found {len(detections)} detection(s):")
-                                for i, d in enumerate(detections):
-                                    depth_str = f"{d['depth']}mm" if d['depth'] else "no depth"
-                                    print(f"     #{i+1}: conf={d['confidence']:.2f}, {depth_str}")
-                            else:
-                                print(f"   No detections, trying next angle...")
-                            
-                            if detections:
-                                # Accept ANY person detection - no filtering!
-                                print(f"   ✅ Accepting detection without filtering")
-                                best = detections[0]
-                                person_found = True
-                                found_tilt = tilt
-                                conf = int(best['confidence'] * 100)
-                                elapsed = time.time() - start_time
-                                if best['depth']:
-                                    depth_m = best['depth'] / 1000
-                                    print(f"   ✅ [{time.strftime('%H:%M:%S')}] Person found! Confidence: {conf}%, Distance: {depth_m:.1f}m")
-                                else:
-                                    print(f"   ✅ [{time.strftime('%H:%M:%S')}] Person found! Confidence: {conf}%")
-                                print(f"   ⏱️  Total time for this angle: {elapsed:.1f}s")
-                                
-                                # Try face recognition on the detected person region
-                                print(f"   🔍 Recognizing face...")
-                                try:
-                                    rgb_frame, _ = camera.capture_frames()
-                                    # Convert RGB to BGR (face_recognition lib via capstone expects BGR)
-                                    bgr_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-                                    
-                                    # Get person bounding box and crop it with padding for face
-                                    bbox = best['bbox']  # (x, y, w, h) in normalized coords (0-1)
-                                    height, width = bgr_frame.shape[:2]
-                                    
-                                    # OPTIMIZATION: Add padding to focus on upper body (where face is)
-                                    # This reduces the search area and speeds up face detection
-                                    padding = 0.1  # 10% padding
-                                    x1 = max(0, int((bbox[0] - padding) * width))
-                                    y1 = max(0, int(bbox[1] * height))  # No padding on top - face is at top
-                                    x2 = min(width, int((bbox[0] + bbox[2] + padding) * width))
-                                    y2 = min(height, int((bbox[1] + bbox[3] * 0.6) * height))  # Only upper 60% of person
-                                    
-                                    # Crop person region (upper body focus)
-                                    person_roi = bgr_frame[y1:y2, x1:x2]
-                                    
-                                    if person_roi.size > 0:  # Make sure crop is valid
-                                        print(f"     [Debug] Cropped person ROI: {person_roi.shape}")
-                                        # Pass BGR frame to face_recognition (is_rgb=False)
-                                        recognized_faces = face_recognizer.recognize_face(person_roi, is_rgb=False)
-                                        if recognized_faces:
-                                            name, face_conf, face_bbox = recognized_faces[0]
-                                            if name != "Unknown":
-                                                print(f"   ✅ Recognized: {name} (confidence: {face_conf:.2f})")
-                                                tts.speak(f"Yes, I see you {name}!")
-                                            else:
-                                                print(f"   ⚠️  Face detected but not recognized (confidence too low)")
-                                                tts.speak("Yes, I see you!")
-                                        else:
-                                            print(f"   ⚠️  No face detected in person ROI")
-                                            tts.speak("Yes, I see you!")
-                                    else:
-                                        print(f"   ⚠️  Invalid person crop")
-                                        tts.speak("Yes, I see you!")
-                                except Exception as e:
-                                    print(f"   ⚠️  Face recognition error: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    tts.speak("Yes, I see you!")
-                                break
-                            
-                            if person_found:
-                                break
-                        
-                        if not person_found:
-                            print("   ⚠️  No person visually detected, but I heard your voice!")
-                            tts.speak("I heard you!")
-                        
-                        # Show results
-                        print("\n" + "-"*70)
-                        print("RESULTS:")
-                        print("-"*70)
-                        print(f"✅ Voice Direction: {doa}° (0°=front, 90°=left, 180°=back, 270°=right)")
-                        
+                    if result['pan'] is not None:
                         angle_map = {
                             -180: "FAR LEFT", -135: "BACK LEFT", -90: "LEFT", -45: "FRONT LEFT",
                             0: "CENTER", 45: "FRONT RIGHT", 90: "RIGHT", 135: "BACK RIGHT", 180: "FAR RIGHT"
                         }
-                        pan_desc = angle_map.get(pan, f"{pan}°")
-                        
-                        print(f"✅ Camera panned to: {pan_desc} ({pan}°)")
-                        if person_found:
-                            print(f"✅ Person detected at tilt={found_tilt}°")
+                        pan_desc = angle_map.get(result['pan'], f"{result['pan']}°")
+                        print(f"✅ Camera panned to: {pan_desc} ({result['pan']}°)")
+                    
+                    if result['person_found']:
+                        if result['recognized_name']:
+                            print(f"✅ Person detected and recognized as: {result['recognized_name']}")
                         else:
-                            print(f"⚠️  No person detected (scanned tilts: {tilt_angles}) - Acknowledged with 'I heard you!'")
-                        print("-"*70)
+                            print(f"✅ Person detected")
                     else:
-                        print("❌ Could not calculate servo position")
+                        print(f"⚠️  No person detected - Acknowledged with 'I heard you!'")
+                    print("-"*70)
                 else:
-                    print("❌ Could not determine voice direction")
+                    print(f"❌ {result['message']}")
                 
                 # Return camera to center
                 print("\n[Camera] Returning to center position...")

@@ -49,6 +49,9 @@ class FaceRecognizer:
         Returns:
             List of tuples: (name, confidence, (left, top, right, bottom))
         """
+        import time
+        total_start = time.time()
+        
         if not self.known_encodings:
             return []
             
@@ -58,25 +61,29 @@ class FaceRecognizer:
         else:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # OPTIMIZATION 1: Downsample image for faster face detection (2-3x speedup)
-        # Face detection is the slowest part - reducing resolution speeds it up significantly
+        # OPTIMIZATION 1: Downsample to 0.5x for faster processing
         scale_factor = 0.5  # Process at half resolution
         small_frame = cv2.resize(rgb_frame, (0, 0), fx=scale_factor, fy=scale_factor)
         
-        # OPTIMIZATION 2: Use HOG model (faster on CPU, Jetson Nano doesn't have strong GPU)
-        # HOG is much faster than CNN on Jetson Nano's CPU
-        # number_of_times_to_upsample=0 means don't look for small faces (faster)
-        face_locations = face_recognition.face_locations(small_frame, model="hog", number_of_times_to_upsample=0)
+        # OPTIMIZATION 2: Use CNN with GPU (fastest for full recognition!)
+        # Benchmark shows: CNN 0.5x GPU = 0.024s vs HOG 0.5x = 0.039s
+        # CNN with GPU at 0.5x scale is 40% faster than HOG!
+        detect_start = time.time()
+        face_locations = face_recognition.face_locations(small_frame, model="cnn", number_of_times_to_upsample=0)
+        detect_time = time.time() - detect_start
         
         if not face_locations:
-            print(f"     [Debug] No face locations found in frame")
+            print(f"     [Debug] No face locations found in frame (took {detect_time:.2f}s)")
             return []
         
-        print(f"     [Debug] Found {len(face_locations)} face(s) in frame")
+        print(f"     [Debug] Found {len(face_locations)} face(s) in frame (detection took {detect_time:.2f}s)")
         
         # OPTIMIZATION 3: Use fastest encoding (num_jitters=0 means no data augmentation)
         # num_jitters=1 is default, 0 is fastest but slightly less accurate
+        encode_start = time.time()
         face_encodings = face_recognition.face_encodings(small_frame, face_locations, num_jitters=0)
+        encode_time = time.time() - encode_start
+        print(f"     [Debug] Encoding took {encode_time:.2f}s")
 
         matches = []
         for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
@@ -102,8 +109,15 @@ class FaceRecognizer:
                     print(f"     [Debug] ⚠️ Distance {distance:.3f} > 0.6 threshold, treating as Unknown")
 
             # Scale face locations back to original size
-            matches.append((name, confidence, (int(left/scale_factor), int(top/scale_factor), 
-                                              int(right/scale_factor), int(bottom/scale_factor))))
+            top = int(top / scale_factor)
+            right = int(right / scale_factor)
+            bottom = int(bottom / scale_factor)
+            left = int(left / scale_factor)
             
+            matches.append((name, confidence, (left, top, right, bottom)))
+        
+        total_time = time.time() - total_start
+        print(f"     [Debug] Total face recognition took {total_time:.2f}s")
+        
         return matches
 
