@@ -248,26 +248,52 @@ export async function tryMdnsHostname(
 }
 
 /**
- * Combined discovery: tries mDNS first, then falls back to subnet scan.
+ * Known Tailscale IPs for ROVY robots.
+ * Add your robot's Tailscale IP here for automatic discovery.
+ */
+const KNOWN_TAILSCALE_IPS = [
+  "100.72.107.106",  // ROVY Pi
+];
+
+/**
+ * Try to reach robot via Tailscale IP.
+ */
+export async function tryTailscaleIps(
+  port: number = DEFAULT_PORT
+): Promise<DiscoveredRobot | null> {
+  for (const ip of KNOWN_TAILSCALE_IPS) {
+    const robot = await probeHost(ip, port);
+    if (robot) {
+      return robot;
+    }
+  }
+  return null;
+}
+
+/**
+ * Combined discovery: tries mDNS, Tailscale, then subnet scan.
  */
 export async function discoverRobots(
   options: DiscoveryOptions = {}
 ): Promise<DiscoveryResult> {
   const startTime = Date.now();
   const foundRobots: DiscoveredRobot[] = [];
+  const port = options.port || DEFAULT_PORT;
 
-  // Try mDNS first (fast if it works)
-  const mdnsRobot = await tryMdnsHostname("rovy.local", options.port);
+  // Get phone IP for context
+  let phoneIp: string | null = null;
+  try {
+    phoneIp = await Network.getIpAddressAsync();
+    if (phoneIp === "0.0.0.0") phoneIp = null;
+  } catch {}
+
+  // 1. Try mDNS first (fast if it works)
+  console.log("Trying mDNS discovery (rovy.local)...");
+  const mdnsRobot = await tryMdnsHostname("rovy.local", port);
   if (mdnsRobot) {
+    console.log("Found robot via mDNS:", mdnsRobot.ip);
     foundRobots.push(mdnsRobot);
     options.onProgress?.(1, 1, foundRobots);
-    
-    // Get phone IP for context
-    let phoneIp: string | null = null;
-    try {
-      phoneIp = await Network.getIpAddressAsync();
-    } catch {}
-
     return {
       robots: foundRobots,
       phoneIp,
@@ -277,7 +303,24 @@ export async function discoverRobots(
     };
   }
 
-  // Fall back to subnet scan
+  // 2. Try Tailscale IPs (works across networks)
+  console.log("Trying Tailscale discovery...");
+  const tailscaleRobot = await tryTailscaleIps(port);
+  if (tailscaleRobot) {
+    console.log("Found robot via Tailscale:", tailscaleRobot.ip);
+    foundRobots.push(tailscaleRobot);
+    options.onProgress?.(1, 1, foundRobots);
+    return {
+      robots: foundRobots,
+      phoneIp,
+      subnet: phoneIp ? getSubnet(phoneIp) : null,
+      scannedCount: 1,
+      durationMs: Date.now() - startTime,
+    };
+  }
+
+  // 3. Fall back to subnet scan
+  console.log("Falling back to subnet scan...");
   return discoverRobotsOnNetwork(options);
 }
 
