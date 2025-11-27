@@ -174,6 +174,15 @@ class DepthAICameraSource(CameraSource):
     def _start_pipeline(self) -> None:
         assert dai is not None  # For type checkers
 
+        # Log available devices
+        try:
+            available = dai.Device.getAllAvailableDevices()
+            LOGGER.info(f"📷 DepthAI: Found {len(available)} device(s)")
+            for dev in available:
+                LOGGER.info(f"  - Device: {dev.getMxId()}")
+        except Exception as e:
+            LOGGER.warning(f"Could not list DepthAI devices: {e}")
+
         # Reclaim any leaked device handles before bringing up a new pipeline.
         # Some DepthAI SDK builds keep devices alive after failures which causes
         # subsequent connections to report X_LINK_DEVICE_ALREADY_IN_USE.

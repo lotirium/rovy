@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=rovy
+Group=rovy
+SupplementaryGroups=video plugdev
 WorkingDirectory=/home/rovy/rovy_client/robot
 ExecStart=/bin/bash /home/rovy/rovy_client/robot/start.sh
 Restart=on-failure
