@@ -11,6 +11,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { useRobot } from '@/context/robot-provider';
+import { DEFAULT_CLOUD_URL } from '@/services/cloud-api';
 
 interface VoiceLogEntry {
   id: string;
@@ -53,7 +54,8 @@ export default function AgenticVoiceScreen() {
   const { baseUrl } = useRobot();
 
   const cameraWsUrl = useMemo(() => buildWebSocketUrl(baseUrl, '/camera/ws'), [baseUrl]);
-  const audioWsUrl = useMemo(() => buildWebSocketUrl(baseUrl, '/audio-stream'), [baseUrl]);
+  // Audio goes to PC cloud server, not Pi
+  const audioWsUrl = useMemo(() => buildWebSocketUrl(DEFAULT_CLOUD_URL, '/voice'), []);
 
   const cameraSocket = useRef<WebSocket | null>(null);
   const audioSocket = useRef<WebSocket | null>(null);
@@ -173,7 +175,7 @@ export default function AgenticVoiceScreen() {
     ws.onopen = () => {
       setIsAudioConnecting(false);
       setIsAudioConnected(true);
-      appendLog({ label: 'Voice link ready', message: 'Connected to robot audio-stream WebSocket.', tone: 'info' });
+      appendLog({ label: 'Voice link ready', message: 'Connected to cloud AI server for voice processing.', tone: 'info' });
     };
 
     ws.onmessage = (event) => {
@@ -249,7 +251,7 @@ export default function AgenticVoiceScreen() {
     ws.onclose = () => {
       setIsAudioConnected(false);
       setIsAudioConnecting(false);
-      appendLog({ label: 'Voice link closed', message: 'Robot closed the audio WebSocket.', tone: 'error' });
+      appendLog({ label: 'Voice link closed', message: 'Cloud AI server disconnected.', tone: 'error' });
     };
   }, [appendLog, audioWsUrl]);
 

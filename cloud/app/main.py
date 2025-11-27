@@ -687,6 +687,91 @@ async def json_control_websocket(websocket: WebSocket):
             pass
 
 
+@app.websocket("/voice")
+async def voice_websocket(websocket: WebSocket):
+    """WebSocket endpoint for voice interaction from mobile app.
+    
+    Receives: {"type": "audio_chunk", "encoding": "base64", "data": "..."}
+              {"type": "audio_end", "encoding": "base64", "sampleRate": 16000}
+    
+    Sends:    {"type": "status", "message": "..."}
+              {"type": "chunk_received"}
+              {"type": "audio_complete", "total_chunks": N}
+              {"type": "transcript", "text": "..."}
+              {"type": "response", "text": "...", "audio_base64": "..."}
+    """
+    await websocket.accept()
+    LOGGER.info("Voice WebSocket connected from mobile app")
+    
+    audio_chunks = []
+    
+    try:
+        await websocket.send_json({"type": "status", "message": "Voice connection ready"})
+        
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+            
+            if msg_type == "audio_chunk":
+                # Collect audio chunks
+                chunk_data = data.get("data", "")
+                audio_chunks.append(chunk_data)
+                await websocket.send_json({"type": "chunk_received"})
+                
+            elif msg_type == "audio_end":
+                # Process complete audio
+                total_chunks = len(audio_chunks)
+                await websocket.send_json({
+                    "type": "audio_complete",
+                    "total_chunks": total_chunks
+                })
+                
+                if total_chunks > 0:
+                    # Combine all chunks
+                    import base64
+                    full_audio_b64 = "".join(audio_chunks)
+                    audio_chunks = []  # Reset for next recording
+                    
+                    sample_rate = data.get("sampleRate", 16000)
+                    
+                    # Try to process with AI if available (PC only)
+                    try:
+                        # Check if we have AI modules (PC server)
+                        from speech import SpeechProcessor
+                        from ai import CloudAssistant
+                        import config
+                        
+                        # These would be loaded in the server
+                        # For now, just acknowledge receipt
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": f"Received {total_chunks} audio chunks. AI processing available on PC server."
+                        })
+                        
+                    except ImportError:
+                        # No AI modules - this is the Pi, not PC
+                        await websocket.send_json({
+                            "type": "status", 
+                            "message": f"Received {total_chunks} audio chunks. Connect to PC cloud server for AI processing."
+                        })
+                else:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": "No audio data received"
+                    })
+                    
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                
+    except Exception as exc:
+        LOGGER.debug("Voice WebSocket closed: %s", exc)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.get("/shot")
 async def single_frame() -> Response:
     """Serve a single JPEG frame without the additional camera namespace."""
