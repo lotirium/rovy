@@ -12,6 +12,16 @@ A FastAPI service that exposes discovery, telemetry, camera, and control endpoin
 
 ## Getting Started
 
+### Hardware Setup (OAK-D Camera)
+
+If you're using an OAK-D camera, you need to set up udev rules to allow non-root access to the device:
+
+```bash
+sudo ./scripts/setup-oakd-udev.sh
+```
+
+This only needs to be done once per system. After running this script, you may need to unplug and replug the OAK-D device.
+
 ### Installation
 
 Use the provided setup script to create a virtual environment and install the API along with its development dependencies:
