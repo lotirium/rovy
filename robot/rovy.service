@@ -15,6 +15,7 @@ StandardError=journal
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
+Environment=CAMERA_DEVICE=1
 
 [Install]
 WantedBy=multi-user.target

@@ -612,6 +612,59 @@ async def camera_websocket(websocket: WebSocket):
         except Exception:
             pass
 
+
+@app.websocket("/json")
+async def json_control_websocket(websocket: WebSocket):
+    """WebSocket endpoint for real-time motor/lights control via JSON commands.
+    
+    Command format:
+    - Movement: {"T": 1, "L": left_speed, "R": right_speed}
+    - Lights: {"T": 132, "IO4": pwm_value, "IO5": pwm_value}
+    """
+    await websocket.accept()
+    LOGGER.info("JSON control WebSocket connected")
+    
+    base_controller = _get_base_controller()
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            cmd_type = data.get("T", 0)
+            
+            if cmd_type == 1:  # Movement command
+                left_speed = float(data.get("L", 0))
+                right_speed = float(data.get("R", 0))
+                
+                if base_controller and hasattr(base_controller, "set_motor"):
+                    try:
+                        # Convert -1 to 1 range to motor values
+                        await anyio.to_thread.run_sync(
+                            base_controller.set_motor, left_speed, right_speed
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("Motor control failed: %s", exc)
+                        
+            elif cmd_type == 132:  # Lights command
+                io4 = int(data.get("IO4", 0))
+                io5 = int(data.get("IO5", 0))
+                
+                if base_controller and hasattr(base_controller, "lights_ctrl"):
+                    try:
+                        await anyio.to_thread.run_sync(
+                            base_controller.lights_ctrl, io4, io5
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("Lights control failed: %s", exc)
+                        
+    except Exception as exc:
+        LOGGER.debug("JSON WebSocket closed: %s", exc)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.get("/shot")
 async def single_frame() -> Response:
     """Serve a single JPEG frame without the additional camera namespace."""
