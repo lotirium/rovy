@@ -1001,7 +1001,7 @@ async def text_to_speech(request: dict):
 # Piper TTS for local speech on Pi
 _piper_voice = None
 PIPER_MODEL_PATH = "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx"
-AUDIO_DEVICE = "plughw:3,0"  # USB speaker
+AUDIO_DEVICE = "plughw:2,0"  # USB speaker (card 2: UACDemoV1.0)
 
 
 def _get_piper_voice():
