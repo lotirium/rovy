@@ -1117,10 +1117,17 @@ async def speak_text(request: dict):
 
 @app.get("/shot")
 async def single_frame() -> Response:
-    """Serve a single JPEG frame without the additional camera namespace."""
-
-    frame = oak_snapshot()
-    return Response(content=frame, media_type="image/jpeg")
+    """Serve a single JPEG frame from DepthAI/OAK-D camera."""
+    try:
+        camera_service = app.state.camera_service
+        if camera_service:
+            frame = await camera_service.get_frame()
+            return Response(content=frame, media_type="image/jpeg")
+        else:
+            raise HTTPException(status_code=503, detail="Camera service not available")
+    except Exception as e:
+        LOGGER.error(f"Failed to get camera frame: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def _camera_stream(service: CameraService, frames: int | None) -> AsyncIterator[bytes]:
