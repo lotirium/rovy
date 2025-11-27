@@ -133,7 +133,7 @@ export const cmdJsonCmd = (
   }
 
   let payload: MovementCommand | LightsCommand | GimbalCommand;
-  
+
   if (jsonData.T === cmd_movition_ctrl) {
     payload = {
       ...jsonData,

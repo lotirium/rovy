@@ -83,7 +83,10 @@ export const connectNearbyRobotsSocket = (
   socket.onerror = (event) => {
     const message =
       typeof event === "object" && event && "message" in event
-        ? String((event as { message?: unknown }).message ?? "Nearby robot socket error.")
+        ? String(
+            (event as { message?: unknown }).message ??
+              "Nearby robot socket error."
+          )
         : "Nearby robot socket error.";
     handlers.onError?.(new Error(message));
   };

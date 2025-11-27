@@ -129,7 +129,11 @@ export interface DiscoveryOptions {
   /** Maximum IPs to scan (default: 254) */
   maxHosts?: number;
   /** Callback for progress updates */
-  onProgress?: (scanned: number, total: number, found: DiscoveredRobot[]) => void;
+  onProgress?: (
+    scanned: number,
+    total: number,
+    found: DiscoveredRobot[]
+  ) => void;
   /** Abort signal to cancel discovery */
   signal?: AbortSignal;
 }
@@ -148,12 +152,7 @@ export interface DiscoveryResult {
 export async function discoverRobotsOnNetwork(
   options: DiscoveryOptions = {}
 ): Promise<DiscoveryResult> {
-  const {
-    port = DEFAULT_PORT,
-    maxHosts = 254,
-    onProgress,
-    signal,
-  } = options;
+  const { port = DEFAULT_PORT, maxHosts = 254, onProgress, signal } = options;
 
   const startTime = Date.now();
   const foundRobots: DiscoveredRobot[] = [];
@@ -252,7 +251,7 @@ export async function tryMdnsHostname(
  * Add your robot's Tailscale IP here for automatic discovery.
  */
 const KNOWN_TAILSCALE_IPS = [
-  "100.72.107.106",  // ROVY Pi
+  "100.72.107.106", // ROVY Pi
 ];
 
 /**
@@ -323,4 +322,3 @@ export async function discoverRobots(
   console.log("Falling back to subnet scan...");
   return discoverRobotsOnNetwork(options);
 }
-

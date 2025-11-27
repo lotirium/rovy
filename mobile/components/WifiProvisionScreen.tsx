@@ -49,7 +49,7 @@ const hotspotApi = {
       return false;
     }
   },
-  
+
   async scanNetworks(): Promise<{ ssid: string; signal: number }[]> {
     try {
       const response = await fetch(`${HOTSPOT_URL}/scan`);
@@ -63,7 +63,7 @@ const hotspotApi = {
       return [];
     }
   },
-  
+
   async connect(ssid: string, password: string): Promise<{ success: boolean; message?: string }> {
     try {
       const response = await fetch(`${HOTSPOT_URL}/connect`, {
@@ -76,7 +76,7 @@ const hotspotApi = {
       return { success: false, message: error instanceof Error ? error.message : 'Connection failed' };
     }
   },
-  
+
   async getStatus(): Promise<{ connected: boolean; network_name?: string; ip_address?: string }> {
     try {
       const response = await fetch(`${HOTSPOT_URL}/status`);
@@ -285,7 +285,7 @@ export function WifiProvisionScreen() {
 
       // Check if connected to ROVY-Setup hotspot
       const isHotspot = await hotspotApi.checkConnection();
-      
+
       if (isHotspot) {
         // Found hotspot! Add as a "device"
         setDevices([{
@@ -373,7 +373,7 @@ export function WifiProvisionScreen() {
         setIsOnSameNetwork(null);
         setIsConnecting(true);
         setError(null);
-        
+
         // Verify hotspot connection is still active
         const connected = await hotspotApi.checkConnection();
         if (connected) {
@@ -442,9 +442,9 @@ export function WifiProvisionScreen() {
     try {
       setIsSendingConfig(true);
       setWifiStatus("connecting");
-      
+
       const result = await hotspotApi.connect(ssid.trim(), password);
-      
+
       if (result.success) {
         setWifiStatus("connected");
         Alert.alert(
@@ -556,7 +556,7 @@ export function WifiProvisionScreen() {
       });
 
       setDiscoveredRobots(result.robots);
-      
+
       if (result.robots.length === 0) {
         // No robots found - show helpful message via alert
         Alert.alert(
@@ -647,7 +647,7 @@ export function WifiProvisionScreen() {
     void (async () => {
       try {
         await refreshPhoneNetwork();
-        
+
         // Auto-run network discovery after a brief delay
         if (mounted && !hasScannedNetwork) {
           setTimeout(() => {
@@ -665,7 +665,7 @@ export function WifiProvisionScreen() {
     return () => {
       mounted = false;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const getStatusText = (): string => {
@@ -1095,7 +1095,7 @@ export function WifiProvisionScreen() {
                 <ThemedText style={styles.sectionTitle}>
                   Configure Robot WiFi
                 </ThemedText>
-                
+
                 {availableNetworks.length > 0 && (
                   <View style={styles.wifiList}>
                     <ThemedText style={styles.subsectionTitle}>
@@ -1137,7 +1137,7 @@ export function WifiProvisionScreen() {
                     })}
                   </View>
                 )}
-                
+
                 <View style={styles.form}>
                   <View>
                     <ThemedText style={styles.label}>Network Name (SSID)</ThemedText>
@@ -1181,7 +1181,7 @@ export function WifiProvisionScreen() {
                     )}
                   </Pressable>
                 </View>
-                
+
                 <View style={styles.statusRow}>
                   <ThemedText style={styles.statusLabel}>Status:</ThemedText>
                   <View style={styles.statusValueRow}>
