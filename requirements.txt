@@ -1,0 +1,101 @@
+# ============================================================================
+# Rovy Cloud Server - Requirements
+# Uses LOCAL models - no cloud APIs needed!
+# ============================================================================
+# Install with: pip install -r requirements.txt
+# ============================================================================
+
+# ============================================================================
+# Core Dependencies
+# ============================================================================
+
+# Numerical computing
+numpy>=1.21.0
+
+# Image processing
+opencv-python>=4.5.0
+Pillow>=9.0.0
+
+# WebSocket server
+websockets>=11.0
+
+# ============================================================================
+# LOCAL LLM - llama.cpp Python bindings
+# ============================================================================
+# For GPU acceleration, install with:
+#   CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python
+# Or for CPU only:
+#   pip install llama-cpp-python
+
+llama-cpp-python>=0.2.0
+
+# ============================================================================
+# Speech Recognition - LOCAL Whisper
+# ============================================================================
+# Uses OpenAI's Whisper model running LOCALLY
+
+openai-whisper>=20231117
+
+# ============================================================================
+# Text-to-Speech - LOCAL Piper
+# ============================================================================
+# High-quality neural TTS running locally
+# Download voices from: https://github.com/rhasspy/piper/releases
+
+piper-tts>=1.2.0
+
+# ============================================================================
+# Face Recognition
+# ============================================================================
+# Uses dlib's CNN face detector (GPU accelerated)
+# Note: Requires cmake and dlib to be installed
+
+face-recognition>=1.3.0
+dlib>=19.24.0
+
+# ============================================================================
+# Audio Processing
+# ============================================================================
+
+# For audio I/O (required by Whisper)
+soundfile>=0.12.0
+
+# Optional: For microphone input
+# PyAudio>=0.2.11
+
+# ============================================================================
+# Optional: PyTorch (for GPU-accelerated Whisper)
+# ============================================================================
+# Uncomment if you want GPU-accelerated speech recognition
+# torch>=2.0.0
+
+# ============================================================================
+# Notes:
+# ============================================================================
+# 
+# GGUF Models needed (download separately):
+# 
+# 1. Text Model (choose one):
+#    - gemma-2-2b-it-Q4_K_M.gguf (small, fast)
+#    - llama-2-7b-chat-Q4_K_M.gguf (balanced)
+#    - mistral-7b-instruct-Q4_K_M.gguf (good quality)
+#
+# 2. Vision Model (for image understanding):
+#    - llava-v1.5-7b-Q4_K_M.gguf
+#    - llava-phi-3-mini-int4.gguf (smaller, faster)
+#
+# 3. Vision Projector (required for vision):
+#    - mmproj-model-f16.gguf (for llava-v1.5)
+#    - llava-phi-3-mini-mmproj-f16.gguf (for phi-3)
+#
+# 4. Piper Voice (for TTS):
+#    - en_US-lessac-medium.onnx
+#    - en_US-hfc_male-medium.onnx
+#
+# Place models in ~/.cache/ or set environment variables:
+#    ROVY_TEXT_MODEL=/path/to/text-model.gguf
+#    ROVY_VISION_MODEL=/path/to/vision-model.gguf
+#    ROVY_VISION_MMPROJ=/path/to/mmproj.gguf
+#
+# ============================================================================
+
