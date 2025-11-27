@@ -418,22 +418,11 @@ def _iter_webcam_candidates() -> list[int | str]:
 
 
 def _create_camera_service() -> CameraService:
+    """Create camera service for mobile app streaming (uses USB camera, not OAK-D)."""
     primary_source = None
 
-    if _FORCE_WEBCAM:
-        LOGGER.info(
-            "DepthAI camera explicitly disabled via CAMERA_FORCE_WEBCAM; attempting USB webcam sources instead",
-        )
-    elif DepthAICameraSource.is_available():
-        try:
-            primary_source = DepthAICameraSource()
-            LOGGER.info("Using DepthAI camera source for streaming")
-        except CameraError as exc:
-            LOGGER.warning("DepthAI camera source unavailable: %s", exc)
-    else:
-        LOGGER.warning(
-            "DepthAI package not installed; skipping OAK-D camera stream. Install the 'depthai' package to enable it."
-        )
+    # Always use USB webcam for mobile app streaming (OAK-D is reserved for AI vision)
+    LOGGER.info("Using USB camera for mobile app streaming (OAK-D reserved for AI vision)")
 
     if primary_source is None:
         if OpenCVCameraSource.is_available():
@@ -1117,16 +1106,28 @@ async def speak_text(request: dict):
 
 @app.get("/shot")
 async def single_frame() -> Response:
-    """Serve a single JPEG frame from DepthAI/OAK-D camera."""
+    """Serve a single JPEG frame from OAK-D camera for AI vision."""
     try:
-        camera_service = app.state.camera_service
-        if camera_service:
-            frame = await camera_service.get_frame()
-            return Response(content=frame, media_type="image/jpeg")
-        else:
-            raise HTTPException(status_code=503, detail="Camera service not available")
+        # Use OAK-D camera directly for AI vision (not USB camera stream)
+        from .camera import DepthAICameraSource
+        
+        if not hasattr(app.state, '_oak_camera'):
+            # Initialize OAK-D camera on first use
+            try:
+                app.state._oak_camera = DepthAICameraSource(
+                    preview_width=640,
+                    preview_height=480,
+                    fps=30.0
+                )
+                LOGGER.info("OAK-D camera initialized for vision queries")
+            except Exception as e:
+                LOGGER.error(f"Failed to initialize OAK-D camera: {e}")
+                raise HTTPException(status_code=503, detail="OAK-D camera not available")
+        
+        frame = await app.state._oak_camera.get_jpeg_frame()
+        return Response(content=frame, media_type="image/jpeg")
     except Exception as e:
-        LOGGER.error(f"Failed to get camera frame: {e}")
+        LOGGER.error(f"Failed to get OAK-D frame: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
