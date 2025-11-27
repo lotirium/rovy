@@ -1,163 +1,175 @@
-import { CLOUD_API_BASE_URL } from "@/constants/env";
-import type {
-  ClaimRobotResponse,
-  CloudRobot,
-  CloudSession,
-  CloudUser,
-  NearbyRobotSummary,
-} from "@/types/cloud";
+/**
+ * Cloud AI API - Connects to PC server for AI processing
+ *
+ * This is separate from robot-api.ts which connects to the Pi.
+ *
+ * Architecture:
+ *   Phone App → Pi (robot-api.ts): Camera, rover control, lights, WiFi
+ *   Phone App → PC (cloud-api.ts): Chat, vision, STT, TTS
+ */
 
-const ensureBaseUrl = () => {
-  if (!CLOUD_API_BASE_URL) {
-    throw new Error(
-      "Cloud API base URL is not configured. Set EXPO_PUBLIC_CLOUD_API_BASE_URL to continue."
+import axios, { AxiosInstance } from "axios";
+
+// Default Cloud PC IP (Tailscale) - FastAPI runs on port 8000
+export const DEFAULT_CLOUD_URL = "http://100.121.110.125:8000";
+
+export interface ChatRequest {
+  message: string;
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface ChatResponse {
+  response: string;
+  movement?: {
+    direction: string;
+    distance: number;
+    speed: string;
+  };
+}
+
+export interface VisionRequest {
+  question: string;
+  image_base64: string;
+  max_tokens?: number;
+}
+
+export interface VisionResponse {
+  response: string;
+  movement?: {
+    direction: string;
+    distance: number;
+    speed: string;
+  };
+}
+
+export interface STTResponse {
+  text: string | null;
+  success: boolean;
+}
+
+export interface CloudHealth {
+  ok: boolean;
+  assistant_loaded: boolean;
+  speech_loaded: boolean;
+}
+
+export interface CloudApiOptions {
+  baseUrl?: string;
+  timeout?: number;
+}
+
+export class CloudAPI {
+  private baseUrl: string;
+  private axiosInstance: AxiosInstance;
+  private timeout: number;
+
+  constructor(options: CloudApiOptions = {}) {
+    this.baseUrl = (options.baseUrl || DEFAULT_CLOUD_URL).replace(/\/$/, "");
+    this.timeout = options.timeout ?? 30000; // Longer timeout for AI processing
+
+    this.axiosInstance = axios.create({
+      baseURL: this.baseUrl,
+      timeout: this.timeout,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+    });
+  }
+
+  public updateBaseUrl(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.axiosInstance.defaults.baseURL = this.baseUrl;
+  }
+
+  public getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  /**
+   * Check cloud server health
+   */
+  public async health(): Promise<CloudHealth> {
+    const response = await this.axiosInstance.get<CloudHealth>("/health");
+    return response.data;
+  }
+
+  /**
+   * Chat with AI (text only)
+   */
+  public async chat(request: ChatRequest): Promise<ChatResponse> {
+    const response = await this.axiosInstance.post<ChatResponse>("/chat", {
+      message: request.message,
+      max_tokens: request.max_tokens ?? 150,
+      temperature: request.temperature ?? 0.7,
+    });
+    return response.data;
+  }
+
+  /**
+   * Ask AI about an image
+   */
+  public async vision(request: VisionRequest): Promise<VisionResponse> {
+    const response = await this.axiosInstance.post<VisionResponse>("/vision", {
+      question: request.question,
+      image_base64: request.image_base64,
+      max_tokens: request.max_tokens ?? 200,
+    });
+    return response.data;
+  }
+
+  /**
+   * Convert speech to text
+   * @param audioBlob Audio data as Blob or File
+   */
+  public async speechToText(audioBlob: Blob): Promise<STTResponse> {
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "audio.wav");
+
+    const response = await this.axiosInstance.post<STTResponse>(
+      "/stt",
+      formData,
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      }
     );
+    return response.data;
   }
 
-  return CLOUD_API_BASE_URL;
-};
-
-const buildUrl = (path: string) => new URL(path, ensureBaseUrl()).toString();
-
-const parseJson = async <T>(response: Response): Promise<T> => {
-  const text = await response.text();
-  if (!text) {
-    return {} as T;
+  /**
+   * Convert text to speech
+   * @returns Audio data as ArrayBuffer (WAV format)
+   */
+  public async textToSpeech(text: string): Promise<ArrayBuffer> {
+    const response = await this.axiosInstance.post(
+      "/tts",
+      { text },
+      {
+        responseType: "arraybuffer",
+      }
+    );
+    return response.data;
   }
 
-  try {
-    return JSON.parse(text) as T;
-  } catch (error) {
-    console.warn("Failed to parse JSON response", error, text);
-    throw new Error("Unexpected response payload from cloud API.");
+  /**
+   * Get WebSocket URL for real-time voice interaction
+   */
+  public getVoiceWebSocketUrl(): string {
+    const wsBase = this.baseUrl.replace(/^http/, "ws");
+    return `${wsBase}/voice`;
   }
-};
+}
 
-const extractErrorMessage = async (response: Response) => {
-  try {
-    const payload = await parseJson<{ message?: string; error?: string }>(response);
-    if (payload.message) {
-      return payload.message;
-    }
-    if (payload.error) {
-      return payload.error;
-    }
-  } catch (error) {
-    const text = await response.text();
-    if (text) {
-      return text;
-    }
-  }
+/**
+ * Create a CloudAPI instance
+ */
+export const createCloudApi = (baseUrl?: string, timeout?: number) =>
+  new CloudAPI({ baseUrl, timeout });
 
-  return `Request failed with status ${response.status}.`;
-};
-
-const handleResponse = async <T>(response: Response): Promise<T> => {
-  if (!response.ok) {
-    throw new Error(await extractErrorMessage(response));
-  }
-
-  return parseJson<T>(response);
-};
-
-const buildAuthHeaders = (token: string, includeJson = false) => {
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/json",
-  };
-
-  if (includeJson) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  return headers;
-};
-
-export const fetchCurrentSession = async (
-  token: string
-): Promise<CloudSession> => {
-  const response = await fetch(buildUrl("/session"), {
-    method: "GET",
-    headers: buildAuthHeaders(token),
-  });
-
-  const payload = await handleResponse<{
-    user: CloudUser;
-    token?: string;
-  }>(response);
-
-  return {
-    token: payload.token ?? token,
-    user: payload.user,
-  };
-};
-
-export const fetchClaimedRobots = async (
-  token: string
-): Promise<CloudRobot[]> => {
-  const response = await fetch(buildUrl("/robots/mine"), {
-    method: "GET",
-    headers: buildAuthHeaders(token),
-  });
-
-  const payload = await handleResponse<
-    { robots?: CloudRobot[] } | CloudRobot[]
-  >(response);
-
-  if (Array.isArray(payload)) {
-    return payload;
-  }
-
-  return payload.robots ?? [];
-};
-
-export const fetchUnclaimedRobots = async (
-  token: string
-): Promise<NearbyRobotSummary[]> => {
-  const response = await fetch(buildUrl("/robots/unclaimed"), {
-    method: "GET",
-    headers: buildAuthHeaders(token),
-  });
-
-  const payload = await handleResponse<
-    { robots?: NearbyRobotSummary[] } | NearbyRobotSummary[]
-  >(response);
-
-  if (Array.isArray(payload)) {
-    return payload;
-  }
-
-  return payload.robots ?? [];
-};
-
-export const claimRobot = async (
-  token: string,
-  payload: { serial: string; pin: string }
-): Promise<ClaimRobotResponse> => {
-  const response = await fetch(buildUrl("/robots/claim"), {
-    method: "POST",
-    headers: buildAuthHeaders(token, true),
-    body: JSON.stringify(payload),
-  });
-
-  const result = await handleResponse<ClaimRobotResponse>(response);
-  if (!result.robot) {
-    throw new Error("Claim response did not include robot details.");
-  }
-
-  return result;
-};
-
-export const releaseRobot = async (
-  token: string,
-  robotId: string
-): Promise<void> => {
-  const response = await fetch(buildUrl(`/robots/${robotId}/release`), {
-    method: "POST",
-    headers: buildAuthHeaders(token, true),
-  });
-
-  if (!response.ok) {
-    throw new Error(await extractErrorMessage(response));
-  }
-};
+/**
+ * Default cloud API instance (uses Tailscale IP)
+ */
+export const cloudApi = new CloudAPI();

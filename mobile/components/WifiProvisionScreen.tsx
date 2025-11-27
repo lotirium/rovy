@@ -10,9 +10,10 @@ import React, {
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   KeyboardAvoidingView,
   Modal,
-  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -25,12 +26,73 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 import { DEFAULT_ROBOT_BASE_URL, useRobot } from "@/context/robot-provider";
+import { discoverRobots, DiscoveredRobot } from "@/services/network-discovery";
 import { createRobotApi } from "@/services/robot-api";
 import { checkAllRobotsStatus } from "@/services/robot-status-check";
 import { RobotStatusCheck as RobotStatusCheckType } from "@/services/robot-storage";
 import { Image } from "expo-image";
 import { IconSymbol } from "./ui/icon-symbol";
-import WifiManager from "react-native-wifi-reborn";
+
+// Hotspot provisioning config (replaces Bluetooth)
+// Supports multiple hotspot names for different robot configurations
+const HOTSPOT_SSIDS = ["ROVY-Setup", "UGV", "UGV-Setup", "ROVY"];
+const HOTSPOT_IP = "192.168.4.1";
+const HOTSPOT_URL = `http://${HOTSPOT_IP}`;
+
+// Hotspot API functions
+const hotspotApi = {
+  async checkConnection(): Promise<boolean> {
+    try {
+      const response = await fetch(`${HOTSPOT_URL}/health`, { timeout: 3000 } as any);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  },
+
+  async scanNetworks(): Promise<{ ssid: string; signal: number }[]> {
+    try {
+      const response = await fetch(`${HOTSPOT_URL}/scan`);
+      const data = await response.json();
+      return (data.networks || []).map((n: any) => ({
+        ssid: typeof n === 'string' ? n : n.ssid,
+        signal: typeof n === 'object' ? (n.signal || n.rssi || -70) : -70,
+      }));
+    } catch (error) {
+      console.error('Hotspot scan failed:', error);
+      return [];
+    }
+  },
+
+  async connect(ssid: string, password: string): Promise<{ success: boolean; message?: string }> {
+    try {
+      const response = await fetch(`${HOTSPOT_URL}/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid, password }),
+      });
+      return await response.json();
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : 'Connection failed' };
+    }
+  },
+
+  async getStatus(): Promise<{ connected: boolean; network_name?: string; ip_address?: string }> {
+    try {
+      const response = await fetch(`${HOTSPOT_URL}/status`);
+      return await response.json();
+    } catch {
+      return { connected: false };
+    }
+  },
+};
+
+// Type for hotspot device (replaces RovyDevice)
+interface HotspotDevice {
+  id: string;
+  name: string;
+  rssi?: number;
+}
 
 const deriveHost = (value: string | null | undefined) => {
   if (!value) {
@@ -79,12 +141,35 @@ const getSignalStrengthInfo = (rssi?: number | null) => {
   return { label: "Weak", color: "#F87171" };
 };
 
+const formatRssiValue = (rssi?: number | null) => {
+  if (typeof rssi !== "number") {
+    return "Signal unknown";
+  }
+  return `${rssi} dBm`;
+};
+
 /**
  * Wi-Fi Provision Screen Component
- * Guides the user through connecting to the robot hotspot and
- * managing the Wi-Fi connection.
+ * Guides the user through finding the robot via WiFi hotspot
+ * and configuring its WiFi connection.
+ * 
+ * Flow:
+ * 1. User connects phone to "ROVY-Setup" hotspot (password: rovysetup)
+ * 2. User taps Scan to detect the hotspot connection
+ * 3. App shows available WiFi networks via HTTP API at 192.168.4.1
+ * 4. User selects network and enters password
+ * 5. Robot connects to WiFi and turns off hotspot
  */
 export function WifiProvisionScreen() {
+  // Hotspot-based provisioning state (replaces BLE)
+  const [isScanning, setIsScanning] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isSendingConfig, setIsSendingConfig] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [wifiStatus, setWifiStatus] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [isHotspotMode, setIsHotspotMode] = useState(false);
+
   const {
     refreshStatus,
     status,
@@ -97,10 +182,16 @@ export function WifiProvisionScreen() {
 
   const router = useRouter();
 
-  const [selectedNetwork, setSelectedNetwork] = useState<string>("");
+  const [devices, setDevices] = useState<HotspotDevice[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<HotspotDevice | null>(null);
   const [ssid, setSsid] = useState("");
   const [password, setPassword] = useState("");
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [selectedNetwork, setSelectedNetwork] = useState<string | null>(null);
+  const [showWifiConfig, setShowWifiConfig] = useState(false);
   const [isCheckingNetwork, setIsCheckingNetwork] = useState(false);
+  const [isOnSameNetwork, setIsOnSameNetwork] = useState<boolean | null>(null);
+  const [isRobotConnecting, setIsRobotConnecting] = useState(false);
   const [isManualModalVisible, setIsManualModalVisible] = useState(false);
   const [manualIpInput, setManualIpInput] = useState("");
   const [manualIpEdited, setManualIpEdited] = useState(false);
@@ -110,11 +201,28 @@ export function WifiProvisionScreen() {
   const [isManualConnecting, setIsManualConnecting] = useState(false);
   const [savedRobots, setSavedRobots] = useState<RobotStatusCheckType[]>([]);
   const [isCheckingRobots, setIsCheckingRobots] = useState(false);
-  const [phoneWifiNetworks, setPhoneWifiNetworks] = useState<
+  const [discoveredRobots, setDiscoveredRobots] = useState<DiscoveredRobot[]>([]);
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  const [discoveryProgress, setDiscoveryProgress] = useState<{ scanned: number; total: number } | null>(null);
+  const [hasScannedNetwork, setHasScannedNetwork] = useState(false);
+  const discoveryAbortRef = useRef<AbortController | null>(null);
+  const [robotWifiNetworks, setRobotWifiNetworks] = useState<
     { ssid: string; rssi: number }[]
   >([]);
-  const [isScanningPhoneWifi, setIsScanningPhoneWifi] = useState(false);
-  const [isConfiguringWifi, setIsConfiguringWifi] = useState(false);
+  const [availableNetworks, setAvailableNetworks] = useState<
+    { ssid: string; signal: number }[]
+  >([]);
+  const [isScanningRobotWifi, setIsScanningRobotWifi] = useState(false);
+  const scanRotationValue = useRef(new Animated.Value(0)).current;
+  const scanRotationLoop = useRef<Animated.CompositeAnimation | null>(null);
+  const scanRotation = useMemo(
+    () =>
+      scanRotationValue.interpolate({
+        inputRange: [0, 1],
+        outputRange: ["0deg", "360deg"],
+      }),
+    [scanRotationValue]
+  );
 
   const isCheckingNetworkRef = useRef(false);
   const refreshStatusRef = useRef(refreshStatus);
@@ -123,6 +231,31 @@ export function WifiProvisionScreen() {
   useEffect(() => {
     refreshStatusRef.current = refreshStatus;
   }, [refreshStatus]);
+
+  useEffect(() => {
+    if (isScanning) {
+      scanRotationLoop.current = Animated.loop(
+        Animated.timing(scanRotationValue, {
+          toValue: 1,
+          duration: 1200,
+          easing: Easing.linear,
+          useNativeDriver: true,
+        })
+      );
+      scanRotationLoop.current.start();
+    } else {
+      scanRotationLoop.current?.stop();
+      scanRotationValue.stopAnimation(() => {
+        scanRotationValue.setValue(0);
+      });
+      scanRotationLoop.current = null;
+    }
+
+    return () => {
+      scanRotationLoop.current?.stop();
+      scanRotationLoop.current = null;
+    };
+  }, [isScanning, scanRotationValue]);
 
   useEffect(() => {
     if (manualIpEdited) {
@@ -140,70 +273,40 @@ export function WifiProvisionScreen() {
   }, [baseUrl, manualIpEdited, status?.network?.ip]);
 
   /**
-   * Scan for Wi-Fi networks visible to this device (used to find the robot hotspot)
+   * Step 1: Scan for ROVY hotspot
+   * Instead of BLE, we check if user is connected to ROVY-Setup WiFi hotspot
    */
-  const handleScanNetworks = useCallback(async () => {
-    if (Platform.OS !== "android") {
-      Alert.alert(
-        "Scanning not supported",
-        "Wi-Fi scanning is only available on Android. Please manually connect your phone to the robot hotspot, then continue."
-      );
-      return;
-    }
-
-    const granted = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      {
-        title: "Location permission required",
-        message:
-          "We need location access to scan Wi-Fi networks near this device.",
-        buttonPositive: "Allow",
-        buttonNegative: "Deny",
-      }
-    );
-
-    if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-      Alert.alert(
-        "Permission required",
-        "Enable location access to scan nearby Wi-Fi networks."
-      );
-      return;
-    }
-
-    setIsScanningPhoneWifi(true);
-    setPhoneWifiNetworks([]);
-
+  const handleScan = useCallback(async () => {
     try {
-      const scanResults = await WifiManager.reScanAndLoadWifiList();
+      setDevices([]);
+      setSelectedDevice(null);
+      setError(null);
+      setIsScanning(true);
 
-      const networks = (scanResults || []).map((network: any) => ({
-        ssid: network?.SSID || network?.ssid || "",
-        rssi:
-          typeof network?.level === "number"
-            ? network.level
-            : typeof network?.signalStrength === "number"
-              ? network.signalStrength
-              : -100,
-      }));
+      // Check if connected to ROVY-Setup hotspot
+      const isHotspot = await hotspotApi.checkConnection();
 
-      const filtered = networks.filter((network) => network.ssid);
-      setPhoneWifiNetworks(filtered);
-
-      if (filtered.length === 0) {
+      if (isHotspot) {
+        // Found hotspot! Add as a "device"
+        setDevices([{
+          id: "rovy-hotspot",
+          name: "ROVY (Hotspot)",
+          rssi: -50,
+        }]);
+        setIsHotspotMode(true);
+      } else {
         Alert.alert(
-          "No Networks Found",
-          "No Wi-Fi networks were detected near this device. Move closer to your router or robot hotspot and try again."
+          "Connect to Robot Hotspot",
+          `To set up your robot:\n\n1. Open WiFi settings\n2. Connect to one of: ${HOTSPOT_SSIDS.join(", ")}\n3. Come back and tap Scan again`,
+          [{ text: "OK" }]
         );
       }
-    } catch (error) {
-      Alert.alert(
-        "Scan Error",
-        error instanceof Error
-          ? error.message
-          : "Failed to scan nearby Wi-Fi networks from this device"
-      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to find robot hotspot";
+      setError(message);
     } finally {
-      setIsScanningPhoneWifi(false);
+      setIsScanning(false);
     }
   }, []);
 
@@ -239,22 +342,96 @@ export function WifiProvisionScreen() {
 
     isCheckingNetworkRef.current = true;
     setIsCheckingNetwork(true);
+    setIsOnSameNetwork(null);
+
     try {
       await refreshStatusRef.current();
 
       setTimeout(() => {
+        setIsOnSameNetwork(true);
+        setShowWifiConfig(false);
         setIsCheckingNetwork(false);
         isCheckingNetworkRef.current = false;
       }, 500);
     } catch (error) {
       console.log("Robot not on same network:", error);
+      setIsOnSameNetwork(false);
       setIsCheckingNetwork(false);
       isCheckingNetworkRef.current = false;
     }
   }, []);
 
   /**
-   * Step 3: Send Wi-Fi configuration
+   * Step 2: "Connect" to selected ROVY hotspot
+   * Since we're already connected via WiFi, this confirms and fetches networks
+   */
+  const handleConnect = useCallback(
+    async (device: HotspotDevice) => {
+      try {
+        setSelectedDevice(device);
+        setShowWifiConfig(false);
+        setIsOnSameNetwork(null);
+        setIsConnecting(true);
+        setError(null);
+
+        // Verify hotspot connection is still active
+        const connected = await hotspotApi.checkConnection();
+        if (connected) {
+          setIsConnected(true);
+          // Fetch available WiFi networks from the robot
+          const networks = await hotspotApi.scanNetworks();
+          setAvailableNetworks(networks);
+          setShowWifiConfig(true);
+        } else {
+          Alert.alert(
+            "Connection Lost",
+            `Please reconnect to the robot hotspot WiFi and try again.`
+          );
+          setSelectedDevice(null);
+        }
+        await refreshPhoneNetwork();
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to connect to hotspot";
+        setError(message);
+        setSelectedDevice(null);
+        setIsOnSameNetwork(null);
+      } finally {
+        setIsConnecting(false);
+      }
+    },
+    [refreshPhoneNetwork]
+  );
+
+  /**
+   * Handle "Connect" button - robot is on same network
+   */
+  const handleNetworkConnect = useCallback(async () => {
+    try {
+      setIsRobotConnecting(true);
+      await refreshStatus();
+      Alert.alert(
+        "Connected",
+        "Robot is connected on the same network. You can now control it."
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to connect to robot";
+      Alert.alert("Connection Error", message);
+    } finally {
+      setIsRobotConnecting(false);
+    }
+  }, [refreshStatus]);
+
+  /**
+   * Show Wi-Fi configuration form
+   */
+  const handleChangeWifi = useCallback(() => {
+    setShowWifiConfig(true);
+  }, []);
+
+  /**
+   * Step 3: Send Wi-Fi configuration via hotspot HTTP API
    */
   const handleSendConfig = useCallback(async () => {
     if (!ssid.trim()) {
@@ -263,24 +440,58 @@ export function WifiProvisionScreen() {
     }
 
     try {
-      if (!api) {
-        throw new Error("Robot API unavailable. Connect to the hotspot first.");
-      }
+      setIsSendingConfig(true);
+      setWifiStatus("connecting");
 
-      setIsConfiguringWifi(true);
-      await api.connectWifi({ ssid: ssid.trim(), password });
-      await refreshStatus();
-      await checkSameNetwork();
+      const result = await hotspotApi.connect(ssid.trim(), password);
+
+      if (result.success) {
+        setWifiStatus("connected");
+        Alert.alert(
+          "WiFi Configured!",
+          "The robot will now connect to your WiFi network. The hotspot will turn off.\n\nPlease reconnect your phone to your home WiFi, then use 'Connect to a specific IP' to find the robot.",
+          [{ text: "OK" }]
+        );
+        // Reset state
+        setIsConnected(false);
+        setSelectedDevice(null);
+        setShowWifiConfig(false);
+        setSsid("");
+        setPassword("");
+      } else {
+        setWifiStatus("failed");
+        Alert.alert("Connection Failed", result.message || "Failed to connect to WiFi");
+      }
     } catch (err) {
+      setWifiStatus("failed");
       const message =
         err instanceof Error
           ? err.message
           : "Failed to send Wi-Fi configuration";
       Alert.alert("Configuration Error", message);
     } finally {
-      setIsConfiguringWifi(false);
+      setIsSendingConfig(false);
     }
-  }, [api, ssid, password, refreshStatus, checkSameNetwork]);
+  }, [ssid, password]);
+
+  /**
+   * Disconnect from hotspot (reset state)
+   */
+  const handleDisconnect = useCallback(async () => {
+    setSelectedDevice(null);
+    setIsConnected(false);
+    setSsid("");
+    setPassword("");
+    setShowWifiConfig(false);
+    setIsOnSameNetwork(null);
+    setAvailableNetworks([]);
+    setDevices([]);
+    setIsHotspotMode(false);
+    Alert.alert(
+      "Disconnected",
+      "You can now disconnect from ROVY-Setup WiFi in your phone settings."
+    );
+  }, []);
 
   const handleManualConnect = useCallback(async () => {
     const formatted = formatBaseUrl(manualIpInput);
@@ -322,6 +533,91 @@ export function WifiProvisionScreen() {
     }
   }, [manualIpInput, refreshStatus, router, setBaseUrl, connectToStoredRobot]);
 
+  /**
+   * Discover robots on the same network
+   */
+  const handleDiscoverNetwork = useCallback(async () => {
+    // Cancel any existing discovery
+    discoveryAbortRef.current?.abort();
+    discoveryAbortRef.current = new AbortController();
+
+    setIsDiscovering(true);
+    setDiscoveryProgress({ scanned: 0, total: 254 });
+    setDiscoveredRobots([]);
+    setHasScannedNetwork(true);
+
+    try {
+      const result = await discoverRobots({
+        signal: discoveryAbortRef.current.signal,
+        onProgress: (scanned, total, found) => {
+          setDiscoveryProgress({ scanned, total });
+          setDiscoveredRobots([...found]);
+        },
+      });
+
+      setDiscoveredRobots(result.robots);
+
+      if (result.robots.length === 0) {
+        // No robots found - show helpful message via alert
+        Alert.alert(
+          "No Robots Found",
+          "Make sure your robot is powered on and connected to the same WiFi network as your phone.",
+          [{ text: "OK" }]
+        );
+      }
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        console.error("Network discovery failed:", error);
+        Alert.alert(
+          "Discovery Failed",
+          error instanceof Error ? error.message : "Failed to scan network"
+        );
+      }
+    } finally {
+      setIsDiscovering(false);
+      setDiscoveryProgress(null);
+      discoveryAbortRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Connect to a discovered robot
+   */
+  const handleConnectToDiscovered = useCallback(
+    async (robot: DiscoveredRobot) => {
+      setIsManualConnecting(true);
+      try {
+        // Check if this is a previously stored robot
+        const connected = await connectToStoredRobot(robot.baseUrl);
+        if (connected) {
+          await refreshStatus();
+          router.push("/(tabs)/home");
+          return;
+        }
+
+        // New robot - set up connection
+        setBaseUrl(robot.baseUrl);
+        await refreshStatus();
+        router.replace("/wifi");
+      } catch (error) {
+        Alert.alert(
+          "Connection Failed",
+          error instanceof Error ? error.message : "Failed to connect to robot"
+        );
+      } finally {
+        setIsManualConnecting(false);
+      }
+    },
+    [connectToStoredRobot, refreshStatus, router, setBaseUrl]
+  );
+
+  // Cancel discovery on unmount
+  useEffect(() => {
+    return () => {
+      discoveryAbortRef.current?.abort();
+    };
+  }, []);
+
   // Load and check saved robots on mount
   useEffect(() => {
     let mounted = true;
@@ -345,12 +641,21 @@ export function WifiProvisionScreen() {
     };
   }, []);
 
-  // Refresh phone network on mount (only once)
+  // Auto-discover robots on mount
   useEffect(() => {
     let mounted = true;
     void (async () => {
       try {
         await refreshPhoneNetwork();
+
+        // Auto-run network discovery after a brief delay
+        if (mounted && !hasScannedNetwork) {
+          setTimeout(() => {
+            if (mounted) {
+              handleDiscoverNetwork();
+            }
+          }, 500);
+        }
       } catch (error) {
         if (mounted) {
           console.warn("Failed to refresh phone network on mount:", error);
@@ -360,7 +665,51 @@ export function WifiProvisionScreen() {
     return () => {
       mounted = false;
     };
-  }, [refreshPhoneNetwork]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const getStatusText = (): string => {
+    switch (wifiStatus) {
+      case "idle":
+        return "Idle";
+      case "connecting":
+        return "Connecting...";
+      case "connected":
+        return "Connected";
+      case "failed":
+        return "Failed";
+      default:
+        return "Unknown";
+    }
+  };
+
+  const getStatusColor = (): string => {
+    switch (wifiStatus) {
+      case "idle":
+        return "#67686C";
+      case "connecting":
+        return "#FBBF24";
+      case "connected":
+        return "#1DD1A1";
+      case "failed":
+        return "#F87171";
+      default:
+        return "#67686C";
+    }
+  };
+
+  const hotspotStatus = useMemo(() => {
+    if (error) {
+      return { label: "Error", color: "#F87171" };
+    }
+    if (isConnecting) {
+      return { label: "Connecting", color: "#FBBF24" };
+    }
+    if (isConnected) {
+      return { label: "Connected", color: "#1DD1A1" };
+    }
+    return { label: "Ready", color: "#5CC8FF" };
+  }, [error, isConnecting, isConnected]);
 
   const wifiConnectionStatus = useMemo(() => {
     if (status?.network?.ip) {
@@ -372,23 +721,96 @@ export function WifiProvisionScreen() {
     return { label: "Pending", color: "#FBBF24" };
   }, [status?.network?.ip, statusError]);
 
+  const previousNetworks = useMemo(() => {
+    const seen = new Set<string>();
+    const candidates = [
+      status?.network?.wifiSsid,
+      status?.network?.ssid,
+      status?.health?.network?.wifiSsid,
+      status?.health?.network?.ssid,
+    ];
+    for (const candidate of candidates) {
+      if (candidate && candidate.trim()) {
+        seen.add(candidate.trim());
+      }
+    }
+    return Array.from(seen);
+  }, [status]);
+
   const overlayVisible =
+    isConnecting ||
     isManualConnecting ||
+    isRobotConnecting ||
     isCheckingNetwork ||
-    isConfiguringWifi;
+    isSendingConfig;
 
   const overlayMessage = (() => {
     if (isManualConnecting) {
       return "Establishing connection to your robot";
     }
-    if (isConfiguringWifi) {
+    if (isRobotConnecting) {
+      return "Refreshing robot status";
+    }
+    if (isSendingConfig) {
       return "Sending Wi-Fi credentials";
     }
     if (isCheckingNetwork) {
       return "Checking network connection";
     }
-    return "Working";
+    return "Connecting to device";
   })();
+
+  const wifiNetworkName =
+    status?.network?.wifiSsid ||
+    status?.network?.ssid ||
+    status?.health?.network?.wifiSsid ||
+    status?.health?.network?.ssid ||
+    "Unknown network";
+
+  const wifiIpAddress = status?.network?.ip || "Unavailable";
+  const scanIconStyle = isScanning
+    ? {
+      transform: [{ rotate: scanRotation }],
+    }
+    : undefined;
+
+  // Check if we're connected to robot (via BT, hotspot, or direct IP)
+  const isConnectedToRobot = Boolean(
+    isConnected || // Bluetooth connected
+    status?.network?.ip || // Has network IP
+    (baseUrl && baseUrl !== DEFAULT_ROBOT_BASE_URL) // Has custom base URL
+  );
+
+  // Scan robot Wi-Fi networks
+  const handleScanRobotWifi = useCallback(async () => {
+    if (!isConnectedToRobot || !api) {
+      Alert.alert(
+        "Not Connected",
+        "Please connect to the robot first via Bluetooth or IP."
+      );
+      return;
+    }
+
+    setIsScanningRobotWifi(true);
+    setRobotWifiNetworks([]);
+    try {
+      const response = await api.scanWifiNetworks();
+      const networks = Array.isArray(response.networks)
+        ? response.networks.map((n: any) => ({
+          ssid: typeof n === "string" ? n : n.ssid || "",
+          rssi: typeof n === "object" && n.rssi ? n.rssi : -100,
+        }))
+        : [];
+      setRobotWifiNetworks(networks);
+    } catch (error) {
+      Alert.alert(
+        "Scan Failed",
+        error instanceof Error ? error.message : "Failed to scan Wi-Fi networks"
+      );
+    } finally {
+      setIsScanningRobotWifi(false);
+    }
+  }, [isConnectedToRobot, api]);
 
   // Reconnect to a saved robot
   const handleReconnectToRobot = useCallback(
@@ -458,144 +880,415 @@ export function WifiProvisionScreen() {
             </ThemedText>
           </View>
 
+          {error ? (
+            <ThemedView style={styles.errorCard}>
+              <ThemedText style={styles.errorText}>{error}</ThemedText>
+            </ThemedView>
+          ) : null}
+
           {statusError ? (
             <ThemedView style={styles.errorCard}>
               <ThemedText style={styles.errorText}>{statusError}</ThemedText>
             </ThemedView>
           ) : null}
 
+          {/* Network Discovery Section - Primary method when robot is on same WiFi */}
+          <ThemedView style={styles.sectionCard}>
+            <View style={styles.sectionHeader}>
+              <View>
+                <ThemedText style={styles.sectionTitle}>
+                  Find on Network
+                </ThemedText>
+                <ThemedText style={styles.sectionHint}>
+                  Scan for robots on your WiFi
+                </ThemedText>
+              </View>
+              <Pressable
+                style={[
+                  styles.primaryButton,
+                  isDiscovering && styles.disabledPrimary,
+                ]}
+                onPress={handleDiscoverNetwork}
+                disabled={isDiscovering}
+              >
+                {isDiscovering ? (
+                  <ActivityIndicator color="#04110B" size="small" />
+                ) : (
+                  <ThemedText style={styles.primaryButtonText}>
+                    Scan
+                  </ThemedText>
+                )}
+              </Pressable>
+            </View>
+
+            {isDiscovering && discoveryProgress && (
+              <View style={styles.inlineStatus}>
+                <ActivityIndicator size="small" color="#1DD1A1" />
+                <ThemedText style={styles.statusLabelText}>
+                  Scanning network... {discoveryProgress.scanned}/{discoveryProgress.total}
+                </ThemedText>
+              </View>
+            )}
+
+            {discoveredRobots.length > 0 && (
+              <View style={styles.robotList}>
+                {discoveredRobots.map((robot) => (
+                  <Pressable
+                    key={robot.baseUrl}
+                    style={styles.robotItem}
+                    onPress={() => handleConnectToDiscovered(robot)}
+                  >
+                    <View style={styles.robotItemContent}>
+                      <View style={styles.robotItemHeader}>
+                        <ThemedText style={styles.robotName}>
+                          {robot.name || "ROVY Robot"}
+                        </ThemedText>
+                        <StatusPill color="#1DD1A1" label="Online" />
+                      </View>
+                      <ThemedText style={styles.robotSubtitle}>
+                        {robot.ip}:{robot.port} • {robot.responseTimeMs}ms
+                      </ThemedText>
+                    </View>
+                    <IconSymbol
+                      size={20}
+                      name="chevron.right"
+                      color="#67686C"
+                    />
+                  </Pressable>
+                ))}
+              </View>
+            )}
+
+            {hasScannedNetwork && !isDiscovering && discoveredRobots.length === 0 && (
+              <ThemedText style={styles.emptyStateText}>
+                No robots found on this network. Try hotspot setup below.
+              </ThemedText>
+            )}
+          </ThemedView>
 
           <View>
             <View style={styles.sectionHeader}>
               <View>
                 <ThemedText style={styles.sectionTitle}>
-                  Wi-Fi hotspot
+                  Hotspot Setup
                 </ThemedText>
                 <ThemedText style={styles.sectionHint}>
-                  Connect your phone to the robot hotspot, then pick the Wi-Fi
-                  network the robot should join.
+                  For first-time WiFi configuration
                 </ThemedText>
               </View>
               <StatusPill
-                color={wifiConnectionStatus.color}
-                label={wifiConnectionStatus.label}
+                color={hotspotStatus.color}
+                label={hotspotStatus.label}
               />
             </View>
 
             <View style={styles.sectionCard}>
-              <View style={styles.blockHeader}>
-                <ThemedText style={styles.blockTitle}>Available networks</ThemedText>
+              <View style={styles.sectionHeader}>
+                <View>
+                  <ThemedText style={styles.sectionTitle}>
+                    Find Robot
+                  </ThemedText>
+                </View>
                 <Pressable
                   style={[
                     styles.scanButton,
-                    (isScanningPhoneWifi || isConfiguringWifi) && styles.disabledPrimary,
+                    (isScanning || isConnecting) && styles.disabledPrimary,
                   ]}
-                  onPress={handleScanNetworks}
-                  disabled={isScanningPhoneWifi || isConfiguringWifi}
+                  onPress={handleScan}
+                  disabled={isScanning || isConnecting}
                 >
-                  {isScanningPhoneWifi ? (
-                    <ActivityIndicator color="#fff" />
-                  ) : (
+                  <Animated.View style={scanIconStyle}>
                     <IconSymbol
                       size={20}
                       name="arrow.trianglehead.2.clockwise"
                       color="#fff"
                     />
-                  )}
+                  </Animated.View>
                 </Pressable>
               </View>
-
-              {phoneWifiNetworks.length === 0 && !isScanningPhoneWifi ? (
-                <ThemedText style={styles.emptyStateText}>
-                  Scan to find Wi-Fi networks visible to this device.
-                </ThemedText>
+              {isScanning ? (
+                <View style={styles.inlineStatus}>
+                  <ThemedText style={styles.statusLabelText}>
+                    Checking for ROVY-Setup hotspot...
+                  </ThemedText>
+                </View>
               ) : null}
-
-              {phoneWifiNetworks.length > 0 && (
-                <View style={styles.wifiList}>
-                  {phoneWifiNetworks.map((network, index) => {
-                    const signalInfo = getSignalStrengthInfo(network.rssi);
-                    const isSelected = selectedNetwork === network.ssid;
-                    return (
-                      <Pressable
-                        key={`${network.ssid}-${index}`}
-                        style={[styles.wifiItem, isSelected && styles.deviceSelected]}
-                        onPress={() => {
-                          setSelectedNetwork(network.ssid);
-                          setSsid(network.ssid);
-                        }}
-                      >
-                        <ThemedText style={styles.wifiSsid}>
-                          {network.ssid || "Unknown"}
-                        </ThemedText>
-                        <View
+              {devices.length === 0 && !isScanning && isConnected ? (
+                <ThemedText style={styles.emptyStateText}>
+                  Connected to robot hotspot. Disconnect to scan again.
+                </ThemedText>
+              ) : (
+                devices.length !== 0 && (
+                  <View style={styles.deviceList}>
+                    {devices.map((device) => {
+                      const signalInfo = getSignalStrengthInfo(device.rssi);
+                      return (
+                        <Pressable
+                          key={device.id}
                           style={[
-                            styles.signalBadge,
-                            { borderColor: signalInfo.color },
+                            styles.deviceItem,
+                            selectedDevice?.id === device.id &&
+                            styles.deviceSelected,
                           ]}
+                          onPress={() => handleConnect(device)}
+                          disabled={isConnecting}
                         >
-                          <View
-                            style={[
-                              styles.signalDot,
-                              { backgroundColor: signalInfo.color },
-                            ]}
-                          />
-                          <ThemedText
-                            style={[
-                              styles.signalBadgeText,
-                              { color: signalInfo.color },
-                            ]}
-                          >
-                            {signalInfo.label}
-                          </ThemedText>
-                        </View>
-                      </Pressable>
-                    );
-                  })}
-                </View>
+                          <View style={styles.deviceHeader}>
+                            {selectedDevice?.id === device.id && isConnected ? (
+                              <View
+                                style={[
+                                  styles.signalDot,
+                                  { backgroundColor: "#1DD1A1" },
+                                ]}
+                              />
+                            ) : null}
+                            <View>
+                              <ThemedText style={styles.deviceName}>
+                                {device.name || "JARVIS"}
+                              </ThemedText>
+                            </View>
+                            <View
+                              style={[
+                                styles.signalBadge,
+                                { borderColor: signalInfo.color },
+                              ]}
+                            >
+                              <View
+                                style={[
+                                  styles.signalDot,
+                                  { backgroundColor: signalInfo.color },
+                                ]}
+                              />
+                              <ThemedText
+                                style={[
+                                  styles.signalBadgeText,
+                                  { color: signalInfo.color },
+                                ]}
+                              >
+                                {signalInfo.label}
+                              </ThemedText>
+                            </View>
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                )
               )}
+            </View>
 
-              <View style={styles.form}>
-                <View>
-                  <ThemedText style={styles.label}>Wi-Fi network</ThemedText>
-                  <TextInput
-                    style={styles.input}
-                    value={ssid}
-                    onChangeText={setSsid}
-                    placeholder="Network SSID"
-                    placeholderTextColor="#6B7280"
-                    autoCapitalize="none"
-                  />
-                </View>
-                <View>
-                  <ThemedText style={styles.label}>Password (optional)</ThemedText>
-                  <TextInput
-                    style={styles.input}
-                    value={password}
-                    onChangeText={setPassword}
-                    placeholder="Password"
-                    placeholderTextColor="#6B7280"
-                    secureTextEntry
-                  />
-                </View>
-                <Pressable
-                  style={[
-                    styles.primaryButton,
-                    isConfiguringWifi && styles.disabledPrimary,
-                  ]}
-                  onPress={handleSendConfig}
-                  disabled={isConfiguringWifi}
-                >
-                  {isConfiguringWifi ? (
-                    <ActivityIndicator color="#04110B" />
-                  ) : (
-                    <ThemedText style={styles.primaryButtonText}>
-                      Send Wi-Fi credentials
+            {isConnected ? (
+              <Pressable
+                style={[styles.secondaryButton, styles.outlineButton]}
+                onPress={handleDisconnect}
+                disabled={isSendingConfig}
+              >
+                <ThemedText style={styles.outlineButtonText}>
+                  Disconnect
+                </ThemedText>
+              </Pressable>
+            ) : null}
+
+            {/* WiFi Configuration Form - shown when connected to hotspot */}
+            {showWifiConfig && isConnected && (
+              <ThemedView style={styles.sectionCard}>
+                <ThemedText style={styles.sectionTitle}>
+                  Configure Robot WiFi
+                </ThemedText>
+
+                {availableNetworks.length > 0 && (
+                  <View style={styles.wifiList}>
+                    <ThemedText style={styles.subsectionTitle}>
+                      Available Networks
                     </ThemedText>
-                  )}
-                </Pressable>
+                    {availableNetworks.map((network, index) => {
+                      const signalInfo = getSignalStrengthInfo(network.signal);
+                      const isSelected = ssid === network.ssid;
+                      return (
+                        <Pressable
+                          key={`${network.ssid}-${index}`}
+                          style={[
+                            styles.wifiItem,
+                            isSelected && { borderColor: "#1DD1A1" }
+                          ]}
+                          onPress={() => setSsid(network.ssid)}
+                        >
+                          <ThemedText style={styles.wifiSsid}>
+                            {network.ssid}
+                          </ThemedText>
+                          <View style={styles.signalBadge}>
+                            <View
+                              style={[
+                                styles.signalDot,
+                                { backgroundColor: signalInfo.color },
+                              ]}
+                            />
+                            <ThemedText
+                              style={[
+                                styles.signalBadgeText,
+                                { color: signalInfo.color },
+                              ]}
+                            >
+                              {signalInfo.label}
+                            </ThemedText>
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                )}
+
+                <View style={styles.form}>
+                  <View>
+                    <ThemedText style={styles.label}>Network Name (SSID)</ThemedText>
+                    <TextInput
+                      style={styles.input}
+                      value={ssid}
+                      onChangeText={setSsid}
+                      placeholder="Enter WiFi network name"
+                      placeholderTextColor="#6B7280"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                    />
+                  </View>
+                  <View>
+                    <ThemedText style={styles.label}>Password</ThemedText>
+                    <TextInput
+                      style={styles.input}
+                      value={password}
+                      onChangeText={setPassword}
+                      placeholder="Enter WiFi password"
+                      placeholderTextColor="#6B7280"
+                      secureTextEntry
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                    />
+                  </View>
+                  <Pressable
+                    style={[
+                      styles.primaryButton,
+                      (isSendingConfig || !ssid.trim()) && styles.disabledPrimary,
+                    ]}
+                    onPress={handleSendConfig}
+                    disabled={isSendingConfig || !ssid.trim()}
+                  >
+                    {isSendingConfig ? (
+                      <ActivityIndicator color="#04110B" />
+                    ) : (
+                      <ThemedText style={styles.primaryButtonText}>
+                        Connect Robot to WiFi
+                      </ThemedText>
+                    )}
+                  </Pressable>
+                </View>
+
+                <View style={styles.statusRow}>
+                  <ThemedText style={styles.statusLabel}>Status:</ThemedText>
+                  <View style={styles.statusValueRow}>
+                    <View style={[styles.statusIndicator, { backgroundColor: getStatusColor() }]} />
+                    <ThemedText style={styles.statusValue}>{getStatusText()}</ThemedText>
+                  </View>
+                </View>
+              </ThemedView>
+            )}
+          </View>
+
+          {/* Wi-Fi Section */}
+          <View>
+            <View style={styles.sectionHeader}>
+              <View>
+                <ThemedText style={styles.sectionTitle}>Wi-Fi</ThemedText>
               </View>
             </View>
+
+            {/* Robot Wi-Fi Status Card */}
+            <ThemedView style={styles.sectionCard}>
+              <ThemedText style={styles.sectionTitle}>Robot Wi-Fi</ThemedText>
+              <View style={styles.statusRow}>
+                <ThemedText style={styles.statusLabel}>Status:</ThemedText>
+                <ThemedText style={styles.statusValue}>
+                  {status?.network?.wifiSsid || status?.network?.ssid
+                    ? `Connected to ${status.network.wifiSsid || status.network.ssid
+                    }`
+                    : "Not connected"}
+                </ThemedText>
+              </View>
+
+              {isConnectedToRobot &&
+                !status?.network?.wifiSsid &&
+                !status?.network?.ssid && (
+                  <>
+                    <Pressable
+                      style={[
+                        styles.primaryButton,
+                        (isScanningRobotWifi || !isConnectedToRobot) &&
+                        styles.disabledPrimary,
+                      ]}
+                      onPress={handleScanRobotWifi}
+                      disabled={isScanningRobotWifi || !isConnectedToRobot}
+                    >
+                      {isScanningRobotWifi ? (
+                        <ActivityIndicator color="#04110B" />
+                      ) : (
+                        <ThemedText style={styles.primaryButtonText}>
+                          Scan networks
+                        </ThemedText>
+                      )}
+                    </Pressable>
+
+                    {robotWifiNetworks.length > 0 && (
+                      <View style={styles.wifiList}>
+                        <ThemedText style={styles.subsectionTitle}>
+                          Available networks
+                        </ThemedText>
+                        {robotWifiNetworks.map((network, index) => {
+                          const signalInfo = getSignalStrengthInfo(
+                            network.rssi
+                          );
+                          return (
+                            <Pressable
+                              key={`${network.ssid}-${index}`}
+                              style={styles.wifiItem}
+                              onPress={() => {
+                                // TODO: Open password input modal
+                                Alert.alert(
+                                  "Connect",
+                                  `Connect to ${network.ssid}? (Password input coming soon)`
+                                );
+                              }}
+                            >
+                              <ThemedText style={styles.wifiSsid}>
+                                {network.ssid}
+                              </ThemedText>
+                              <View
+                                style={[
+                                  styles.signalBadge,
+                                  { borderColor: signalInfo.color },
+                                ]}
+                              >
+                                <View
+                                  style={[
+                                    styles.signalDot,
+                                    { backgroundColor: signalInfo.color },
+                                  ]}
+                                />
+                                <ThemedText
+                                  style={[
+                                    styles.signalBadgeText,
+                                    { color: signalInfo.color },
+                                  ]}
+                                >
+                                  {signalInfo.label}
+                                </ThemedText>
+                              </View>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    )}
+                  </>
+                )}
+            </ThemedView>
 
             {/* Previously Connected Robots Card */}
             {savedRobots.length !== 0 && <ThemedView style={styles.sectionCard}>

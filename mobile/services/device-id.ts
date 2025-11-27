@@ -10,8 +10,13 @@ const DEVICE_ID_STORAGE_KEY = "device_id";
 export async function getDeviceId(): Promise<string> {
   try {
     // Check if SecureStore is available
-    if (SecureStore.isAvailableAsync && !(await SecureStore.isAvailableAsync())) {
-      console.warn("SecureStore is not available, generating temporary device ID");
+    if (
+      SecureStore.isAvailableAsync &&
+      !(await SecureStore.isAvailableAsync())
+    ) {
+      console.warn(
+        "SecureStore is not available, generating temporary device ID"
+      );
       // Fallback to a temporary in-memory ID (won't persist)
       return `temp-${randomUUID()}`;
     }
@@ -62,4 +67,3 @@ export async function getDeviceInfo(): Promise<{
     platform,
   };
 }
-
