@@ -1,82 +1,47 @@
 import { Image } from 'expo-image';
 import { useRouter } from 'expo-router';
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import Animated, { 
+  useSharedValue, 
+  useAnimatedStyle, 
+  withRepeat, 
+  withSequence,
+  withTiming,
+  FadeInDown,
+  FadeIn
+} from 'react-native-reanimated';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { useRobot } from '@/context/robot-provider';
 
-const ROBOT_FEATURES = [
+const PRIMARY_ACTIONS = [
   {
-    id: 'stream',
-    label: 'Live View',
-    description: 'See through my eyes',
-    href: '/manual' as const,
-    icon: 'video.fill' as const,
-    iconBg: '#3B82F6',
-    iconColor: '#FFFFFF',
+    id: 'voice',
+    label: 'Voice Chat',
+    description: 'Talk with AI',
+    href: '/agentic' as const,
+    icon: 'mic.fill' as const,
+    gradient: ['#1DD1A1', '#17B891'],
   },
   {
-    id: 'patrol',
-    label: 'Patrol',
-    description: 'Guard & explore',
+    id: 'drive',
+    label: 'Manual Drive',
+    description: 'Take control',
     href: '/manual' as const,
-    icon: 'shield.fill' as const,
-    iconBg: '#F59E0B',
-    iconColor: '#FFFFFF',
-  },
-  {
-    id: 'follow',
-    label: 'Follow Me',
-    description: 'Stay by your side',
-    href: '/manual' as const,
-    icon: 'figure.walk' as const,
-    iconBg: '#8B5CF6',
-    iconColor: '#FFFFFF',
-  },
-  {
-    id: 'detect',
-    label: 'Detect',
-    description: 'Find people & objects',
-    href: '/manual' as const,
-    icon: 'person.crop.rectangle' as const,
-    iconBg: '#EC4899',
-    iconColor: '#FFFFFF',
-  },
-  {
-    id: 'goto',
-    label: 'Go To',
-    description: 'Navigate somewhere',
-    href: '/manual' as const,
-    icon: 'location.fill' as const,
-    iconBg: '#10B981',
-    iconColor: '#FFFFFF',
-  },
-  {
-    id: 'snapshot',
-    label: 'Snapshot',
-    description: 'Capture a photo',
-    href: '/manual' as const,
-    icon: 'camera.fill' as const,
-    iconBg: '#EF4444',
-    iconColor: '#FFFFFF',
+    icon: 'gamecontroller.fill' as const,
+    gradient: ['#3B82F6', '#2563EB'],
   },
 ] as const;
 
-const QUICK_ACTIONS = [
+const SECONDARY_ACTIONS = [
   {
-    id: 'drive',
-    label: 'Drive',
-    icon: 'arrow.up.arrow.down' as const,
-    href: '/manual' as const,
-  },
-  {
-    id: 'memory',
-    label: 'Memory',
-    icon: 'brain' as const,
+    id: 'status',
+    label: 'Status',
+    icon: 'chart.bar.fill' as const,
     href: '/(tabs)/status' as const,
   },
   {
@@ -105,6 +70,26 @@ export default function HomeScreen() {
   const isOnline = Boolean(status?.network?.ip);
   const wifiLabel = status?.network?.wifiSsid ?? status?.network?.ssid ?? (isOnline ? 'Connected' : 'Offline');
 
+  // Animated pulse for status dot
+  const pulseScale = useSharedValue(1);
+  
+  useEffect(() => {
+    if (isOnline) {
+      pulseScale.value = withRepeat(
+        withSequence(
+          withTiming(1.2, { duration: 1000 }),
+          withTiming(1, { duration: 1000 })
+        ),
+        -1,
+        false
+      );
+    }
+  }, [isOnline]);
+
+  const pulseStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: pulseScale.value }],
+  }));
+
   return (
     <SafeAreaView style={styles.safeArea} edges={["top"]}>
       <ThemedView style={styles.screen}>
@@ -112,123 +97,112 @@ export default function HomeScreen() {
           contentContainerStyle={styles.content}
           showsVerticalScrollIndicator={false}
         >
-          {/* Header with robot identity */}
-          <View style={styles.header}>
-            <View style={styles.robotIdentity}>
-              <View style={styles.avatarContainer}>
-                <Image
-                  source={require("@/assets/images/rovy.png")}
-                  style={styles.avatar}
-                  contentFit="cover"
-                />
-                <View style={[styles.statusDot, { backgroundColor: isOnline ? '#34D399' : '#EF4444' }]} />
-              </View>
-              <View style={styles.robotInfo}>
-                <ThemedText style={styles.robotName}>JARVIS</ThemedText>
-                <ThemedText style={styles.robotSubtitle}>
-                  Your AI Robot Assistant
-                </ThemedText>
-              </View>
-            </View>
-          </View>
-
-          {/* Status bar - compact battery and wifi */}
-          <View style={styles.statusBar}>
-            <View style={styles.statusItem}>
-              <IconSymbol name="battery.75" color={batteryColor} size={16} />
-              <ThemedText style={styles.statusText}>{batteryLabel}</ThemedText>
-            </View>
-            <View style={styles.statusDivider} />
-            <View style={styles.statusItem}>
-              <IconSymbol 
-                name="wifi" 
-                color={isOnline ? '#34D399' : '#67686C'} 
-                size={16} 
-              />
-              <ThemedText style={styles.statusText}>{wifiLabel}</ThemedText>
-            </View>
-            {status?.network?.ip && (
-              <>
-                <View style={styles.statusDivider} />
-                <ThemedText style={styles.statusIp}>{status.network.ip}</ThemedText>
-              </>
-            )}
-          </View>
-
-          {/* Main Talk button - primary CTA */}
-          <Pressable
-            style={({ pressed }) => [
-              styles.talkButton,
-              pressed && styles.talkButtonPressed,
-            ]}
-            onPress={() => router.push('/agentic')}
+          {/* Hero Section with Robot */}
+          <Animated.View 
+            entering={FadeIn.duration(600)}
+            style={styles.heroSection}
           >
-            <View style={styles.talkIconContainer}>
-              <IconSymbol name="mic.fill" size={32} color="#04110B" />
+            <View style={styles.heroContent}>
+              <Image
+                source={require("@/assets/images/rovy.png")}
+                style={styles.heroImage}
+                contentFit="contain"
+              />
+              <View style={styles.heroTextContainer}>
+                <ThemedText style={styles.heroTitle}>JARVIS</ThemedText>
+                <ThemedText style={styles.heroSubtitle}>Ready to assist</ThemedText>
+              </View>
             </View>
-            <View style={styles.talkContent}>
-              <ThemedText style={styles.talkLabel}>Talk to JARVIS</ThemedText>
-              <ThemedText style={styles.talkHint}>
-                Tap to start a voice conversation
-              </ThemedText>
-            </View>
-            <IconSymbol name="chevron.right" size={20} color="#04110B" />
-          </Pressable>
-
-          {/* Feature grid */}
-          <View style={styles.sectionHeader}>
-            <ThemedText style={styles.sectionTitle}>Capabilities</ThemedText>
-          </View>
-
-          <View style={styles.featureGrid}>
-            {ROBOT_FEATURES.map((feature) => (
-              <Pressable
-                key={feature.id}
-                style={({ pressed }) => [
-                  styles.featureCard,
-                  pressed && styles.featureCardPressed,
-                ]}
-                onPress={() => router.push(feature.href)}
-              >
-                <View style={[styles.featureIcon, { backgroundColor: feature.iconBg }]}>
-                  <IconSymbol
-                    name={feature.icon}
-                    size={20}
-                    color={feature.iconColor}
-                  />
-                </View>
-                <ThemedText style={styles.featureLabel}>{feature.label}</ThemedText>
-                <ThemedText style={styles.featureDescription}>
-                  {feature.description}
-                </ThemedText>
-              </Pressable>
-            ))}
-          </View>
-
-          {/* Quick actions */}
-          <View style={styles.sectionHeader}>
-            <ThemedText style={styles.sectionTitle}>Quick Actions</ThemedText>
-          </View>
-
-          <View style={styles.quickActionsRow}>
-            {QUICK_ACTIONS.map((action) => (
-              <Pressable
-                key={action.id}
-                style={({ pressed }) => [
-                  styles.quickAction,
-                  pressed && styles.quickActionPressed,
-                ]}
-                onPress={() => router.push(action.href)}
-              >
-                <IconSymbol
-                  name={action.icon}
-                  size={20}
-                  color="#D1D5DB"
+            
+            {/* Inline Status */}
+            <View style={styles.inlineStatus}>
+              <View style={styles.statusChip}>
+                <Animated.View 
+                  style={[
+                    styles.statusIndicator,
+                    { backgroundColor: isOnline ? '#34D399' : '#EF4444' },
+                    isOnline && pulseStyle
+                  ]}
                 />
-                <ThemedText style={styles.quickActionLabel}>{action.label}</ThemedText>
-              </Pressable>
+                <ThemedText style={styles.statusChipText}>
+                  {isOnline ? 'Online' : 'Offline'}
+                </ThemedText>
+              </View>
+              <View style={styles.statusChip}>
+                <IconSymbol name="battery.75" color={batteryColor} size={14} />
+                <ThemedText style={styles.statusChipText}>{batteryLabel}</ThemedText>
+              </View>
+            </View>
+          </Animated.View>
+
+          {/* Primary Actions - Big Cards */}
+          <Animated.View 
+            entering={FadeInDown.delay(200).duration(500)}
+            style={styles.primarySection}
+          >
+            {PRIMARY_ACTIONS.map((action, index) => (
+              <Animated.View 
+                key={action.id}
+                entering={FadeInDown.delay(300 + index * 100).duration(500)}
+              >
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.primaryCard,
+                    pressed && styles.primaryCardPressed,
+                  ]}
+                  onPress={() => router.push(action.href)}
+                >
+                  <View style={styles.primaryCardContent}>
+                    <View style={[styles.primaryIconContainer, { backgroundColor: action.gradient[0] }]}>
+                      <IconSymbol name={action.icon} size={28} color="#FFFFFF" />
+                    </View>
+                    <View style={styles.primaryTextContainer}>
+                      <ThemedText style={styles.primaryLabel}>{action.label}</ThemedText>
+                      <ThemedText style={styles.primaryDescription}>{action.description}</ThemedText>
+                    </View>
+                    <IconSymbol name="chevron.right" size={20} color="#9CA3AF" />
+                  </View>
+                </Pressable>
+              </Animated.View>
             ))}
-          </View>
+          </Animated.View>
+
+          {/* Secondary Actions - Compact */}
+          <Animated.View 
+            entering={FadeInDown.delay(500).duration(500)}
+            style={styles.secondarySection}
+          >
+            {SECONDARY_ACTIONS.map((action, index) => (
+              <Animated.View 
+                key={action.id}
+                entering={FadeInDown.delay(600 + index * 80).duration(400)}
+                style={{ flex: 1 }}
+              >
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.secondaryCard,
+                    pressed && styles.secondaryCardPressed,
+                  ]}
+                  onPress={() => router.push(action.href)}
+                >
+                  <IconSymbol name={action.icon} size={24} color="#E5E7EB" />
+                  <ThemedText style={styles.secondaryLabel}>{action.label}</ThemedText>
+                </Pressable>
+              </Animated.View>
+            ))}
+          </Animated.View>
+
+          {/* System Info - Minimal */}
+          {status?.network?.ip && (
+            <Animated.View 
+              entering={FadeInDown.delay(700).duration(500)}
+              style={styles.infoFooter}
+            >
+              <ThemedText style={styles.infoText}>
+                {wifiLabel} • {status.network.ip}
+              </ThemedText>
+            </Animated.View>
+          )}
 
         </ScrollView>
       </ThemedView>
@@ -246,180 +220,155 @@ const styles = StyleSheet.create({
     backgroundColor: '#0F0F0F',
   },
   content: {
-    padding: 20,
+    padding: 24,
+    paddingTop: 16,
     paddingBottom: 48,
+    gap: 24,
+  },
+  
+  // Hero Section
+  heroSection: {
     gap: 20,
   },
-  header: {
-    marginBottom: 4,
-  },
-  robotIdentity: {
-    flexDirection: 'row',
+  heroContent: {
     alignItems: 'center',
     gap: 16,
+    paddingVertical: 20,
   },
-  avatarContainer: {
-    position: 'relative',
+  heroImage: {
+    width: 160,
+    height: 120,
   },
-  avatar: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    borderWidth: 2,
-    borderColor: '#1DD1A1',
+  heroTextContainer: {
+    alignItems: 'center',
+    gap: 4,
   },
-  statusDot: {
-    position: 'absolute',
-    bottom: 2,
-    right: 2,
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    borderWidth: 2,
-    borderColor: '#0F0F0F',
-  },
-  robotInfo: {
-    flex: 1,
-  },
-  robotName: {
-    fontSize: 28,
+  heroTitle: {
+    fontSize: 36,
     fontFamily: 'JetBrainsMono_700Bold',
     color: '#F9FAFB',
-    letterSpacing: -0.5,
+    letterSpacing: -1,
   },
-  robotSubtitle: {
-    fontSize: 14,
-    color: '#67686C',
-    marginTop: 2,
+  heroSubtitle: {
+    fontSize: 16,
+    color: '#9CA3AF',
+    fontFamily: 'JetBrainsMono_400Regular',
   },
-  statusBar: {
+  
+  // Inline Status
+  inlineStatus: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  statusChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#1A1A1A',
-    paddingVertical: 12,
+    gap: 8,
     paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: 'rgba(26, 26, 26, 0.6)',
     borderWidth: 1,
-    borderColor: '#252525',
+    borderColor: 'rgba(37, 37, 37, 0.4)',
+    borderRadius: 20,
   },
-  statusItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
+  statusIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
   },
-  statusText: {
+  statusChipText: {
     fontSize: 13,
     color: '#D1D5DB',
     fontFamily: 'JetBrainsMono_500Medium',
   },
-  statusIp: {
+  
+  // Primary Actions
+  primarySection: {
+    gap: 16,
+  },
+  primaryCard: {
+    backgroundColor: 'rgba(26, 26, 26, 0.7)',
+    borderWidth: 1,
+    borderColor: 'rgba(37, 37, 37, 0.6)',
+    borderRadius: 16,
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  primaryCardPressed: {
+    backgroundColor: 'rgba(34, 34, 34, 0.9)',
+    transform: [{ scale: 0.98 }],
+  },
+  primaryCardContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 20,
+    gap: 16,
+  },
+  primaryIconContainer: {
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  primaryTextContainer: {
+    flex: 1,
+    gap: 4,
+  },
+  primaryLabel: {
+    fontSize: 18,
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    color: '#F9FAFB',
+  },
+  primaryDescription: {
+    fontSize: 14,
+    color: '#9CA3AF',
+  },
+  
+  // Secondary Actions
+  secondarySection: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  secondaryCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    paddingVertical: 24,
+    paddingHorizontal: 16,
+    backgroundColor: 'rgba(26, 26, 26, 0.6)',
+    borderWidth: 1,
+    borderColor: 'rgba(37, 37, 37, 0.4)',
+    borderRadius: 16,
+  },
+  secondaryCardPressed: {
+    backgroundColor: 'rgba(34, 34, 34, 0.8)',
+    transform: [{ scale: 0.97 }],
+  },
+  secondaryLabel: {
+    fontSize: 14,
+    fontFamily: 'JetBrainsMono_500Medium',
+    color: '#D1D5DB',
+  },
+  
+  // Footer Info
+  infoFooter: {
+    alignItems: 'center',
+    paddingTop: 8,
+  },
+  infoText: {
     fontSize: 12,
     color: '#67686C',
     fontFamily: 'JetBrainsMono_400Regular',
-  },
-  statusDivider: {
-    width: 1,
-    height: 16,
-    backgroundColor: '#303030',
-    marginHorizontal: 12,
-  },
-  talkButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1DD1A1',
-    padding: 20,
-    gap: 16,
-  },
-  talkButtonPressed: {
-    backgroundColor: '#17B891',
-  },
-  talkIconContainer: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: 'rgba(4, 17, 11, 0.15)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  talkContent: {
-    flex: 1,
-  },
-  talkLabel: {
-    fontSize: 18,
-    fontFamily: 'JetBrainsMono_700Bold',
-    color: '#04110B',
-  },
-  talkHint: {
-    fontSize: 13,
-    color: '#04110B',
-    opacity: 0.7,
-    marginTop: 2,
-  },
-  sectionHeader: {
-    marginTop: 8,
-  },
-  sectionTitle: {
-    fontSize: 13,
-    fontFamily: 'JetBrainsMono_600SemiBold',
-    color: '#67686C',
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-  },
-  featureGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  featureCard: {
-    width: '31.5%',
-    backgroundColor: '#1A1A1A',
-    padding: 14,
-    borderWidth: 1,
-    borderColor: '#252525',
-    gap: 8,
-  },
-  featureCardPressed: {
-    backgroundColor: '#222222',
-    borderColor: '#353535',
-  },
-  featureIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  featureLabel: {
-    fontSize: 14,
-    fontFamily: 'JetBrainsMono_600SemiBold',
-    color: '#F9FAFB',
-  },
-  featureDescription: {
-    fontSize: 11,
-    color: '#67686C',
-    lineHeight: 14,
-  },
-  quickActionsRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  quickAction: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    backgroundColor: '#1A1A1A',
-    paddingVertical: 14,
-    borderWidth: 1,
-    borderColor: '#252525',
-  },
-  quickActionPressed: {
-    backgroundColor: '#222222',
-    borderColor: '#353535',
-  },
-  quickActionLabel: {
-    fontSize: 14,
-    fontFamily: 'JetBrainsMono_500Medium',
-    color: '#D1D5DB',
   },
 });

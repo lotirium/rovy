@@ -5,6 +5,15 @@ import { Audio, Recording } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import Animated, { 
+  FadeInDown, 
+  FadeIn,
+  useSharedValue,
+  useAnimatedStyle,
+  withRepeat,
+  withSequence,
+  withTiming
+} from 'react-native-reanimated';
 
 import { CameraVideo } from '@/components/camera-video';
 import { ThemedText } from '@/components/themed-text';
@@ -71,6 +80,28 @@ export default function AgenticVoiceScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
   const [voiceLog, setVoiceLog] = useState<VoiceLogEntry[]>([]);
+
+  // Animation for recording pulse
+  const recordingPulse = useSharedValue(1);
+
+  useEffect(() => {
+    if (isRecording) {
+      recordingPulse.value = withRepeat(
+        withSequence(
+          withTiming(1.1, { duration: 500 }),
+          withTiming(1, { duration: 500 })
+        ),
+        -1,
+        false
+      );
+    } else {
+      recordingPulse.value = withTiming(1, { duration: 200 });
+    }
+  }, [isRecording]);
+
+  const recordingPulseStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: recordingPulse.value }],
+  }));
 
   const appendLog = useCallback((entry: Omit<VoiceLogEntry, 'id' | 'timestamp'>) => {
     setVoiceLog((prev) => {
@@ -468,14 +499,20 @@ export default function AgenticVoiceScreen() {
   return (
     <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
       <ThemedView style={styles.container}>
-        <View style={styles.headerRow}>
+        <Animated.View 
+          entering={FadeIn.duration(400)}
+          style={styles.headerRow}
+        >
           <Pressable style={styles.backButton} onPress={() => router.back()}>
             <IconSymbol name="chevron.left" size={16} color="#E5E7EB" />
           </Pressable>
-          <ThemedText type="title">Agentic control</ThemedText>
-        </View>
+          <ThemedText type="title">Voice Control</ThemedText>
+        </Animated.View>
 
-        <View style={styles.statusRow}>
+        <Animated.View 
+          entering={FadeInDown.delay(100).duration(400)}
+          style={styles.statusRow}
+        >
           <View style={styles.statusPill}>
             <View style={[styles.statusDot, isCameraStreaming ? styles.statusOn : styles.statusOff]} />
             <ThemedText style={styles.statusText}>
@@ -488,7 +525,7 @@ export default function AgenticVoiceScreen() {
               Voice {isAudioConnected ? 'linked' : isAudioConnecting ? 'connecting' : 'disconnected'}
             </ThemedText>
           </View>
-        </View>
+        </Animated.View>
 
         <CameraVideo
           wsUrl={cameraWsUrl}
@@ -499,83 +536,101 @@ export default function AgenticVoiceScreen() {
           onToggleStream={handleToggleCamera}
         />
 
-        <ThemedView style={styles.card}>
-          <View style={styles.cardHeader}>
-            <ThemedText type="subtitle">Push-to-talk</ThemedText>
-            <Pressable onPress={isAudioConnected ? disconnectAudioSocket : connectAudioSocket}>
-              <ThemedText type="link">{isAudioConnected ? 'Reconnect' : 'Retry link'}</ThemedText>
-            </Pressable>
-          </View>
-          <Pressable
-            style={[
-              styles.talkButton,
-              isRecording && styles.talkButtonActive,
-              !isAudioConnected && styles.talkButtonDisabled,
-            ]}
-            onPressIn={startRecording}
-            onPressOut={stopRecording}
-            disabled={!isAudioConnected}
-          >
-            {isRecording ? (
-              <ActivityIndicator color="#04110B" />
-            ) : (
-              <IconSymbol name="mic.fill" size={18} color="#04110B" />
-            )}
-            <ThemedText style={styles.talkButtonText}>
-              {isRecording ? 'Recording...' : !isAudioConnected ? 'Waiting for connection...' : 'Hold to talk'}
-            </ThemedText>
-          </Pressable>
-          {recordingError ? (
-            <ThemedText style={styles.errorText}>{recordingError}</ThemedText>
-          ) : null}
-          {audioError ? (
-            <ThemedText style={styles.errorText}>{audioError}</ThemedText>
-          ) : null}
-        </ThemedView>
-
-        <ThemedView style={styles.logCard}>
-          <View style={styles.cardHeader}>
-            <ThemedText type="subtitle">Conversation log</ThemedText>
-            <View style={styles.logLegend}>
-              <View style={[styles.legendDot, styles.legendRobot]} />
-              <ThemedText style={styles.legendText}>Robot</ThemedText>
-              <View style={[styles.legendDot, styles.legendYou]} />
-              <ThemedText style={styles.legendText}>You</ThemedText>
+        <Animated.View entering={FadeInDown.delay(300).duration(400)}>
+          <ThemedView style={styles.card}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="subtitle">Push-to-talk</ThemedText>
+              <Pressable onPress={isAudioConnected ? disconnectAudioSocket : connectAudioSocket}>
+                <ThemedText type="link">{isAudioConnected ? 'Reconnect' : 'Retry link'}</ThemedText>
+              </Pressable>
             </View>
-          </View>
-          <ScrollView style={styles.logScroll} showsVerticalScrollIndicator={false}>
-            {voiceLog.length === 0 ? (
-              <View style={styles.emptyLog}>
-                <Image
-                  source={require('@/assets/images/rovy.png')}
-                  style={styles.emptyImage}
-                  contentFit="contain"
-                />
-                <ThemedText style={styles.emptyText}>
-                  Hold the microphone to start a conversation with your robot.
-                </ThemedText>
-              </View>
-            ) : (
-              voiceLog.map((entry) => (
-                <View
-                  key={entry.id}
-                  style={[
-                    styles.logItem,
-                    entry.tone === 'client' ? styles.logItemClient : styles.logItemRobot,
-                  ]}
-                >
-                  <View style={styles.logItemHeader}>
-                    <ThemedText style={styles.logLabel}>{entry.label}</ThemedText>
-                    <ThemedText style={styles.logTime}>
-                      {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            <Animated.View style={isRecording ? recordingPulseStyle : undefined}>
+              <Pressable
+                style={[
+                  styles.talkButton,
+                  isRecording && styles.talkButtonActive,
+                  !isAudioConnected && styles.talkButtonDisabled,
+                ]}
+                onPressIn={startRecording}
+                onPressOut={stopRecording}
+                disabled={!isAudioConnected}
+              >
+                {isRecording ? (
+                  <>
+                    <View style={styles.recordingIndicator}>
+                      <View style={styles.recordingDot} />
+                    </View>
+                    <ThemedText style={styles.talkButtonText}>Listening...</ThemedText>
+                  </>
+                ) : (
+                  <>
+                    <IconSymbol name="mic.fill" size={18} color="#04110B" />
+                    <ThemedText style={styles.talkButtonText}>
+                      {!isAudioConnected ? 'Waiting for connection...' : 'Hold to talk'}
                     </ThemedText>
-                  </View>
-                  <ThemedText style={styles.logMessage}>{entry.message}</ThemedText>
+                  </>
+                )}
+              </Pressable>
+            </Animated.View>
+            {recordingError ? (
+              <ThemedText style={styles.errorText}>{recordingError}</ThemedText>
+            ) : null}
+            {audioError ? (
+              <ThemedText style={styles.errorText}>{audioError}</ThemedText>
+            ) : null}
+          </ThemedView>
+        </Animated.View>
+
+        <Animated.View entering={FadeInDown.delay(400).duration(400)} style={{ flex: 1 }}>
+          <ThemedView style={styles.logCard}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="subtitle">Conversation</ThemedText>
+              <View style={styles.logLegend}>
+                <View style={[styles.legendDot, styles.legendRobot]} />
+                <ThemedText style={styles.legendText}>AI</ThemedText>
+                <View style={[styles.legendDot, styles.legendYou]} />
+                <ThemedText style={styles.legendText}>You</ThemedText>
+              </View>
+            </View>
+            <ScrollView style={styles.logScroll} showsVerticalScrollIndicator={false}>
+              {voiceLog.length === 0 ? (
+                <View style={styles.emptyLog}>
+                  <Image
+                    source={require('@/assets/images/rovy.png')}
+                    style={styles.emptyImage}
+                    contentFit="contain"
+                  />
+                  <ThemedText style={styles.emptyTitle}>Ready to chat</ThemedText>
+                  <ThemedText style={styles.emptyText}>
+                    Hold the microphone button to start talking with JARVIS
+                  </ThemedText>
                 </View>
-              ))
-            )}
-          </ScrollView>
-        </ThemedView>
+              ) : (
+                voiceLog.map((entry, index) => (
+                  <Animated.View
+                    key={entry.id}
+                    entering={FadeInDown.delay(index * 30).duration(300)}
+                  >
+                    <View
+                      style={[
+                        styles.logItem,
+                        entry.tone === 'client' ? styles.logItemClient : styles.logItemRobot,
+                      ]}
+                    >
+                      <View style={styles.logItemHeader}>
+                        <ThemedText style={styles.logLabel}>{entry.label}</ThemedText>
+                        <ThemedText style={styles.logTime}>
+                          {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        </ThemedText>
+                      </View>
+                      <ThemedText style={styles.logMessage}>{entry.message}</ThemedText>
+                    </View>
+                  </Animated.View>
+                ))
+              )}
+            </ScrollView>
+          </ThemedView>
+        </Animated.View>
       </ThemedView>
     </SafeAreaView>
   );
@@ -640,10 +695,15 @@ const styles = StyleSheet.create({
   card: {
     padding: 16,
     gap: 12,
-    borderRadius: 0,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#202020',
-    backgroundColor: '#1C1C1C',
+    borderColor: 'rgba(37, 37, 37, 0.6)',
+    backgroundColor: 'rgba(26, 26, 26, 0.7)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 2,
   },
   cardHeader: {
     flexDirection: 'row',
@@ -659,19 +719,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
-    paddingVertical: 16,
-    borderRadius: 12,
+    paddingVertical: 18,
+    borderRadius: 14,
     backgroundColor: '#1DD1A1',
+    shadowColor: '#1DD1A1',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 4,
   },
   talkButtonActive: {
-    backgroundColor: '#0DAA80',
+    backgroundColor: '#EF4444',
+    shadowColor: '#EF4444',
   },
   talkButtonDisabled: {
-    opacity: 0.5,
+    opacity: 0.4,
   },
   talkButtonText: {
     color: '#04110B',
-    fontWeight: '700',
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    fontSize: 15,
+  },
+  recordingIndicator: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(4, 17, 11, 0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recordingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#04110B',
   },
   errorText: {
     color: '#F87171',
@@ -680,11 +761,16 @@ const styles = StyleSheet.create({
   logCard: {
     flex: 1,
     borderWidth: 1,
-    borderColor: '#202020',
-    backgroundColor: '#0F1512',
-    borderRadius: 0,
+    borderColor: 'rgba(37, 37, 37, 0.6)',
+    backgroundColor: 'rgba(15, 21, 18, 0.8)',
+    borderRadius: 12,
     padding: 16,
     gap: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 2,
   },
   logScroll: {
     flex: 1,
@@ -693,31 +779,45 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 12,
-    paddingVertical: 40,
-  },
-  emptyText: {
-    color: '#9CA3AF',
-    textAlign: 'center',
+    paddingVertical: 48,
   },
   emptyImage: {
     width: 120,
     height: 80,
+    marginBottom: 8,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    color: '#E5E7EB',
+    marginBottom: 4,
+  },
+  emptyText: {
+    color: '#9CA3AF',
+    textAlign: 'center',
+    lineHeight: 20,
+    paddingHorizontal: 20,
   },
   logItem: {
-    padding: 12,
-    borderRadius: 10,
-    gap: 6,
-    marginBottom: 10,
+    padding: 14,
+    borderRadius: 12,
+    gap: 8,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 1,
   },
   logItemRobot: {
-    backgroundColor: '#111827',
+    backgroundColor: 'rgba(17, 24, 39, 0.8)',
     borderWidth: 1,
-    borderColor: '#1F2937',
+    borderColor: 'rgba(31, 41, 55, 0.6)',
   },
   logItemClient: {
-    backgroundColor: '#11261E',
+    backgroundColor: 'rgba(17, 38, 30, 0.8)',
     borderWidth: 1,
-    borderColor: '#1DD1A1',
+    borderColor: 'rgba(29, 209, 161, 0.4)',
   },
   logItemHeader: {
     flexDirection: 'row',
