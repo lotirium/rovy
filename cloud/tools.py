@@ -425,116 +425,110 @@ class ToolExecutor:
             return {"success": False, "result": f"Music control error: {str(e)}", "data": None}
     
     async def _spotify_control(self, action: str, query: str = "") -> Dict[str, Any]:
-        """Control Spotify playback using Web API."""
-        if not await self._ensure_client():
-            return {"success": False, "result": "Cannot connect to Spotify", "data": None}
-        
+        """Control Spotify playback using Web API with user auth."""
         try:
-            # Get Spotify credentials
+            # Import spotipy
+            try:
+                import spotipy
+                from spotipy.oauth2 import SpotifyOAuth
+            except ImportError:
+                return {"success": False, "result": "Spotify library not installed. Run: pip install spotipy", "data": None}
+            
+            # Get credentials
             client_id = os.getenv("SPOTIFY_CLIENT_ID")
             client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+            redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
             
             if not client_id or not client_secret:
+                return {"success": False, "result": "Spotify credentials not configured", "data": None}
+            
+            # Create Spotify client with cached token
+            sp_oauth = SpotifyOAuth(
+                client_id=client_id,
+                client_secret=client_secret,
+                redirect_uri=redirect_uri,
+                scope="user-read-playback-state,user-modify-playback-state,user-library-read",
+                cache_path=".spotify_token_cache"
+            )
+            
+            token_info = sp_oauth.get_cached_token()
+            if not token_info:
                 return {
                     "success": False,
-                    "result": "Spotify credentials not configured",
+                    "result": "Spotify not authenticated. Run: python cloud/auth_spotify.py",
                     "data": None
                 }
             
-            # Get access token
-            token = await self._get_spotify_token(client_id, client_secret)
-            if not token:
-                return {"success": False, "result": "Could not authenticate with Spotify", "data": None}
+            sp = spotipy.Spotify(auth=token_info['access_token'])
             
-            headers = {"Authorization": f"Bearer {token}"}
+            # Find ROVY device
+            devices = sp.devices()
+            rovy_device = None
+            for dev in devices.get('devices', []):
+                if 'ROVY' in dev['name'] or 'raspotify' in dev['name'].lower():
+                    rovy_device = dev
+                    break
+            
+            if not rovy_device:
+                return {
+                    "success": False,
+                    "result": "ROVY Spotify device not found. Make sure Raspotify is running.",
+                    "data": None
+                }
+            
+            device_id = rovy_device['id']
             
             if action == "play":
-                # Start playback - play user's liked songs shuffled
-                # First, try to get available devices
-                devices_response = await self.http_client.get(
-                    "https://api.spotify.com/v1/me/player/devices",
-                    headers=headers
-                )
-                
-                if devices_response.status_code != 200:
-                    return {
-                        "success": False,
-                        "result": "No Spotify devices available. Open Spotify on your phone/computer first.",
-                        "data": None
-                    }
-                
-                devices = devices_response.json().get("devices", [])
-                if not devices:
-                    return {
-                        "success": False,
-                        "result": "No active Spotify devices. Open Spotify app first.",
-                        "data": None
-                    }
-                
-                # Get user's saved tracks (liked songs)
-                tracks_response = await self.http_client.get(
-                    "https://api.spotify.com/v1/me/tracks?limit=50",
-                    headers=headers
-                )
-                
-                if tracks_response.status_code == 200:
-                    tracks = tracks_response.json().get("items", [])
+                # Play random from liked songs
+                try:
+                    # Get user's saved tracks
+                    results = sp.current_user_saved_tracks(limit=50)
+                    tracks = results['items']
+                    
                     if tracks:
-                        # Start playback with liked songs, shuffled
-                        play_response = await self.http_client.put(
-                            "https://api.spotify.com/v1/me/player/play",
-                            headers=headers,
-                            json={
-                                "context_uri": "spotify:collection:tracks",  # User's liked songs
-                                "offset": {"position": 0},
-                                "position_ms": 0
-                            }
-                        )
+                        # Get track URIs
+                        track_uris = [item['track']['uri'] for item in tracks]
                         
-                        # Enable shuffle
-                        await self.http_client.put(
-                            "https://api.spotify.com/v1/me/player/shuffle?state=true",
-                            headers=headers
-                        )
+                        # Start playback on ROVY device with shuffle
+                        sp.shuffle(True, device_id=device_id)
+                        sp.start_playback(device_id=device_id, uris=track_uris)
                         
                         return {
                             "success": True,
-                            "result": "Playing your liked songs on Spotify",
-                            "data": {"action": "play", "source": "liked_songs"}
+                            "result": f"Playing {len(tracks)} liked songs on ROVY (shuffled)",
+                            "data": {"action": "play", "tracks": len(tracks)}
                         }
-                
-                # Fallback: just resume playback
-                play_response = await self.http_client.put(
-                    "https://api.spotify.com/v1/me/player/play",
-                    headers=headers
-                )
-                
-                return {
-                    "success": True,
-                    "result": "Resuming Spotify playback",
-                    "data": {"action": "play"}
-                }
+                    else:
+                        # No liked songs, play a popular playlist
+                        sp.start_playback(device_id=device_id, context_uri="spotify:playlist:37i9dQZEVXbMDoHDwVN2tF")
+                        return {
+                            "success": True,
+                            "result": "Playing Global Top 50 on ROVY",
+                            "data": {"action": "play", "source": "playlist"}
+                        }
+                except Exception as e:
+                    # Fallback: try to just resume
+                    try:
+                        sp.start_playback(device_id=device_id)
+                        return {"success": True, "result": "Music playing on ROVY", "data": {"action": "play"}}
+                    except:
+                        return {"success": False, "result": f"Could not start playback: {str(e)}", "data": None}
             
             elif action == "pause":
-                await self.http_client.put(
-                    "https://api.spotify.com/v1/me/player/pause",
-                    headers=headers
-                )
-                return {"success": True, "result": "Paused Spotify", "data": {"action": "pause"}}
+                sp.pause_playback(device_id=device_id)
+                return {"success": True, "result": "Music paused", "data": {"action": "pause"}}
             
             elif action == "next":
-                await self.http_client.post(
-                    "https://api.spotify.com/v1/me/player/next",
-                    headers=headers
-                )
-                return {"success": True, "result": "Skipped to next song", "data": {"action": "next"}}
+                sp.next_track(device_id=device_id)
+                return {"success": True, "result": "Next track", "data": {"action": "next"}}
             
             elif action == "previous":
-                await self.http_client.post(
-                    "https://api.spotify.com/v1/me/player/previous",
-                    headers=headers
-                )
-                return {"success": True, "result": "Previous song", "data": {"action": "previous"}}
+                sp.previous_track(device_id=device_id)
+                return {"success": True, "result": "Previous track", "data": {"action": "previous"}}
+            
+            elif action == "stop":
+                sp.pause_playback(device_id=device_id)
+                return {"success": True, "result": "Music stopped", "data": {"action": "stop"}}
             
             else:
                 return {"success": False, "result": f"Unknown action: {action}", "data": None}
