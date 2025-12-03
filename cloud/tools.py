@@ -81,6 +81,15 @@ class ToolExecutor:
                     "query": "Search query"
                 },
                 "keywords": ["search", "look up", "find", "google", "who is", "what is"]
+            },
+            "move_robot": {
+                "description": "Move the robot in a direction",
+                "parameters": {
+                    "direction": "forward/backward/left/right",
+                    "distance": "Distance in meters (default 0.5)",
+                    "speed": "slow/medium/fast (default medium)"
+                },
+                "keywords": ["move", "go", "forward", "backward", "left", "right", "turn", "drive"]
             }
         }
     
@@ -136,8 +145,24 @@ class ToolExecutor:
             location = self._extract_location(query) or "Seoul"
             return {"tool": "get_weather", "params": {"location": location}}
         
-        # Music control
-        if 'music' in query_lower or 'song' in query_lower:
+        # Music control - check standalone commands first (without "music"/"song" keyword)
+        # This handles: "next", "next one", "skip", "pause", "resume", etc.
+        standalone_music_patterns = [
+            (r'\b(?:next|skip)\s*(?:song|track|one)?\b', 'next'),
+            (r'\b(?:previous|prev|back|last)\s*(?:song|track|one)?\b', 'previous'),
+            (r'\b(?:pause|hold)\s*(?:it|music|song|this)?\b', 'pause'),
+            (r'\b(?:resume|continue|unpause)\s*(?:music|song|it)?\b', 'play'),
+            (r'\b(?:stop)\s*(?:music|song|it|playing|this)?\b', 'stop'),
+        ]
+        
+        for pattern, action in standalone_music_patterns:
+            if re.search(pattern, query_lower):
+                # Make sure it's not part of a movement command
+                if not any(move_kw in query_lower for move_kw in ['move', 'go', 'drive', 'walk', 'turn', 'forward', 'backward']):
+                    return {"tool": "play_music", "params": {"action": action, "query": ""}}
+        
+        # Music control with explicit "music" or "song" keyword
+        if 'music' in query_lower or 'song' in query_lower or 'play' in query_lower:
             action = "play"
             if "pause" in query_lower:
                 action = "pause"
@@ -148,6 +173,36 @@ class ToolExecutor:
             elif "previous" in query_lower or "back" in query_lower:
                 action = "previous"
             return {"tool": "play_music", "params": {"action": action, "query": ""}}
+        
+        # Robot movement
+        movement_keywords = ['move', 'go', 'drive', 'turn']
+        if any(kw in query_lower for kw in movement_keywords):
+            direction = "forward"  # default
+            distance = 0.5
+            speed = "medium"
+            
+            # Detect direction
+            if 'forward' in query_lower or 'ahead' in query_lower or 'straight' in query_lower:
+                direction = "forward"
+            elif 'backward' in query_lower or 'back' in query_lower or 'reverse' in query_lower:
+                direction = "backward"
+            elif 'left' in query_lower:
+                direction = "left"
+            elif 'right' in query_lower:
+                direction = "right"
+            
+            # Detect speed
+            if 'fast' in query_lower or 'quick' in query_lower:
+                speed = "fast"
+            elif 'slow' in query_lower or 'slowly' in query_lower:
+                speed = "slow"
+            
+            # Detect distance (optional - look for numbers)
+            distance_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:meter|metre|m\b)', query_lower)
+            if distance_match:
+                distance = float(distance_match.group(1))
+            
+            return {"tool": "move_robot", "params": {"direction": direction, "distance": distance, "speed": speed}}
         
         # Reminders
         if 'remind' in query_lower:
@@ -211,6 +266,12 @@ class ToolExecutor:
                 return await self.calculate(params.get("expression", ""))
             elif tool_name == "play_music":
                 return await self.play_music(params.get("action", "play"), params.get("query", ""))
+            elif tool_name == "move_robot":
+                return await self.move_robot(
+                    params.get("direction", "forward"),
+                    params.get("distance", 0.5),
+                    params.get("speed", "medium")
+                )
             elif tool_name == "set_reminder":
                 return await self.set_reminder(params.get("message", ""), params.get("minutes", 5))
             elif tool_name == "web_search":
@@ -416,6 +477,8 @@ class ToolExecutor:
                 result = await self._control_system_media("pause")
             elif action == "play":
                 result = await self._control_system_media("play")
+            elif action == "stop":
+                result = await self._control_system_media("stop")
             elif action == "next":
                 result = await self._control_system_media("next")
             elif action == "previous":
@@ -644,10 +707,14 @@ class ToolExecutor:
                     script = 'tell application "Music" to play'
                 elif action == "pause":
                     script = 'tell application "Music" to pause'
+                elif action == "stop":
+                    script = 'tell application "Music" to stop'
                 elif action == "next":
                     script = 'tell application "Music" to next track'
                 elif action == "previous":
                     script = 'tell application "Music" to previous track'
+                else:
+                    return {"success": False, "result": f"Unsupported action: {action}", "data": None}
                 
                 result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
                 
@@ -789,6 +856,65 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"Web search error: {e}")
             return {"success": False, "result": f"Search error: {str(e)}", "data": None}
+    
+    async def move_robot(self, direction: str = "forward", distance: float = 0.5, speed: str = "medium") -> Dict[str, Any]:
+        """Move the robot in a specified direction."""
+        if not await self._ensure_client():
+            return {"success": False, "result": "Cannot connect to robot", "data": None}
+        
+        try:
+            # Get robot IP from environment
+            robot_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+            
+            # Validate inputs
+            valid_directions = ["forward", "backward", "left", "right"]
+            if direction not in valid_directions:
+                return {
+                    "success": False,
+                    "result": f"Invalid direction. Use: {', '.join(valid_directions)}",
+                    "data": None
+                }
+            
+            valid_speeds = ["slow", "medium", "fast"]
+            if speed not in valid_speeds:
+                speed = "medium"
+            
+            # Clamp distance to reasonable values (0.1 to 5 meters)
+            distance = max(0.1, min(5.0, distance))
+            
+            # Send movement command to robot
+            url = f"http://{robot_ip}:8000/control/move"
+            
+            payload = {
+                "direction": direction,
+                "distance": distance,
+                "speed": speed
+            }
+            
+            response = await self.http_client.post(url, json=payload, timeout=10.0)
+            
+            if response.status_code == 200:
+                # Create natural language response
+                distance_str = f"{distance:.1f} meters" if distance != 0.5 else "a bit"
+                return {
+                    "success": True,
+                    "result": f"Moving {direction} {distance_str}",
+                    "data": {"direction": direction, "distance": distance, "speed": speed}
+                }
+            else:
+                return {
+                    "success": False,
+                    "result": f"Robot movement failed: {response.status_code}",
+                    "data": None
+                }
+        
+        except Exception as e:
+            logger.error(f"Robot movement error: {e}")
+            return {
+                "success": False,
+                "result": f"Could not move robot: {str(e)}",
+                "data": None
+            }
     
     def get_tools_description(self) -> str:
         """Get a description of available tools for the LLM prompt."""

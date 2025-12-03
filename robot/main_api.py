@@ -812,8 +812,11 @@ async def speak_text(request: dict):
     return {"status": "speaking", "method": "piper_async"}
 
 
-# Global music player process
+# Global music player state
 music_player_process = None
+music_paused = False
+current_search_term = None
+music_track_index = 0  # Track which result to play from search
 
 @app.post("/music/{action}")
 async def control_music(action: str, request: dict = None):
@@ -831,10 +834,19 @@ async def control_music(action: str, request: dict = None):
     
     # Run music control in background
     def do_music_control():
-        global music_player_process
+        global music_player_process, music_paused, current_search_term, music_track_index
         
         try:
             if action == "play":
+                # Resume if paused
+                if music_paused and music_player_process and music_player_process.poll() is None:
+                    import os
+                    import signal
+                    os.kill(music_player_process.pid, signal.SIGCONT)
+                    music_paused = False
+                    print(f"[Music] ✅ Resumed")
+                    return
+                
                 # Stop any existing playback first
                 if music_player_process and music_player_process.poll() is None:
                     music_player_process.terminate()
@@ -846,6 +858,10 @@ async def control_music(action: str, request: dict = None):
                 else:
                     # Default: popular music mix
                     search_term = "popular music mix 2024"
+                
+                current_search_term = search_term
+                music_paused = False
+                music_track_index = 0  # Reset track index for new search
                 
                 print(f"[Music] Searching YouTube for: {search_term}")
                 
@@ -875,18 +891,106 @@ async def control_music(action: str, request: dict = None):
                 else:
                     print(f"[Music] ❌ Could not find audio for: {search_term}")
             
+            elif action == "pause":
+                if music_player_process and music_player_process.poll() is None:
+                    if not music_paused:
+                        import os
+                        import signal
+                        os.kill(music_player_process.pid, signal.SIGSTOP)
+                        music_paused = True
+                        print(f"[Music] ✅ Paused")
+                    else:
+                        print(f"[Music] Already paused")
+                else:
+                    print(f"[Music] No music playing")
+            
             elif action == "stop":
                 if music_player_process and music_player_process.poll() is None:
                     music_player_process.terminate()
                     music_player_process.wait(timeout=2)
+                    music_paused = False
                     print(f"[Music] ✅ Stopped")
                 else:
                     print(f"[Music] No music playing")
             
-            elif action in ["pause", "next", "previous"]:
-                # These require more complex player control
-                # For now, just stop and inform user
-                print(f"[Music] {action} not supported yet, use 'stop' to end playback")
+            elif action == "next":
+                # Play next song from similar search
+                if current_search_term:
+                    search_term = current_search_term
+                else:
+                    search_term = "popular music mix 2024"
+                
+                # Stop current playback
+                if music_player_process and music_player_process.poll() is None:
+                    music_player_process.terminate()
+                    music_player_process.wait(timeout=2)
+                
+                music_paused = False
+                music_track_index += 1  # Increment to get next track
+                
+                print(f"[Music] Searching for next song (#{music_track_index})...")
+                
+                # Search for multiple songs and pick one based on index
+                # Use ytsearch5: to get 5 results, then pick based on track_index
+                result = subprocess.run(
+                    ['yt-dlp', '--default-search', 'ytsearch5:', 
+                     '-f', 'bestaudio', '--get-url', '--no-warnings', 
+                     '--quiet', '--playlist-items', str((music_track_index % 5) + 1),
+                     search_term],
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    audio_url = result.stdout.strip()
+                    music_player_process = subprocess.Popen(
+                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    print(f"[Music] ✅ Next track playing")
+                else:
+                    print(f"[Music] ❌ Could not find next track")
+            
+            elif action == "previous":
+                # For previous, go back to the previous track
+                if current_search_term:
+                    search_term = current_search_term
+                else:
+                    search_term = "popular music mix 2024"
+                
+                # Stop current playback
+                if music_player_process and music_player_process.poll() is None:
+                    music_player_process.terminate()
+                    music_player_process.wait(timeout=2)
+                
+                music_paused = False
+                music_track_index = max(0, music_track_index - 1)  # Decrement to get previous track
+                
+                print(f"[Music] Going to previous track (#{music_track_index})...")
+                
+                # Search for multiple songs and pick one based on index
+                result = subprocess.run(
+                    ['yt-dlp', '--default-search', 'ytsearch5:', 
+                     '-f', 'bestaudio', '--get-url', '--no-warnings', 
+                     '--quiet', '--playlist-items', str((music_track_index % 5) + 1),
+                     search_term],
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    audio_url = result.stdout.strip()
+                    music_player_process = subprocess.Popen(
+                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    print(f"[Music] ✅ Previous track playing")
+                else:
+                    print(f"[Music] ❌ Could not find previous track")
                 
         except Exception as e:
             print(f"[Music] Error: {e}")
