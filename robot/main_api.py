@@ -175,26 +175,33 @@ class RobotServer:
             return False
     
     def init_camera(self):
-        """Initialize camera."""
+        """Initialize camera - automatically find USB camera."""
         if not CAMERA_OK:
             return False
         
-        try:
-            self.camera = cv2.VideoCapture(config.CAMERA_INDEX)
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-            self.camera.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
-            
-            ret, _ = self.camera.read()
-            if ret:
-                print("[Camera] Ready")
-                return True
-            else:
-                print("[Camera] Failed to read frame")
-                return False
-        except Exception as e:
-            print(f"[Camera] Init failed: {e}")
-            return False
+        # Try indices in order: 1 (USB Camera), 0, 2
+        for camera_index in [1, 0, 2]:
+            try:
+                print(f"[Camera] Trying /dev/video{camera_index}...")
+                self.camera = cv2.VideoCapture(camera_index)
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+                self.camera.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
+                
+                ret, frame = self.camera.read()
+                if ret and frame is not None:
+                    print(f"[Camera] Ready on /dev/video{camera_index}")
+                    return True
+                else:
+                    self.camera.release()
+                    self.camera = None
+            except Exception as e:
+                if self.camera:
+                    self.camera.release()
+                    self.camera = None
+        
+        print("[Camera] No working camera found")
+        return False
     
     def init_audio(self):
         """Initialize audio input (ReSpeaker)."""

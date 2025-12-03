@@ -28,7 +28,7 @@ ROVER_BAUDRATE = 115200
 # Camera
 # =============================================================================
 
-CAMERA_INDEX = int(os.getenv("ROVY_CAMERA_INDEX", "0"))
+CAMERA_INDEX = int(os.getenv("ROVY_CAMERA_INDEX", "1"))  # USB Camera is at /dev/video1
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 15
