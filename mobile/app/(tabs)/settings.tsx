@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, { FadeInDown } from 'react-native-reanimated';
+import Slider from '@react-native-community/slider';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -11,8 +12,25 @@ import { useRobot } from '@/context/robot-provider';
 
 export default function SettingsScreen() {
   const router = useRouter();
-  const { baseUrl, setBaseUrl, refreshStatus, clearConnection } = useRobot();
+  const { baseUrl, setBaseUrl, refreshStatus, clearConnection, api } = useRobot();
   const [draftUrl, setDraftUrl] = useState(baseUrl);
+  const [volume, setVolume] = useState(80);
+  const [isLoadingVolume, setIsLoadingVolume] = useState(false);
+
+  // Load current volume on mount
+  useEffect(() => {
+    const loadVolume = async () => {
+      try {
+        const response = await api.get('/control/volume');
+        if (response.volume !== undefined) {
+          setVolume(response.volume);
+        }
+      } catch (error) {
+        console.warn('Failed to load volume', error);
+      }
+    };
+    loadVolume();
+  }, [api]);
 
   const handleSave = useCallback(() => {
     if (!draftUrl.startsWith('http')) {
@@ -23,6 +41,19 @@ export default function SettingsScreen() {
     setBaseUrl(draftUrl);
     refreshStatus();
   }, [draftUrl, refreshStatus, setBaseUrl]);
+
+  const handleVolumeChange = useCallback(async (value: number) => {
+    setVolume(value);
+    setIsLoadingVolume(true);
+    try {
+      await api.post('/control/volume', { volume: Math.round(value) });
+    } catch (error) {
+      console.warn('Failed to set volume', error);
+      Alert.alert('Volume Error', 'Failed to update speaker volume');
+    } finally {
+      setIsLoadingVolume(false);
+    }
+  }, [api]);
 
   const handleClearConnection = useCallback(() => {
     Alert.alert(
@@ -92,6 +123,37 @@ export default function SettingsScreen() {
         <Animated.View entering={FadeInDown.delay(200).duration(400)}>
           <ThemedView style={styles.card}>
             <View style={styles.cardHeader}>
+              <IconSymbol name="speaker.wave.3.fill" size={24} color="#8B5CF6" />
+              <ThemedText type="subtitle">Speaker Volume</ThemedText>
+            </View>
+            <ThemedText style={styles.cardDescription}>
+              Adjust robot speaker loudness
+            </ThemedText>
+            <View style={styles.volumeContainer}>
+              <IconSymbol name="speaker.wave.1.fill" size={20} color="#67686C" />
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={100}
+                value={volume}
+                onValueChange={setVolume}
+                onSlidingComplete={handleVolumeChange}
+                minimumTrackTintColor="#8B5CF6"
+                maximumTrackTintColor="rgba(55, 55, 55, 0.6)"
+                thumbTintColor="#8B5CF6"
+                disabled={isLoadingVolume}
+              />
+              <IconSymbol name="speaker.wave.3.fill" size={20} color="#8B5CF6" />
+            </View>
+            <View style={styles.volumeValue}>
+              <ThemedText style={styles.volumeText}>{Math.round(volume)}%</ThemedText>
+            </View>
+          </ThemedView>
+        </Animated.View>
+
+        <Animated.View entering={FadeInDown.delay(300).duration(400)}>
+          <ThemedView style={styles.card}>
+            <View style={styles.cardHeader}>
               <IconSymbol name="arrow.triangle.2.circlepath" size={24} color="#F59E0B" />
               <ThemedText type="subtitle">Reset Connection</ThemedText>
             </View>
@@ -111,10 +173,10 @@ export default function SettingsScreen() {
           </ThemedView>
         </Animated.View>
 
-        <Animated.View entering={FadeInDown.delay(300).duration(400)}>
+        <Animated.View entering={FadeInDown.delay(400).duration(400)}>
           <ThemedView style={styles.card}>
             <View style={styles.cardHeader}>
-              <IconSymbol name="info.circle.fill" size={24} color="#8B5CF6" />
+              <IconSymbol name="info.circle.fill" size={24} color="#6366F1" />
               <ThemedText type="subtitle">About</ThemedText>
             </View>
             <View style={styles.infoRow}>
@@ -257,5 +319,24 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     marginTop: 8,
+  },
+  volumeContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 8,
+  },
+  slider: {
+    flex: 1,
+    height: 40,
+  },
+  volumeValue: {
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  volumeText: {
+    fontSize: 24,
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    color: '#8B5CF6',
   },
 });
