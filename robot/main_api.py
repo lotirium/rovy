@@ -726,7 +726,14 @@ async def speak_text(request: dict):
             audio_bytes = base64.b64decode(audio_base64)
             audio_io = io.BytesIO(audio_bytes)
             data, samplerate = sf.read(audio_io)
-            sd.play(data, samplerate)
+            # Find output device
+            devices = sd.query_devices()
+            output_device = None
+            for i, dev in enumerate(devices):
+                if dev['max_output_channels'] > 0:
+                    output_device = i
+                    break
+            sd.play(data, samplerate, device=output_device)
             sd.wait()
             return {"status": "spoken", "method": "audio"}
         except Exception as e:
@@ -754,7 +761,25 @@ async def speak_text(request: dict):
         if proc.returncode == 0 and PLAYBACK_OK and os.path.exists(wav_path):
             # Play the generated audio
             data, samplerate = sf.read(wav_path)
-            sd.play(data, samplerate)
+            
+            # Find output device and its default sample rate
+            devices = sd.query_devices()
+            output_device = None
+            device_samplerate = 48000  # Default fallback
+            for i, dev in enumerate(devices):
+                if dev['max_output_channels'] > 0:
+                    output_device = i
+                    device_samplerate = int(dev['default_samplerate'])
+                    break
+            
+            # Resample if needed
+            if samplerate != device_samplerate:
+                from scipy import signal as scipy_signal
+                num_samples = int(len(data) * device_samplerate / samplerate)
+                data = scipy_signal.resample(data, num_samples)
+                samplerate = device_samplerate
+            
+            sd.play(data, samplerate, device=output_device)
             sd.wait()
             os.unlink(wav_path)
             return {"status": "spoken", "method": "piper"}

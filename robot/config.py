@@ -48,7 +48,7 @@ AUDIO_BUFFER_SECONDS = 2.0
 # =============================================================================
 
 # Piper TTS voice model path
-PIPER_VOICE = os.getenv("ROVY_PIPER_VOICE", "/usr/share/piper/en_US-lessac-medium.onnx")
+PIPER_VOICE = os.getenv("ROVY_PIPER_VOICE", "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx")
 
 # =============================================================================
 # Connection
