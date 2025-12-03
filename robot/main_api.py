@@ -868,6 +868,72 @@ async def control_music(action: str, request: dict = None):
     }
 
 
+@app.post("/youtube-music/{action}")
+async def control_youtube_music(action: str, request: dict):
+    """Control YouTube Music playback on robot (from cloud AI)."""
+    print(f"[YouTube Music] Action: {action}")
+    
+    valid_actions = ["play", "pause", "stop", "next", "previous"]
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Use: {', '.join(valid_actions)}")
+    
+    query = request.get("query", "") if request else ""
+    
+    # Run YouTube Music control in background
+    def do_youtube_music_control():
+        try:
+            import platform
+            if platform.system() == "Linux":
+                if action == "play":
+                    # Open YouTube Music in chromium (headless browser on Pi)
+                    # Play a random mix or user's library
+                    print(f"[YouTube Music] Opening YouTube Music...")
+                    
+                    # Use chromium-browser to open YouTube Music
+                    # The --app flag makes it fullscreen without browser UI
+                    url = "https://music.youtube.com"
+                    
+                    subprocess.Popen([
+                        'chromium-browser',
+                        '--app=' + url,
+                        '--autoplay-policy=no-user-gesture-required',
+                        '--start-maximized'
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    print(f"[YouTube Music] ✅ Opened YouTube Music")
+                
+                else:
+                    # For pause/next/previous, use playerctl (works with browser media)
+                    print(f"[YouTube Music] Executing playerctl {action}")
+                    result = subprocess.run(
+                        ['playerctl', action],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if result.returncode == 0:
+                        print(f"[YouTube Music] ✅ {action} successful")
+                    else:
+                        print(f"[YouTube Music] ⚠️ playerctl returned: {result.stderr}")
+            else:
+                print(f"[YouTube Music] ❌ Not supported on {platform.system()}")
+                
+        except Exception as e:
+            print(f"[YouTube Music] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Execute in background
+    threading.Thread(target=do_youtube_music_control, daemon=True).start()
+    
+    return {
+        "status": "ok",
+        "action": action,
+        "message": f"YouTube Music {action} command sent"
+    }
+
+
 @app.post("/claim/request")
 async def claim_request() -> ClaimRequestResponse:
     """Generate a PIN code for claiming the robot (optional, auto-claimed)."""

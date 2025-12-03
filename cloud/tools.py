@@ -35,6 +35,7 @@ class ToolExecutor:
     
     def __init__(self):
         self.spotify_enabled = os.getenv("SPOTIFY_ENABLED", "false").lower() == "true"
+        self.youtube_music_enabled = os.getenv("YOUTUBE_MUSIC_ENABLED", "false").lower() == "true"
         self.http_client = None
         
         # Tool definitions for LLM to understand what's available
@@ -400,13 +401,17 @@ class ToolExecutor:
             return {"success": False, "result": f"Calculation error: {str(e)}", "data": None}
     
     async def play_music(self, action: str = "play", query: str = "") -> Dict[str, Any]:
-        """Control music playback or start playing from Spotify."""
+        """Control music playback - YouTube Music, Spotify, or system control."""
         try:
-            # If Spotify is enabled, use full Spotify API
+            # Priority 1: YouTube Music (if enabled)
+            if self.youtube_music_enabled:
+                return await self._youtube_music_control(action, query)
+            
+            # Priority 2: Spotify (if enabled)
             if self.spotify_enabled:
                 return await self._spotify_control(action, query)
             
-            # Otherwise use system media control (playerctl/etc)
+            # Priority 3: System media control (playerctl/etc)
             if action == "pause":
                 result = await self._control_system_media("pause")
             elif action == "play":
@@ -423,6 +428,53 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"Music control error: {e}")
             return {"success": False, "result": f"Music control error: {str(e)}", "data": None}
+    
+    async def _youtube_music_control(self, action: str, query: str = "") -> Dict[str, Any]:
+        """Control YouTube Music via robot browser automation."""
+        if not await self._ensure_client():
+            return {"success": False, "result": "Cannot connect to robot", "data": None}
+        
+        try:
+            # Get robot IP
+            robot_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+            
+            # Send YouTube Music control command to robot
+            url = f"http://{robot_ip}:8000/youtube-music/{action}"
+            
+            payload = {"action": action}
+            if query:
+                payload["query"] = query
+            
+            response = await self.http_client.post(url, json=payload, timeout=10.0)
+            
+            if response.status_code == 200:
+                result_data = response.json()
+                if action == "play" and not query:
+                    return {
+                        "success": True,
+                        "result": "Playing music on YouTube Music",
+                        "data": result_data
+                    }
+                else:
+                    return {
+                        "success": True,
+                        "result": f"YouTube Music {action}",
+                        "data": result_data
+                    }
+            else:
+                return {
+                    "success": False,
+                    "result": f"YouTube Music control failed: {response.status_code}",
+                    "data": None
+                }
+        
+        except Exception as e:
+            logger.error(f"YouTube Music control error: {e}")
+            return {
+                "success": False,
+                "result": f"Could not control YouTube Music: {str(e)}",
+                "data": None
+            }
     
     async def _spotify_control(self, action: str, query: str = "") -> Dict[str, Any]:
         """Control Spotify playback using Web API with user auth."""
