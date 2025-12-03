@@ -107,6 +107,19 @@ class HealthResponse(BaseModel):
     version: str = "2.0"
     capabilities: dict
 
+class ClaimRequestResponse(BaseModel):
+    pin: str
+
+class ClaimConfirmRequest(BaseModel):
+    pin: str
+
+class ClaimConfirmResponse(BaseModel):
+    control_token: str
+    robot_id: str
+
+class ClaimControlResponse(BaseModel):
+    session_id: str
+
 
 # ==============================================================================
 # Robot Client with API
@@ -382,6 +395,28 @@ app.add_middleware(
 # Global robot server instance
 robot_server: Optional[RobotServer] = None
 
+# Claim state (for mobile app authentication)
+import secrets
+import hmac
+import hashlib
+
+CLAIM_STATE = {
+    "claimed": False,
+    "control_token_hash": None,
+    "pin": None,
+    "pin_exp": 0,
+}
+
+def hash_token(token: str) -> str:
+    """Hash a token for secure storage."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def verify_token(token: str) -> bool:
+    """Verify a control token."""
+    if not (CLAIM_STATE["claimed"] and CLAIM_STATE["control_token_hash"]):
+        return False
+    return hmac.compare_digest(hash_token(token), CLAIM_STATE["control_token_hash"])
+
 
 def get_robot() -> RobotServer:
     """Get robot server instance."""
@@ -626,6 +661,85 @@ async def get_wifi_status():
 async def get_mode():
     """Get robot operating mode."""
     return {"mode": "autonomous"}
+
+
+@app.post("/claim/request")
+async def claim_request() -> ClaimRequestResponse:
+    """Generate a PIN code for claiming the robot."""
+    robot = get_robot()
+    
+    # Generate 6-digit PIN
+    CLAIM_STATE["pin"] = f"{secrets.randbelow(10**6):06d}"
+    CLAIM_STATE["pin_exp"] = time.time() + 120  # 2 minutes
+    
+    # Display PIN on robot's OLED
+    if robot.rover:
+        robot.rover.display_lines([
+            "CLAIM PIN:",
+            CLAIM_STATE["pin"][:3] + " " + CLAIM_STATE["pin"][3:],
+            "Enter in app",
+            "120s timeout"
+        ])
+    
+    print(f"[Claim] PIN generated: {CLAIM_STATE['pin']}")
+    return ClaimRequestResponse(pin=CLAIM_STATE["pin"])
+
+
+@app.post("/claim/confirm")
+async def claim_confirm(request: ClaimConfirmRequest) -> ClaimConfirmResponse:
+    """Confirm PIN and generate control token."""
+    robot = get_robot()
+    
+    # Verify PIN
+    if (request.pin != CLAIM_STATE["pin"] or 
+        time.time() > CLAIM_STATE["pin_exp"] or 
+        CLAIM_STATE["claimed"]):
+        raise HTTPException(status_code=400, detail="invalid_or_expired_pin")
+    
+    # Generate control token
+    token = secrets.token_urlsafe(32)
+    CLAIM_STATE["control_token_hash"] = hash_token(token)
+    CLAIM_STATE["claimed"] = True
+    CLAIM_STATE["pin"] = None
+    CLAIM_STATE["pin_exp"] = 0
+    
+    # Reset OLED display
+    if robot.rover:
+        robot.rover.display_lines([
+            "ROVY",
+            "Connected",
+            "",
+            ""
+        ])
+    
+    print("[Claim] Robot claimed successfully")
+    return ClaimConfirmResponse(
+        control_token=token,
+        robot_id="rovy-pi"
+    )
+
+
+@app.post("/claim/release")
+async def claim_release():
+    """Release the claim."""
+    if not CLAIM_STATE["claimed"]:
+        raise HTTPException(status_code=400, detail="not_claimed")
+    
+    CLAIM_STATE["claimed"] = False
+    CLAIM_STATE["control_token_hash"] = None
+    
+    print("[Claim] Robot claim released")
+    return {"released": True}
+
+
+@app.post("/claim-control")
+async def claim_control() -> ClaimControlResponse:
+    """Claim control session."""
+    # Generate session ID
+    session_id = secrets.token_urlsafe(16)
+    
+    print(f"[Claim] Control session claimed: {session_id}")
+    return ClaimControlResponse(session_id=session_id)
 
 
 # ==============================================================================
