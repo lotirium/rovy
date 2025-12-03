@@ -812,6 +812,62 @@ async def speak_text(request: dict):
     return {"status": "speaking", "method": "piper_async"}
 
 
+@app.post("/music/{action}")
+async def control_music(action: str, request: dict = None):
+    """Control music playback on robot speakers (from cloud AI)."""
+    print(f"[Music] Action: {action}")
+    
+    valid_actions = ["play", "pause", "stop", "next", "previous"]
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Use: {', '.join(valid_actions)}")
+    
+    # Run music control in background
+    def do_music_control():
+        try:
+            # On Linux (Raspberry Pi), use playerctl
+            import platform
+            if platform.system() == "Linux":
+                # Check if playerctl is available
+                which_proc = subprocess.run(
+                    ['which', 'playerctl'],
+                    capture_output=True,
+                    timeout=2
+                )
+                
+                if which_proc.returncode == 0:
+                    # playerctl is installed
+                    print(f"[Music] Executing playerctl {action}")
+                    result = subprocess.run(
+                        ['playerctl', action],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if result.returncode == 0:
+                        print(f"[Music] ✅ {action} successful")
+                    else:
+                        print(f"[Music] ⚠️ playerctl {action} returned: {result.stderr}")
+                else:
+                    print(f"[Music] ❌ playerctl not installed (install: sudo apt install playerctl)")
+            else:
+                print(f"[Music] ❌ Music control not supported on {platform.system()}")
+                
+        except Exception as e:
+            print(f"[Music] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Execute in background
+    threading.Thread(target=do_music_control, daemon=True).start()
+    
+    return {
+        "status": "ok",
+        "action": action,
+        "message": f"Music {action} command sent to robot"
+    }
+
+
 @app.post("/claim/request")
 async def claim_request() -> ClaimRequestResponse:
     """Generate a PIN code for claiming the robot (optional, auto-claimed)."""

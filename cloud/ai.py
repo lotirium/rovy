@@ -7,11 +7,21 @@ import re
 import gc
 import time
 import logging
+import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime
 from functools import lru_cache
 
 logger = logging.getLogger('Assistant')
+
+# Try to import tool executor
+TOOLS_OK = False
+try:
+    from tools import get_tool_executor
+    TOOLS_OK = True
+except ImportError as e:
+    logger.warning(f"Tools not available: {e}")
+    get_tool_executor = None
 
 # Try to import Qwen2-VL dependencies
 QWEN_VL_OK = False
@@ -57,17 +67,25 @@ class CloudAssistant:
         max_pixels: int = 640 * 480,  # Smaller for speed (VGA)
         lazy_load: bool = False,
         use_4bit: bool = True,  # 4-bit quantization for speed
-        use_compile: bool = True  # torch.compile for optimization
+        use_compile: bool = True,  # torch.compile for optimization
+        enable_tools: bool = True  # Enable external API/tool calling
     ):
         self.model_id = model_id or self.MODEL_ID
         self.max_pixels = max_pixels
         self.use_4bit = use_4bit
         self.use_compile = use_compile
+        self.enable_tools = enable_tools
         
         self.model = None
         self.processor = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._compiled = False
+        
+        # Initialize tool executor if enabled
+        self.tool_executor = None
+        if enable_tools and TOOLS_OK:
+            self.tool_executor = get_tool_executor()
+            logger.info("Tool calling enabled")
         
         if not QWEN_VL_OK:
             logger.error("Qwen2-VL dependencies not installed!")
@@ -162,8 +180,108 @@ class CloudAssistant:
             self.model = None
             self.processor = None
     
+    def classify_intent(self, question: str) -> dict:
+        """Use AI to classify query intent - simple word matching approach."""
+        try:
+            # Very simple prompt - just ask for type
+            classification_prompt = f"""Query: {question}
+
+Is this asking about:
+1. VISION - what you see with camera
+2. WEATHER - weather/temperature/forecast  
+3. TIME - current time/date
+4. MATH - calculation/arithmetic
+5. MUSIC - play/pause/control music
+6. SEARCH - who is/what is/look up
+7. CHAT - general conversation
+
+Answer with just the word: VISION, WEATHER, TIME, MATH, MUSIC, SEARCH, or CHAT
+
+Answer:"""
+
+            messages = [{
+                "role": "user",
+                "content": [{"type": "text", "text": classification_prompt}]
+            }]
+            
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.processor(
+                text=[text],
+                padding=True,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Fast generation
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    temperature=0.1,
+                    do_sample=False,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    use_cache=True
+                )
+            
+            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+            response = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip().upper()
+            
+            logger.info(f"AI classification: '{response}'")
+            
+            # Parse the response
+            if "VISION" in response:
+                return {"type": "vision", "params": {}}
+            elif "WEATHER" in response:
+                location = self._extract_location_ai(question)
+                return {"type": "weather", "params": {"location": location}}
+            elif "TIME" in response:
+                return {"type": "time", "params": {}}
+            elif "MATH" in response:
+                expr = self._extract_math(question)
+                return {"type": "calculator", "params": {"expression": expr}}
+            elif "MUSIC" in response:
+                action = self._extract_music_action(question)
+                return {"type": "music", "params": {"action": action}}
+            elif "SEARCH" in response:
+                return {"type": "search", "params": {"query": question}}
+            else:
+                return {"type": "conversational", "params": {}}
+                
+        except Exception as e:
+            logger.warning(f"AI classification failed: {e}")
+            return {"type": "conversational", "params": {}}
+    
+    def _extract_location_ai(self, question: str) -> str:
+        """Extract location from weather question."""
+        words = question.split()
+        skip = {'what', 'is', 'the', 'weather', 'in', 'at', 'for', 'like', 'today', 'whats', 'how', 'hows', 'there', 'here', 'now'}
+        locations = [w.strip('?.,!') for w in words if w.lower() not in skip and len(w) > 2]
+        # Default to Seoul if no specific location mentioned
+        return locations[0] if locations else "Seoul"
+    
+    def _extract_math(self, question: str) -> str:
+        """Extract math expression from question."""
+        match = re.search(r'([\d\s\+\-\*\/\(\)\.]+)', question)
+        if match:
+            return match.group(1).strip()
+        return question
+    
+    def _extract_music_action(self, question: str) -> str:
+        """Extract music action from question."""
+        q = question.lower()
+        if 'pause' in q:
+            return 'pause'
+        elif 'stop' in q:
+            return 'stop'
+        elif 'next' in q or 'skip' in q:
+            return 'next'
+        elif 'previous' in q or 'back' in q:
+            return 'previous'
+        return 'play'
+    
     def ask(self, question: str, max_tokens: int = None, temperature: float = 0.3) -> str:
-        """Ask a text-only question with optimized generation."""
+        """Ask a text-only question with LLM-based routing and optional tool calling."""
         if not self.model:
             self._load_model()
             if not self.model:
@@ -179,6 +297,27 @@ class CloudAssistant:
         start = time.time()
         question_len = len(question.split())
         
+        # Use fast keyword matching for tool detection
+        tool_result = None
+        if self.enable_tools and self.tool_executor:
+            tool_request = self.tool_executor.detect_tool_use(question)
+            if tool_request:
+                logger.info(f"Tool detected: {tool_request['tool']}")
+                # Execute tool
+                loop = self._get_event_loop()
+                tool_result = loop.run_until_complete(
+                    self.tool_executor.execute(tool_request['tool'], tool_request['params'])
+                )
+                
+                # If tool executed successfully, return result DIRECTLY
+                if tool_result and tool_result.get("success"):
+                    result_text = tool_result['result']
+                    logger.info(f"✅ Tool SUCCESS - Returning directly: {result_text}")
+                    return result_text
+                elif tool_result:
+                    logger.warning(f"⚠️ Tool FAILED: {tool_result.get('result', 'No result')}")
+        
+        # Fall back to LLM for conversational or if no tool was triggered
         try:
             # Dynamic max_tokens based on query complexity
             if max_tokens is None:
@@ -194,9 +333,14 @@ class CloudAssistant:
             if any(p in question.lower() for p in ['time', 'date', 'today', 'day']):
                 time_ctx = f"Current: {datetime.now().strftime('%I:%M %p, %A %B %d, %Y')}. "
             
+            # Add tool result context if available but failed
+            tool_ctx = ""
+            if tool_result and not tool_result.get("success"):
+                tool_ctx = f"(Note: Tried to use external tool but it failed: {tool_result.get('result', 'Unknown error')}). "
+            
             # Ultra-concise system prompt
             system_instruction = "You are Jarvis. Reply in under 20 words."
-            prompt = f"{system_instruction}\n{time_ctx}{question}"
+            prompt = f"{system_instruction}\n{time_ctx}{tool_ctx}{question}"
             messages = [
                 {
                     "role": "user",
@@ -373,6 +517,15 @@ class CloudAssistant:
         text = re.sub(r'\*([^*]+)\*', r'\1', text)  # Remove italic
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
+    
+    def _get_event_loop(self):
+        """Get or create event loop."""
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
     
     def extract_movement(self, response: str, query: str) -> Optional[Dict[str, Any]]:
         """Extract movement commands from text."""

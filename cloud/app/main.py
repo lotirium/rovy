@@ -8,6 +8,7 @@ import hmac
 import importlib
 import logging
 import os
+import re
 import secrets
 import subprocess
 import socket
@@ -864,9 +865,23 @@ async def voice_websocket(websocket: WebSocket):
                                 # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
                                 if assistant:
-                                    # Check if query needs vision
-                                    vision_keywords = ['see', 'camera', 'image', 'look', 'show', 'what', 'view']
-                                    use_vision = any(keyword in transcript.lower() for keyword in vision_keywords)
+                                    # Use keyword matching to determine if vision is needed
+                                    transcript_lower = transcript.lower()
+                                    
+                                    # Vision keywords - only trigger for explicit visual queries
+                                    vision_patterns = [
+                                        r'\bwhat\s+(?:do\s+you\s+)?see\b',
+                                        r'\bwhat\s+(?:can\s+you\s+)?see\b',
+                                        r'\bcan\s+you\s+see\b',
+                                        r'\blook\s+at\b',
+                                        r'\bdescribe\s+what\b',
+                                        r'\bshow\s+me\b'
+                                    ]
+                                    
+                                    use_vision = any(re.search(pattern, transcript_lower) for pattern in vision_patterns)
+                                    
+                                    if use_vision:
+                                        LOGGER.info("Vision query detected via keywords")
                                     
                                     if use_vision:
                                         # Fetch latest frame from Pi camera
