@@ -20,6 +20,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 LOGGER = logging.getLogger("uvicorn.error").getChild(__name__)
 
+# Global lock to prevent USB camera contention between OAK-D and webcam
+_USB_CAMERA_LOCK = asyncio.Lock()
+
 # Ensure project root is in Python path for imports when running as service
 # This MUST happen before any app.* imports
 _project_root = Path(__file__).parent.parent.parent
@@ -102,6 +105,12 @@ from .camera import (
     OpenCVCameraSource,
     PlaceholderCameraSource,
 )
+
+# Import cv2 for USB camera testing (optional dependency)
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 from .oak_stream import get_snapshot as oak_snapshot
 from .oak_stream import get_video_response as oak_video_response
 from .oak_stream import shutdown as oak_shutdown
@@ -380,27 +389,37 @@ _WEBCAM_DEVICE = os.getenv("CAMERA_WEBCAM_DEVICE")
 def _iter_webcam_candidates() -> list[int | str]:
     """Return preferred webcam device identifiers.
 
-    The order favours explicit configuration, then any OAK-D UVC interfaces,
-    and finally generic `/dev/video*` indices so we still try something when no
-    metadata is available.
+    The order favours explicit configuration, then any USB cameras,
+    and finally generic `/dev/video*` indices. OAK-D devices are explicitly
+    skipped since they're reserved for AI vision via the persistent pipeline.
     """
 
     candidates: list[int | str] = []
+
+    # Log all available video devices for debugging
+    by_id_dir = Path("/dev/v4l/by-id")
+    if by_id_dir.is_dir():
+        all_devices = list(by_id_dir.iterdir())
+        LOGGER.info(f"📹 Found {len(all_devices)} video device(s) in /dev/v4l/by-id/")
+        for entry in all_devices:
+            device_type = "OAK-D" if any(x in entry.name.lower() for x in ["oak", "depthai", "luxonis"]) else "USB"
+            LOGGER.info(f"   - {device_type}: {entry.name}")
 
     if _WEBCAM_DEVICE is not None:
         try:
             candidates.append(int(_WEBCAM_DEVICE))
         except ValueError:
             candidates.append(_WEBCAM_DEVICE)
+        LOGGER.info(f"Using explicit camera device from env: {_WEBCAM_DEVICE}")
 
     # Prefer stable /dev/v4l/by-id/ paths over numeric indices
     # Use the by-id path directly (not resolved) so it stays stable even if device re-enumerates
-    by_id_dir = Path("/dev/v4l/by-id")
     if by_id_dir.is_dir():
         for entry in sorted(by_id_dir.iterdir()):
             name = entry.name.lower()
-            # Skip OAK-D devices (reserved for AI vision)
+            # Skip OAK-D devices (reserved for AI vision via persistent pipeline)
             if "oak" in name or "depthai" in name or "luxonis" in name:
+                LOGGER.debug(f"Skipping OAK-D device for streaming: {entry.name}")
                 continue
             # Use any USB camera with video-index0 (main video stream)
             if "usb" in name and "video-index0" in name:
@@ -409,19 +428,19 @@ def _iter_webcam_candidates() -> list[int | str]:
                     # This way if the device re-enumerates, the path still works
                     stable_path = str(entry)
                     candidates.append(stable_path)
-                    LOGGER.info(f"Found stable USB camera device: {entry.name} (using stable path)")
+                    LOGGER.info(f"Added USB camera candidate: {entry.name}")
                 except OSError:
                     continue
 
     # Fall back to common numeric indices if nothing more specific was found.
-    # These entries are appended after any explicit or detected OAK-D devices
-    # so that laptops with built-in webcams still prefer the external device
-    # when one is present.
+    # These entries are appended after any explicit USB camera devices
+    # so that external USB webcams are preferred over built-in cameras.
     generic_indices = range(0, 4)
     for index in generic_indices:
         if index not in candidates:
             candidates.append(index)
 
+    LOGGER.info(f"USB camera candidates (in priority order): {candidates}")
     return candidates
 
 
@@ -431,13 +450,26 @@ def _create_camera_service() -> CameraService:
 
     # Use USB camera for streaming (OAK-D is reserved for AI vision via /shot endpoint)
     if OpenCVCameraSource.is_available():
+        LOGGER.info("🎥 Initializing USB camera for streaming (separate from OAK-D)...")
+        
         for candidate in _iter_webcam_candidates():
             try:
                 LOGGER.info(
                     "Attempting webcam device %s for primary stream source",
                     candidate,
                 )
+                # Test if device is accessible before committing
+                test_cap = cv2.VideoCapture(candidate)
+                if not test_cap.isOpened():
+                    LOGGER.warning("Device %s not accessible, skipping", candidate)
+                    test_cap.release()
+                    continue
+                test_cap.release()
+                
+                # Now create the actual source
                 primary_source = OpenCVCameraSource(device=candidate)
+                LOGGER.info("✅ Using OpenCV camera source for streaming: %s", candidate)
+                break
             except CameraError as exc:
                 LOGGER.warning(
                     "OpenCV camera source unavailable on %s: %s",
@@ -446,11 +478,16 @@ def _create_camera_service() -> CameraService:
                 )
                 primary_source = None
                 continue
-            else:
-                LOGGER.info("Using OpenCV camera source for streaming")
-                break
+            except Exception as exc:
+                LOGGER.warning(
+                    "Unexpected error with device %s: %s",
+                    candidate,
+                    exc,
+                )
+                primary_source = None
+                continue
         else:
-            LOGGER.warning("Unable to open any webcam device for streaming")
+            LOGGER.warning("⚠️  Unable to open any USB webcam device for streaming")
     else:
         LOGGER.warning(
             "OpenCV package not installed; skipping USB camera stream. Install the 'opencv-python' package to enable it."
@@ -477,47 +514,30 @@ def _create_camera_service() -> CameraService:
 
 app.state.camera_service = _create_camera_service()
 
-# Initialize persistent OAK-D camera for fast AI vision snapshots
-# Now safe because USB camera and OAK-D are on separate USB buses
+
+async def _get_webcam_frame_safe() -> bytes:
+    """Get frame from webcam with USB lock to prevent interference with OAK-D."""
+    async with _USB_CAMERA_LOCK:
+        return await app.state.camera_service.get_frame()
+
+
+# Give USB camera time to fully initialize before starting OAK-D
+# This prevents USB bandwidth conflicts during initialization
+import time as time_module
+time_module.sleep(0.5)
+
+# Initialize OAK-D availability check (but don't start pipeline yet to save USB bandwidth)
+# We'll start the pipeline on-demand when /shot is called
 if DepthAICameraSource.is_available():
-    try:
-        import depthai as dai
-        
-        LOGGER.info("🔧 Initializing persistent OAK-D for fast AI vision...")
-        
-        # Force release any stale OAK-D devices from previous runs
-        DepthAICameraSource.force_release_devices()
-        import time
-        time.sleep(1.0)  # Give USB time to stabilize
-        
-        # Create persistent pipeline for preview frames
-        pipeline = dai.Pipeline()
-        
-        cam_rgb = pipeline.create(dai.node.ColorCamera)
-        cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam_rgb.setInterleaved(False)
-        cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-        cam_rgb.setIspScale(1, 3)  # Downscale to 640x360 for speed
-        cam_rgb.setFps(30)  # Set explicit FPS for stable streaming
-        
-        xout_rgb = pipeline.create(dai.node.XLinkOut)
-        xout_rgb.setStreamName("preview")
-        xout_rgb.setMetadataOnly(False)
-        cam_rgb.preview.link(xout_rgb.input)
-        
-        # Start device and keep it running
-        app.state.oakd_device = dai.Device(pipeline)
-        # Use larger queue and blocking mode for more reliable frame retrieval
-        app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=4, blocking=False)
-        
-        LOGGER.info("✅ OAK-D camera initialized for fast AI vision (persistent)")
-    except Exception as exc:
-        LOGGER.warning(f"❌ OAK-D initialization failed: {exc}")
-        app.state.oakd_device = None
-        app.state.oakd_queue = None
+    app.state.oakd_available = True
+    app.state.oakd_device = None
+    app.state.oakd_queue = None
+    app.state.oakd_last_used = 0  # Timestamp of last use
+    LOGGER.info("✅ OAK-D camera available (will start on-demand to minimize USB interference)")
 else:
     LOGGER.warning("⚠️  DepthAI not available - /shot endpoint will not work")
+    LOGGER.info("   USB camera will still work for streaming")
+    app.state.oakd_available = False
     app.state.oakd_device = None
     app.state.oakd_queue = None
 
@@ -641,8 +661,8 @@ async def camera_websocket(websocket: WebSocket):
         
         while True:
             try:
-                # Get frame from the camera service
-                frame_bytes = await camera_service.get_frame()
+                # Get frame from the camera service (with USB lock protection)
+                frame_bytes = await _get_webcam_frame_safe()
                 if frame_bytes:
                     # Send as JSON with base64 frame
                     b64_frame = base64.b64encode(frame_bytes).decode('utf-8')
@@ -868,7 +888,7 @@ async def voice_websocket(websocket: WebSocket):
                                                         assistant.ask, transcript
                                                     )
                                         except Exception as frame_error:
-                                            LOGGER.error(f"Error fetching frame: {frame_error}")
+                                            LOGGER.error(f"Error fetching frame: {frame_error}", exc_info=True)
                                             response = await anyio.to_thread.run_sync(
                                                 assistant.ask, transcript
                                             )
@@ -1247,13 +1267,12 @@ async def speak_text(request: dict):
         raise HTTPException(status_code=503, detail="TTS not available")
 
 
-def _reinit_persistent_oakd():
-    """Reinitialize persistent OAK-D if it's corrupted."""
+def _start_oakd_pipeline():
+    """Start OAK-D pipeline on-demand."""
     import depthai as dai
+    import time
     
-    LOGGER.warning("Reinitializing corrupted OAK-D pipeline...")
-    
-    # Close existing device
+    # Close existing device if any
     if app.state.oakd_device is not None:
         try:
             app.state.oakd_device.close()
@@ -1262,12 +1281,11 @@ def _reinit_persistent_oakd():
         app.state.oakd_device = None
         app.state.oakd_queue = None
     
-    # Force release and wait
+    # Force release any stale devices
     DepthAICameraSource.force_release_devices()
-    import time
-    time.sleep(0.5)
+    time.sleep(0.3)
     
-    # Recreate pipeline
+    # Create pipeline - use MJPEG encoding for less USB bandwidth
     pipeline = dai.Pipeline()
     
     cam_rgb = pipeline.create(dai.node.ColorCamera)
@@ -1275,69 +1293,132 @@ def _reinit_persistent_oakd():
     cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
     cam_rgb.setInterleaved(False)
     cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setIspScale(1, 3)
-    cam_rgb.setFps(30)
-        
+    cam_rgb.setIspScale(1, 3)  # Downscale to 640x360
+    cam_rgb.setFps(10)  # Low FPS to minimize USB bandwidth
+    
     xout_rgb = pipeline.create(dai.node.XLinkOut)
     xout_rgb.setStreamName("preview")
     xout_rgb.setMetadataOnly(False)
     cam_rgb.preview.link(xout_rgb.input)
     
     app.state.oakd_device = dai.Device(pipeline)
-    app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=4, blocking=False)
+    app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=1, blocking=False)
+    app.state.oakd_last_used = time.time()
     
-    LOGGER.info("✅ OAK-D pipeline reinitialized")
+    LOGGER.info("✅ OAK-D pipeline started on-demand")
+
+
+def _stop_oakd_pipeline():
+    """Stop OAK-D pipeline to free USB bandwidth."""
+    if app.state.oakd_device is not None:
+        try:
+            app.state.oakd_device.close()
+            LOGGER.info("🛑 OAK-D pipeline stopped (freeing USB bandwidth)")
+        except:
+            pass
+        app.state.oakd_device = None
+        app.state.oakd_queue = None
+
+
+def _ensure_oakd_pipeline():
+    """Ensure OAK-D pipeline is running, start if needed."""
+    import time
+    
+    if app.state.oakd_queue is not None:
+        # Pipeline already running - check if it's still healthy
+        app.state.oakd_last_used = time.time()
+        return
+    
+    # Start pipeline on-demand
+    LOGGER.info("📷 Starting OAK-D pipeline on-demand...")
+    _start_oakd_pipeline()
 
 
 async def _capture_oakd_snapshot() -> bytes:
-    """Capture a single snapshot from persistent OAK-D camera (fast!) with auto-recovery."""
+    """Capture a single snapshot from OAK-D camera (on-demand) with auto-recovery."""
     import cv2
     import time as time_module
     
-    if app.state.oakd_queue is None:
-        raise CameraError("OAK-D camera not initialized")
+    if not app.state.oakd_available:
+        raise CameraError("OAK-D camera not available")
     
-    # Get latest frame from persistent queue (very fast - no device initialization!)
+    # Start/stop pipeline WITHOUT holding lock to avoid freezing webcam
+    # Only hold lock for brief periods during actual frame capture
     def get_frame_sync():
+        # Start pipeline without lock (this takes several seconds)
+        LOGGER.debug("📷 Starting OAK-D (webcam continues in background)...")
+        _ensure_oakd_pipeline()
+        
+        if app.state.oakd_queue is None:
+            raise CameraError("Failed to start OAK-D pipeline")
+        
+        # Wait for pipeline to produce first frames (without holding lock)
+        LOGGER.debug("⏳ Waiting for OAK-D to warm up (webcam continues)...")
+        time_module.sleep(0.8)
+        
         # Try to get the latest frame
-        max_attempts = 20
+        max_attempts = 15
+        frame_data = None
+        
         for attempt in range(max_attempts):
             try:
+                # Use tryGet() which is non-blocking
                 frame_data = app.state.oakd_queue.tryGet()
                 if frame_data is not None:
                     # Convert to OpenCV frame
                     frame = frame_data.getCvFrame()
                     if frame is None or frame.size == 0:
-                        raise CameraError("Empty frame from OAK-D")
+                        LOGGER.warning(f"Empty frame from OAK-D (attempt {attempt+1}/{max_attempts})")
+                        frame_data = None
+                        time_module.sleep(0.05)
+                        continue
                     
                     # Encode to JPEG
                     success, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     if not success:
                         raise CameraError("Failed to encode frame as JPEG")
                     
-                    LOGGER.info(f"✅ Captured OAK-D snapshot ({len(encoded.tobytes())} bytes) - FAST MODE")
+                    LOGGER.info(f"✅ Captured OAK-D snapshot ({len(encoded.tobytes())} bytes) on attempt {attempt+1}")
+                    
+                    # Stop pipeline after successful capture to free USB bandwidth for webcam
+                    LOGGER.debug("🛑 Stopping OAK-D (webcam resumes full bandwidth)...")
+                    _stop_oakd_pipeline()
+                    
                     return encoded.tobytes()
+                else:
+                    # No frame available yet, wait a short time
+                    LOGGER.debug(f"No frame available from OAK-D queue (attempt {attempt+1}/{max_attempts})")
+                    time_module.sleep(0.1)
+                    
             except Exception as e:
+                error_msg = str(e)
                 # Check if it's an X_LINK error - pipeline might be corrupted
-                if "X_LINK_ERROR" in str(e) or "Communication exception" in str(e):
-                    LOGGER.warning(f"OAK-D pipeline corrupted, attempting recovery...")
+                if "X_LINK_ERROR" in error_msg or "Communication exception" in error_msg or "XLinkError" in error_msg:
+                    LOGGER.warning(f"OAK-D pipeline corrupted: {error_msg}")
                     try:
-                        _reinit_persistent_oakd()
-                        # Give new pipeline time to start
+                        _start_oakd_pipeline()
+                        # Give new pipeline time to start producing frames
                         time_module.sleep(1.0)
                         # Retry with new pipeline
                         continue
                     except Exception as reinit_error:
-                        raise CameraError(f"Failed to reinitialize OAK-D: {reinit_error}")
+                        raise CameraError(f"Failed to restart OAK-D: {reinit_error}")
                 
+                # For other errors, log and retry
+                LOGGER.warning(f"Error getting OAK-D frame (attempt {attempt+1}/{max_attempts}): {error_msg}")
                 if attempt == max_attempts - 1:
-                    raise CameraError(f"Failed to get frame from OAK-D: {e}")
-            
-            # Wait a bit for next frame
-            time_module.sleep(0.05)
+                    # Stop pipeline before raising error
+                    _stop_oakd_pipeline()
+                    raise CameraError(f"Failed to get frame from OAK-D after {max_attempts} attempts: {error_msg}")
+                
+                time_module.sleep(0.05)
         
-        raise CameraError("No frame available from OAK-D after multiple attempts")
+        # Stop pipeline before raising error
+        _stop_oakd_pipeline()
+        raise CameraError(f"No frame available from OAK-D after {max_attempts} attempts. Device not producing frames.")
     
+    # Run without USB lock - let both cameras operate simultaneously
+    # They share USB bandwidth but don't block each other
     return await anyio.to_thread.run_sync(get_frame_sync)
 
 
@@ -1410,7 +1491,7 @@ async def get_network_info() -> NetworkInfoResponse:
 @app.get("/camera/snapshot", tags=["Camera"])
 async def get_camera_snapshot() -> Response:
     try:
-        frame = await app.state.camera_service.get_frame()
+        frame = await _get_webcam_frame_safe()
     except CameraError as exc:
         raise HTTPException(status_code=503, detail="Snapshot unavailable") from exc
 
@@ -1745,8 +1826,8 @@ async def recognize_faces() -> FaceRecognitionResponse:
         )
     
     try:
-        # Get frame from camera
-        frame_bytes = await app.state.camera_service.get_frame()
+        # Get frame from camera (with USB lock protection)
+        frame_bytes = await _get_webcam_frame_safe()
         
         # Decode JPEG to numpy array
         import cv2
@@ -1894,8 +1975,8 @@ async def face_recognition_stream() -> StreamingResponse:
         
         try:
             while True:
-                # Get frame from camera
-                frame_bytes = await app.state.camera_service.get_frame()
+                # Get frame from camera (with USB lock protection)
+                frame_bytes = await _get_webcam_frame_safe()
                 
                 # Decode JPEG
                 nparr = np.frombuffer(frame_bytes, np.uint8)
