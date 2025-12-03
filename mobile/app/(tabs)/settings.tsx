@@ -16,6 +16,7 @@ export default function SettingsScreen() {
   const [draftUrl, setDraftUrl] = useState(baseUrl);
   const [volume, setVolume] = useState(80);
   const [isLoadingVolume, setIsLoadingVolume] = useState(false);
+  const [isMusicPlaying, setIsMusicPlaying] = useState(false);
 
   // Load current volume on mount
   useEffect(() => {
@@ -52,6 +53,26 @@ export default function SettingsScreen() {
       Alert.alert('Volume Error', 'Failed to update speaker volume');
     } finally {
       setIsLoadingVolume(false);
+    }
+  }, [api]);
+
+  const handlePlayMusic = useCallback(async () => {
+    try {
+      await api.post('/music/play', {});
+      setIsMusicPlaying(true);
+    } catch (error) {
+      console.warn('Failed to play music', error);
+      Alert.alert('Music Error', 'Failed to start music playback');
+    }
+  }, [api]);
+
+  const handleStopMusic = useCallback(async () => {
+    try {
+      await api.post('/music/stop', {});
+      setIsMusicPlaying(false);
+    } catch (error) {
+      console.warn('Failed to stop music', error);
+      Alert.alert('Music Error', 'Failed to stop music');
     }
   }, [api]);
 
@@ -154,6 +175,54 @@ export default function SettingsScreen() {
         <Animated.View entering={FadeInDown.delay(300).duration(400)}>
           <ThemedView style={styles.card}>
             <View style={styles.cardHeader}>
+              <IconSymbol name="music.note" size={24} color="#EC4899" />
+              <ThemedText type="subtitle">Music Player</ThemedText>
+            </View>
+            <ThemedText style={styles.cardDescription}>
+              Play music from YouTube on robot speakers
+            </ThemedText>
+            <View style={styles.musicControls}>
+              <Pressable 
+                style={({ pressed }) => [
+                  styles.musicButton,
+                  !isMusicPlaying && styles.musicButtonPrimary,
+                  pressed && styles.musicButtonPressed
+                ]} 
+                onPress={handlePlayMusic}
+                disabled={isMusicPlaying}
+              >
+                <IconSymbol name="play.fill" size={20} color={isMusicPlaying ? "#67686C" : "#FFFFFF"} />
+                <ThemedText style={[styles.musicButtonText, !isMusicPlaying && styles.musicButtonTextPrimary]}>
+                  Play Music
+                </ThemedText>
+              </Pressable>
+              <Pressable 
+                style={({ pressed }) => [
+                  styles.musicButton,
+                  isMusicPlaying && styles.musicButtonDanger,
+                  pressed && styles.musicButtonPressed
+                ]} 
+                onPress={handleStopMusic}
+                disabled={!isMusicPlaying}
+              >
+                <IconSymbol name="stop.fill" size={20} color={isMusicPlaying ? "#FFFFFF" : "#67686C"} />
+                <ThemedText style={[styles.musicButtonText, isMusicPlaying && styles.musicButtonTextDanger]}>
+                  Stop
+                </ThemedText>
+              </Pressable>
+            </View>
+            {isMusicPlaying && (
+              <View style={styles.musicStatus}>
+                <IconSymbol name="waveform" size={16} color="#EC4899" />
+                <ThemedText style={styles.musicStatusText}>Music playing...</ThemedText>
+              </View>
+            )}
+          </ThemedView>
+        </Animated.View>
+
+        <Animated.View entering={FadeInDown.delay(400).duration(400)}>
+          <ThemedView style={styles.card}>
+            <View style={styles.cardHeader}>
               <IconSymbol name="arrow.triangle.2.circlepath" size={24} color="#F59E0B" />
               <ThemedText type="subtitle">Reset Connection</ThemedText>
             </View>
@@ -173,7 +242,7 @@ export default function SettingsScreen() {
           </ThemedView>
         </Animated.View>
 
-        <Animated.View entering={FadeInDown.delay(400).duration(400)}>
+        <Animated.View entering={FadeInDown.delay(500).duration(400)}>
           <ThemedView style={styles.card}>
             <View style={styles.cardHeader}>
               <IconSymbol name="info.circle.fill" size={24} color="#6366F1" />
@@ -338,5 +407,56 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontFamily: 'JetBrainsMono_600SemiBold',
     color: '#8B5CF6',
+  },
+  musicControls: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  musicButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(55, 55, 55, 0.6)',
+    borderRadius: 12,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(55, 55, 55, 0.6)',
+  },
+  musicButtonPrimary: {
+    backgroundColor: '#EC4899',
+    borderColor: '#EC4899',
+  },
+  musicButtonDanger: {
+    backgroundColor: '#EF4444',
+    borderColor: '#EF4444',
+  },
+  musicButtonPressed: {
+    transform: [{ scale: 0.96 }],
+    opacity: 0.8,
+  },
+  musicButtonText: {
+    color: '#67686C',
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    fontSize: 14,
+  },
+  musicButtonTextPrimary: {
+    color: '#FFFFFF',
+  },
+  musicButtonTextDanger: {
+    color: '#FFFFFF',
+  },
+  musicStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    justifyContent: 'center',
+    paddingVertical: 8,
+  },
+  musicStatusText: {
+    color: '#EC4899',
+    fontSize: 13,
+    fontFamily: 'JetBrainsMono_600SemiBold',
   },
 });
