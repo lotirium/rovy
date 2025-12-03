@@ -56,4 +56,5 @@ echo ""
 echo "[2/2] Starting main API server..."
 echo ""
 cd ../cloud
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Use venv Python explicitly instead of relying on PATH
+/home/rovy/rovy_client/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000

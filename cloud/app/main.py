@@ -1082,6 +1082,7 @@ async def text_to_speech(request: dict):
 
 # Piper TTS for local speech on Pi
 _piper_voice = None
+_tts_lock = asyncio.Lock()  # Prevent concurrent audio playback
 PIPER_MODEL_PATH = "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx"
 
 def _get_audio_device():
@@ -1125,7 +1126,7 @@ def _get_piper_voice():
 
 
 def _speak_with_piper(text: str) -> bool:
-    """Synthesize and play speech through speakers."""
+    """Synthesize and play speech through speakers with dynamic device detection."""
     import wave
     import subprocess
     import tempfile
@@ -1167,19 +1168,56 @@ def _speak_with_piper(text: str) -> bool:
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio_bytes)
         
-        # Play through speaker
-        result = subprocess.run(
-            ['aplay', '-D', AUDIO_DEVICE, wav_path],
-            capture_output=True,
-            timeout=30
-        )
+        # Dynamically detect audio device and try multiple fallback options
+        audio_devices = []
         
-        if result.returncode != 0:
-            LOGGER.error(f"aplay failed with code {result.returncode}: {result.stderr.decode()}")
+        # Try to detect USB audio device dynamically
+        try:
+            result = subprocess.run(['aplay', '-l'], capture_output=True, text=True, timeout=2)
+            for line in result.stdout.split('\n'):
+                if 'UACDemo' in line or 'USB Audio' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 1 and 'card' in parts[0]:
+                        card_num = parts[0].split('card')[1].strip()
+                        audio_devices.append(f"plughw:{card_num},0")
+        except Exception as e:
+            LOGGER.debug(f"Failed to detect audio device: {e}")
         
-        # Cleanup
+        # Add fallback devices
+        audio_devices.extend([
+            "plughw:3,0",  # Common USB audio card
+            "plughw:2,0",
+            "default",     # System default
+            "plughw:0,0",  # Built-in audio
+        ])
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        audio_devices = [x for x in audio_devices if not (x in seen or seen.add(x))]
+        
+        # Try each device until one works
+        for device in audio_devices:
+            try:
+                result = subprocess.run(
+                    ['aplay', '-D', device, wav_path],
+                    capture_output=True,
+                    timeout=30
+                )
+                
+                if result.returncode == 0:
+                    LOGGER.info(f"✅ Audio played successfully on {device}")
+                    os.unlink(wav_path)
+                    return True
+                else:
+                    LOGGER.debug(f"Device {device} failed: {result.stderr.decode()}")
+            except Exception as e:
+                LOGGER.debug(f"Device {device} error: {e}")
+                continue
+        
+        # All devices failed
+        LOGGER.error(f"All audio devices failed. Tried: {audio_devices}")
         os.unlink(wav_path)
-        return result.returncode == 0
+        return False
         
     except Exception as e:
         LOGGER.error(f"Piper speak error: {e}")
@@ -1191,6 +1229,7 @@ async def speak_text(request: dict):
     """Speak text through the robot's speakers using Piper TTS.
     
     This endpoint is for the Pi to speak responses from the cloud AI.
+    Uses a lock to prevent concurrent audio playback (ALSA limitation).
     """
     text = request.get("text", "")
     if not text:
@@ -1198,7 +1237,9 @@ async def speak_text(request: dict):
     
     LOGGER.info(f"Speaking: {text[:50]}...")
     
-    success = await anyio.to_thread.run_sync(_speak_with_piper, text)
+    # Use lock to prevent concurrent audio playback
+    async with _tts_lock:
+        success = await anyio.to_thread.run_sync(_speak_with_piper, text)
     
     if success:
         return {"status": "ok", "message": "Speech played"}
