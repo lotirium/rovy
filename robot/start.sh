@@ -57,5 +57,10 @@ echo ""
 # Step 2: Start robot client
 echo "[2/2] Starting robot client..."
 echo ""
-# Stay in robot directory and run robot client
-python main.py
+# Stay in robot directory and run robot client using venv's python
+if [ -f "$VENV_PATH/bin/python" ]; then
+    "$VENV_PATH/bin/python" main.py
+else
+    # Fallback to system python if venv not found
+    python3 main.py
+fi

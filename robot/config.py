@@ -20,7 +20,8 @@ SERVER_URL = f"ws://{PC_SERVER_IP}:{WS_PORT}"
 # =============================================================================
 
 # Rover serial connection (ESP32)
-ROVER_SERIAL_PORT = os.getenv("ROVY_SERIAL_PORT", "/dev/ttyACM0")
+# Pi5 uses /dev/ttyAMA0 for GPIO UART, older Pis may use /dev/ttyS0 or /dev/ttyACM0
+ROVER_SERIAL_PORT = os.getenv("ROVY_SERIAL_PORT", "/dev/ttyAMA0")
 ROVER_BAUDRATE = 115200
 
 # =============================================================================
