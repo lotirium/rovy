@@ -529,8 +529,7 @@ async def camera_websocket(websocket: WebSocket):
             image_bytes = robot.get_cached_image()
             if image_bytes:
                 await websocket.send_json({
-                    "type": "frame",
-                    "data": base64.b64encode(image_bytes).decode('utf-8'),
+                    "frame": base64.b64encode(image_bytes).decode('utf-8'),
                     "timestamp": time.time()
                 })
             await asyncio.sleep(1.0 / config.CAMERA_FPS)
