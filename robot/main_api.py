@@ -649,6 +649,7 @@ async def nod(command: NodCommand):
 async def get_wifi_status():
     """Get WiFi connection status."""
     try:
+        # Check if WiFi is connected
         result = subprocess.run(
             ["nmcli", "-t", "-f", "TYPE,STATE", "device", "status"],
             capture_output=True,
@@ -657,12 +658,30 @@ async def get_wifi_status():
         )
         is_connected = "wifi:connected" in result.stdout
         
+        # Get actual SSID
+        ssid = "unknown"
+        if is_connected:
+            try:
+                ssid_result = subprocess.run(
+                    ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                # Parse output like "yes:MyWiFiNetwork"
+                for line in ssid_result.stdout.split('\n'):
+                    if line.startswith('yes:'):
+                        ssid = line.split(':', 1)[1]
+                        break
+            except Exception as e:
+                print(f"[WiFi] Could not get SSID: {e}")
+        
         return {
             "connected": is_connected,
-            "ssid": "unknown"  # Could parse from nmcli
+            "ssid": ssid
         }
     except Exception as e:
-        return {"connected": False, "error": str(e)}
+        return {"connected": False, "error": str(e), "ssid": "unknown"}
 
 
 @app.get("/mode")
