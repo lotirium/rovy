@@ -1,7 +1,11 @@
 # Rovy Raspberry Pi Client Requirements
 # Controls rover hardware and streams to PC server
 
-# WebSocket client
+# REST API Server (for mobile app)
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# WebSocket client (for cloud streaming)
 websockets>=11.0
 
 # Serial communication with rover
