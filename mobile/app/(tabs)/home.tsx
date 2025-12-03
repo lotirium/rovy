@@ -1,4 +1,3 @@
-import { Image } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
@@ -16,6 +15,7 @@ import Animated, {
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { IconSymbol } from '@/components/ui/icon-symbol';
+import { RobotEyes } from '@/components/robot-eyes-svg';
 import { useRobot } from '@/context/robot-provider';
 
 const PRIMARY_ACTIONS = [
@@ -90,6 +90,14 @@ export default function HomeScreen() {
     transform: [{ scale: pulseScale.value }],
   }));
 
+  // Determine robot emotion based on status
+  const getEmotion = () => {
+    if (!isOnline) return 'neutral';
+    if (batteryLevel !== undefined && batteryLevel < 20) return 'thinking';
+    if (batteryLevel !== undefined && batteryLevel > 80) return 'happy';
+    return 'curious';
+  };
+
   return (
     <SafeAreaView style={styles.safeArea} edges={["top"]}>
       <ThemedView style={styles.screen}>
@@ -97,24 +105,16 @@ export default function HomeScreen() {
           contentContainerStyle={styles.content}
           showsVerticalScrollIndicator={false}
         >
-          {/* Hero Section with Robot */}
+          {/* Animated Robot Eyes */}
+          <Animated.View entering={FadeIn.duration(800)}>
+            <RobotEyes emotion={getEmotion()} isOnline={isOnline} />
+          </Animated.View>
+
+          {/* Status Section */}
           <Animated.View 
             entering={FadeIn.duration(600)}
-            style={styles.heroSection}
+            style={styles.statusSection}
           >
-            <View style={styles.heroContent}>
-              <Image
-                source={require("@/assets/images/rovy.png")}
-                style={styles.heroImage}
-                contentFit="contain"
-              />
-              <View style={styles.heroTextContainer}>
-                <ThemedText style={styles.heroTitle}>JARVIS</ThemedText>
-                <ThemedText style={styles.heroSubtitle}>Ready to assist</ThemedText>
-              </View>
-            </View>
-            
-            {/* Inline Status */}
             <View style={styles.inlineStatus}>
               <View style={styles.statusChip}>
                 <Animated.View 
@@ -221,38 +221,14 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 24,
-    paddingTop: 16,
+    paddingTop: 8,
     paddingBottom: 48,
     gap: 24,
   },
   
-  // Hero Section
-  heroSection: {
+  // Status Section
+  statusSection: {
     gap: 20,
-  },
-  heroContent: {
-    alignItems: 'center',
-    gap: 16,
-    paddingVertical: 20,
-  },
-  heroImage: {
-    width: 160,
-    height: 120,
-  },
-  heroTextContainer: {
-    alignItems: 'center',
-    gap: 4,
-  },
-  heroTitle: {
-    fontSize: 36,
-    fontFamily: 'JetBrainsMono_700Bold',
-    color: '#F9FAFB',
-    letterSpacing: -1,
-  },
-  heroSubtitle: {
-    fontSize: 16,
-    color: '#9CA3AF',
-    fontFamily: 'JetBrainsMono_400Regular',
   },
   
   // Inline Status
