@@ -124,33 +124,64 @@ class ToolExecutor:
         query_lower = query.lower()
         
         # Translation - check first as it's very specific
-        translate_keywords = ['translate', 'traduire', 'traducir', 'übersetzen', 'tradurre', 'traduzir', '翻訳', '翻译']
+        # Support multilingual translation keywords
+        translate_keywords = [
+            'translate', 'traduire', 'traducir', 'übersetzen', 'tradurre', 'traduzir',  # European
+            '翻訳', '翻译', '번역',  # Japanese, Chinese, Korean
+            'अनुवाद', 'ترجمه',  # Hindi, Farsi
+            'dịch',  # Vietnamese
+        ]
+        
         if any(kw in query_lower for kw in translate_keywords):
-            # Pattern: "translate to [language] [text]" or "translate [text] to [language]"
-            # More flexible patterns that handle punctuation
+            # Flexible multilingual patterns
             patterns = [
-                r'translate\s+to\s+(\w+)[\s\.,;:]+(.+)',  # "translate to Chinese. I love you" or "translate to Chinese I love you"
-                r'translate\s+(.+?)\s+to\s+(\w+)',  # "translate I love you to Chinese"
-                r'traduire\s+en\s+(\w+)[\s\.,;:]+(.+)',  # French: "traduire en chinois. je t'aime"
-                r'traducir\s+a(?:l)?\s+(\w+)[\s\.,;:]+(.+)',  # Spanish: "traducir al chino. te amo"
+                # English
+                r'translate\s+to\s+(\w+)[\s\.,;:]+(.+)',
+                r'translate\s+(.+?)\s+to\s+(\w+)',
+                # French
+                r'traduire\s+en\s+(\w+)[\s\.,;:]+(.+)',
+                # Spanish
+                r'traducir\s+a(?:l)?\s+(\w+)[\s\.,;:]+(.+)',
+                # German
+                r'übersetzen?\s+(?:zu|nach)\s+(\w+)[\s\.,;:]+(.+)',
+                # Chinese (翻译到英语 = translate to English)
+                r'翻译(?:到|成)\s*(\w+)[\s\.,;:，。：；]*(.+)',
+                # More flexible: just detect "translate" + language name anywhere
+                r'(\w+)\s*(?:translate|翻译|traducir|traduire)',  # "English translate" or "英语翻译"
             ]
             
             for pattern in patterns:
-                match = re.search(pattern, query_lower, re.IGNORECASE)
+                match = re.search(pattern, query, re.IGNORECASE)  # Use original query to preserve case
                 if match:
-                    if 'to' in pattern or 'en' in pattern or 'a' in pattern:
-                        # First group is language, second is text (for "to" patterns)
-                        if pattern.startswith(r'translate\s+to') or 'en' in pattern or 'a' in pattern:
+                    # Try to extract language and text
+                    if len(match.groups()) >= 2:
+                        if pattern.startswith(r'translate\s+to') or 'en' in pattern or 'a' in pattern or '翻译' in pattern:
                             target_lang = match.group(1).strip()
                             text = match.group(2).strip()
-                            # Clean up punctuation from text
-                            text = text.strip('.,;:!?')
+                            text = text.strip('.,;:!?，。：；')
                         else:
-                            # Text first, language second (for "translate X to Y")
                             text = match.group(1).strip()
                             target_lang = match.group(2).strip()
-                        
-                        return {"tool": "translate", "params": {"text": text, "target_language": target_lang}}
+                    else:
+                        # Fallback: let LLM figure it out
+                        target_lang = "english"
+                        text = query
+                    
+                    return {"tool": "translate", "params": {"text": text, "target_language": target_lang}}
+            
+            # If no pattern matched but has translate keyword, let LLM handle it
+            # Extract potential language name (english, chinese, español, etc.)
+            lang_words = ['english', 'chinese', 'spanish', 'french', 'german', 'italian', 
+                          'portuguese', 'russian', 'hindi', 'farsi', 'persian', 'nepali', 'vietnamese',
+                          '英语', '中文', '西班牙语', '法语', '德语']
+            found_lang = None
+            for lang in lang_words:
+                if lang in query_lower:
+                    found_lang = lang
+                    break
+            
+            if found_lang:
+                return {"tool": "translate", "params": {"text": query, "target_language": found_lang}}
         
         # Time/Date - check first to avoid conflicts with "what is"
         time_patterns = [
@@ -902,38 +933,55 @@ class ToolExecutor:
     async def translate(self, text: str, target_language: str) -> Dict[str, Any]:
         """
         Translate text to target language using the LLM.
+        Supports bidirectional translation (any language to any language).
         
         Args:
             text: Text to translate
-            target_language: Target language (e.g., "Chinese", "Spanish", "French")
+            target_language: Target language (e.g., "Chinese", "Spanish", "English", "英语", etc.)
         
         Returns:
             Dict with success, translated result, and data
         """
         try:
-            # Language name normalization
+            # Language name normalization (only languages with Piper voices)
             language_map = {
                 'chinese': 'Chinese (中文)',
                 'mandarin': 'Chinese (中文)',
+                '中文': 'Chinese (中文)',
+                '中国': 'Chinese (中文)',
                 'spanish': 'Spanish (Español)',
+                'español': 'Spanish (Español)',
                 'french': 'French (Français)',
+                'français': 'French (Français)',
                 'german': 'German (Deutsch)',
+                'deutsch': 'German (Deutsch)',
                 'italian': 'Italian (Italiano)',
+                'italiano': 'Italian (Italiano)',
                 'portuguese': 'Portuguese (Português)',
+                'português': 'Portuguese (Português)',
                 'russian': 'Russian (Русский)',
-                'japanese': 'Japanese (日本語)',
-                'korean': 'Korean (한국어)',
-                'arabic': 'Arabic (العربية)',
+                'русский': 'Russian (Русский)',
                 'hindi': 'Hindi (हिन्दी)',
+                'हिन्दी': 'Hindi (हिन्दी)',
                 'english': 'English',
+                '英语': 'English',
+                '英文': 'English',
+                'farsi': 'Farsi (فارسی)',
+                'persian': 'Farsi (فارسی)',
+                'فارسی': 'Farsi (فارسی)',
+                'nepali': 'Nepali (नेपाली)',
+                'नेपाली': 'Nepali (नेपाली)',
+                'vietnamese': 'Vietnamese (Tiếng Việt)',
+                'tiếng việt': 'Vietnamese (Tiếng Việt)',
+                # Japanese and Korean not available in standard Piper TTS
             }
             
             # Normalize target language
-            target_lower = target_language.lower()
+            target_lower = target_language.lower().strip()
             display_language = language_map.get(target_lower, target_language.title())
             
-            # Create translation prompt
-            prompt = f"Translate the following text to {display_language}. Return ONLY the translated text, nothing else:\n\n{text}"
+            # Create smarter translation prompt that handles bidirectional translation
+            prompt = f"Translate the following text to {display_language}. The text may be in any language. Return ONLY the translated text, nothing else:\n\n{text}"
             
             # Use the LLM to translate
             logger.info(f"Translating '{text}' to {display_language}")

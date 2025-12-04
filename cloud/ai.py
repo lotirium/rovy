@@ -550,20 +550,33 @@ Answer:"""
             if data and "target_language" in data:
                 # Extract ISO code from display language like "Chinese (中文)"
                 target_lang = data["target_language"]
-                # Map back to ISO codes
+                # Map back to ISO codes (match display names from tools.py)
+                # Only includes languages with Piper voice models
                 lang_map = {
                     "Chinese": "zh",
+                    "中文": "zh",
                     "Spanish": "es",
+                    "Español": "es",
                     "French": "fr",
+                    "Français": "fr",
                     "German": "de",
+                    "Deutsch": "de",
                     "Italian": "it",
+                    "Italiano": "it",
                     "Portuguese": "pt",
+                    "Português": "pt",
                     "Russian": "ru",
-                    "Japanese": "ja",
-                    "Korean": "ko",
-                    "Arabic": "ar",
+                    "Русский": "ru",
                     "Hindi": "hi",
+                    "हिन्दी": "hi",
                     "English": "en",
+                    "Farsi": "fa",
+                    "فارسی": "fa",
+                    "Persian": "fa",
+                    "Nepali": "ne",
+                    "नेपाली": "ne",
+                    "Vietnamese": "vi",
+                    "Tiếng Việt": "vi",
                 }
                 for lang_name, code in lang_map.items():
                     if lang_name in target_lang:
