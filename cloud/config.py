@@ -37,7 +37,13 @@ N_CTX = int(os.getenv("ROVY_CTX", "2048"))
 # =============================================================================
 
 # Speech-to-text (Whisper)
-WHISPER_MODEL = os.getenv("ROVY_WHISPER_MODEL", "base")  # tiny, base, small, medium, large
+# Model size affects accuracy: tiny < base < small < medium < large
+# For multilingual accuracy, use "small" or "medium"
+WHISPER_MODEL = os.getenv("ROVY_WHISPER_MODEL", "small")  # tiny, base, small, medium, large
+
+# Language detection settings
+WHISPER_LANGUAGE = os.getenv("ROVY_WHISPER_LANGUAGE", None)  # None = auto-detect, or specify like "en", "es", etc.
+WHISPER_TASK = os.getenv("ROVY_WHISPER_TASK", "transcribe")  # "transcribe" or "translate" (to English)
 
 # Text-to-speech
 TTS_ENGINE = os.getenv("ROVY_TTS_ENGINE", "piper")  # piper, espeak

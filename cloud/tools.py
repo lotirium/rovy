@@ -145,60 +145,70 @@ class ToolExecutor:
             location = self._extract_location(query) or "Seoul"
             return {"tool": "get_weather", "params": {"location": location}}
         
-        # Music control - check standalone commands first (without "music"/"song" keyword)
-        # This handles: "next", "next one", "skip", "pause", "resume", etc.
+        # Music control - multilingual support
+        # Check standalone commands first (without "music"/"song" keyword)
         standalone_music_patterns = [
-            (r'\b(?:next|skip)\s*(?:song|track|one)?\b', 'next'),
-            (r'\b(?:previous|prev|back|last)\s*(?:song|track|one)?\b', 'previous'),
-            (r'\b(?:pause|hold)\s*(?:it|music|song|this)?\b', 'pause'),
-            (r'\b(?:resume|continue|unpause)\s*(?:music|song|it)?\b', 'play'),
-            (r'\b(?:stop)\s*(?:music|song|it|playing|this)?\b', 'stop'),
+            # Next (English, Spanish, French, German, Italian, Portuguese, Russian, Japanese, Chinese)
+            (r'\b(?:next|skip|siguiente|prochain|nächste|prossimo|próxima|следующий|次|下一个)\s*(?:song|track|one|canción|chanson|lied|canzone|música)?\b', 'next'),
+            # Previous (English, Spanish, French, German, Italian, Portuguese, Russian, Japanese, Chinese)
+            (r'\b(?:previous|prev|back|last|anterior|précédent|vorherige|precedente|anterior|предыдущий|前|上一个)\s*(?:song|track|one|canción|chanson|lied|canzone|música)?\b', 'previous'),
+            # Pause (English, Spanish, French, German, Italian, Portuguese, Russian, Japanese, Chinese)
+            (r'\b(?:pause|hold|pausa|pausieren|一時停止|暂停)\s*(?:it|music|song|this|música|musique|musik|musica)?\b', 'pause'),
+            # Resume (English, Spanish, French, German, Italian, Portuguese, Russian, Japanese, Chinese)
+            (r'\b(?:resume|continue|unpause|reanudar|reprendre|fortsetzen|riprendi|retomar|возобновить|再開|继续)\s*(?:music|song|it|música|musique|musik|musica)?\b', 'play'),
+            # Stop (English, Spanish, French, German, Italian, Portuguese, Russian, Japanese, Chinese)
+            (r'\b(?:stop|halt|para|arrête|stopp|ferma|стоп|停止)\s*(?:music|song|it|playing|this|música|musique|musik|musica)?\b', 'stop'),
         ]
         
         for pattern, action in standalone_music_patterns:
             if re.search(pattern, query_lower):
                 # Make sure it's not part of a movement command
-                if not any(move_kw in query_lower for move_kw in ['move', 'go', 'drive', 'walk', 'turn', 'forward', 'backward']):
+                if not any(move_kw in query_lower for move_kw in ['move', 'go', 'drive', 'walk', 'turn', 'forward', 'backward', 'avanza', 'mueve', 'gira']):
                     return {"tool": "play_music", "params": {"action": action, "query": ""}}
         
-        # Music control with explicit "music" or "song" keyword
-        if 'music' in query_lower or 'song' in query_lower or 'play' in query_lower:
+        # Music control with explicit "music" or "song" keyword (multilingual)
+        music_keywords = ['music', 'song', 'play', 'música', 'canción', 'musique', 'chanson', 'musik', 'lied', 'musica', 'canzone', 'музыка', '音楽', '音乐']
+        if any(kw in query_lower for kw in music_keywords):
             action = "play"
-            if "pause" in query_lower:
+            # Pause detection (multilingual)
+            if any(kw in query_lower for kw in ['pause', 'pausa', 'pausieren', '一時停止', '暂停']):
                 action = "pause"
-            elif "stop" in query_lower:
+            # Stop detection (multilingual)
+            elif any(kw in query_lower for kw in ['stop', 'halt', 'para', 'arrête', 'stopp', 'ferma', 'стоп', '停止']):
                 action = "stop"
-            elif "next" in query_lower or "skip" in query_lower:
+            # Next detection (multilingual)
+            elif any(kw in query_lower for kw in ['next', 'skip', 'siguiente', 'prochain', 'nächste', 'prossimo', 'próxima', 'следующий', '次', '下一个']):
                 action = "next"
-            elif "previous" in query_lower or "back" in query_lower:
+            # Previous detection (multilingual)
+            elif any(kw in query_lower for kw in ['previous', 'back', 'anterior', 'précédent', 'vorherige', 'precedente', 'предыдущий', '前', '上一个']):
                 action = "previous"
             return {"tool": "play_music", "params": {"action": action, "query": ""}}
         
-        # Robot movement
-        movement_keywords = ['move', 'go', 'drive', 'turn']
+        # Robot movement (multilingual)
+        movement_keywords = ['move', 'go', 'drive', 'turn', 'avanza', 'mueve', 'gira', 've', 'avance', 'tourne', 'fahre', 'geh', 'vai', 'двигайся', '動く', '移动']
         if any(kw in query_lower for kw in movement_keywords):
             direction = "forward"  # default
             distance = 0.5
             speed = "medium"
             
-            # Detect direction
-            if 'forward' in query_lower or 'ahead' in query_lower or 'straight' in query_lower:
+            # Detect direction (multilingual)
+            if any(kw in query_lower for kw in ['forward', 'ahead', 'straight', 'adelante', 'avant', 'vorwärts', 'avanti', 'frente', 'вперёд', 'вперед', '前', '前进']):
                 direction = "forward"
-            elif 'backward' in query_lower or 'back' in query_lower or 'reverse' in query_lower:
+            elif any(kw in query_lower for kw in ['backward', 'back', 'reverse', 'atrás', 'arrière', 'rückwärts', 'indietro', 'trás', 'назад', '後ろ', '后退']):
                 direction = "backward"
-            elif 'left' in query_lower:
+            elif any(kw in query_lower for kw in ['left', 'izquierda', 'gauche', 'links', 'sinistra', 'esquerda', 'налево', '左']):
                 direction = "left"
-            elif 'right' in query_lower:
+            elif any(kw in query_lower for kw in ['right', 'derecha', 'droite', 'rechts', 'destra', 'direita', 'направо', '右']):
                 direction = "right"
             
-            # Detect speed
-            if 'fast' in query_lower or 'quick' in query_lower:
+            # Detect speed (multilingual)
+            if any(kw in query_lower for kw in ['fast', 'quick', 'rápido', 'vite', 'schnell', 'veloce', 'быстро', '速く', '快']):
                 speed = "fast"
-            elif 'slow' in query_lower or 'slowly' in query_lower:
+            elif any(kw in query_lower for kw in ['slow', 'slowly', 'lento', 'lentement', 'langsam', 'lentamente', 'devagar', 'медленно', 'ゆっくり', '慢']):
                 speed = "slow"
             
-            # Detect distance (optional - look for numbers)
-            distance_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:meter|metre|m\b)', query_lower)
+            # Detect distance (optional - look for numbers with units in multiple languages)
+            distance_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:meter|metre|metro|метр|m\b)', query_lower)
             if distance_match:
                 distance = float(distance_match.group(1))
             

@@ -138,17 +138,27 @@ class SpeechProcessor:
                 )
             
             # Transcribe with automatic language detection
+            # Better parameters for improved accuracy:
             result = self.whisper_model.transcribe(
                 audio,
                 language=None,  # Auto-detect language
+                task="transcribe",  # Don't translate, just transcribe
                 fp16=False,
-                verbose=False
+                verbose=False,
+                temperature=0.0,  # Use greedy decoding for better accuracy
+                beam_size=5,  # Use beam search for better results
+                best_of=5,  # Sample multiple times and pick best
+                condition_on_previous_text=False  # Each segment is independent
             )
             
             text = result["text"].strip()
             detected_language = result.get("language", "en")
             
-            if text:
+            # Log detection confidence if available
+            if "language_probability" in result:
+                confidence = result["language_probability"]
+                logger.info(f"Transcribed ({detected_language}, confidence: {confidence:.2%}): '{text}'")
+            else:
                 logger.info(f"Transcribed ({detected_language}): '{text}'")
             
             return {
