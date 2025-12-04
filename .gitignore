@@ -51,3 +51,6 @@ Thumbs.db
 offload/
 
 api/
+# Piper TTS voice models (download separately)
+models/piper/*.onnx
+models/piper/*.json

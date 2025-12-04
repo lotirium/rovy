@@ -47,8 +47,26 @@ AUDIO_BUFFER_SECONDS = 2.0
 # Text-to-Speech (Piper)
 # =============================================================================
 
-# Piper TTS voice model path
-PIPER_VOICE = os.getenv("ROVY_PIPER_VOICE", "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx")
+# Piper TTS voice model paths for different languages
+# Download voices from: https://github.com/rhasspy/piper/blob/master/VOICES.md
+PIPER_VOICES = {
+    "en": "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx",
+    "es": "/home/rovy/rovy_client/models/piper/es_ES-davefx-medium.onnx",
+    "fr": "/home/rovy/rovy_client/models/piper/fr_FR-siwis-medium.onnx",
+    "de": "/home/rovy/rovy_client/models/piper/de_DE-thorsten-medium.onnx",
+    "it": "/home/rovy/rovy_client/models/piper/it_IT-riccardo-x_low.onnx",
+    "pt": "/home/rovy/rovy_client/models/piper/pt_BR-faber-medium.onnx",
+    "ru": "/home/rovy/rovy_client/models/piper/ru_RU-dmitri-medium.onnx",
+    "zh": "/home/rovy/rovy_client/models/piper/zh_CN-huayan-medium.onnx",
+    "vi": "/home/rovy/rovy_client/models/piper/vi_VN-vais1000-medium.onnx",
+    "hi": "/home/rovy/rovy_client/models/piper/hi_IN-pratham-medium.onnx",
+    "ne": "/home/rovy/rovy_client/models/piper/ne_NP-chitwan-medium.onnx",
+    "fa": "/home/rovy/rovy_client/models/piper/fa_IR-amir-medium.onnx",
+    # Korean (ko) is not available in Piper TTS
+}
+
+# Default voice (backward compatibility)
+PIPER_VOICE = PIPER_VOICES.get("en")
 
 # =============================================================================
 # Connection

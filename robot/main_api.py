@@ -760,14 +760,25 @@ async def speak_text(request: dict):
             import tempfile
             import os
             
-            piper_voice = config.PIPER_VOICE
+            # Select Piper voice based on language
+            piper_voice = config.PIPER_VOICES.get(language, config.PIPER_VOICES.get("en"))
+            
+            # Check if voice file exists
+            if not os.path.exists(piper_voice):
+                print(f"[Speak] Warning: Piper voice not found for {language}: {piper_voice}")
+                # Fall back to English voice
+                piper_voice = config.PIPER_VOICES.get("en")
+                if not os.path.exists(piper_voice):
+                    print(f"[Speak] Error: No Piper voices available")
+                    return
+                print(f"[Speak] Using English voice as fallback")
             
             # Create temp wav file
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                 wav_path = f.name
             
             # Generate speech with Piper
-            print(f"[Speak] Generating with Piper...")
+            print(f"[Speak] Generating with Piper ({os.path.basename(piper_voice)})...")
             proc = subprocess.run(
                 ['piper', '--model', piper_voice, '--output_file', wav_path],
                 input=text,
@@ -810,7 +821,7 @@ async def speak_text(request: dict):
     threading.Thread(target=do_speak, daemon=True).start()
     
     # Return immediately
-    return {"status": "speaking", "method": "piper_async"}
+    return {"status": "speaking", "method": "piper_async", "language": language}
 
 
 # Global music player state

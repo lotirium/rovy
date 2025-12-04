@@ -793,7 +793,16 @@ def _get_speech():
     if _speech is None:
         try:
             from speech import SpeechProcessor
-            _speech = SpeechProcessor()
+            import sys
+            from pathlib import Path
+            # Import config
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            import config
+            _speech = SpeechProcessor(
+                whisper_model=config.WHISPER_MODEL,
+                tts_engine=config.TTS_ENGINE,
+                piper_voices=config.PIPER_VOICES
+            )
             LOGGER.info("SpeechProcessor loaded for voice endpoint")
         except Exception as e:
             LOGGER.error(f"Failed to load SpeechProcessor: {e}")

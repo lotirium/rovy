@@ -9,7 +9,7 @@ import wave
 import tempfile
 import subprocess
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 
@@ -35,9 +35,10 @@ except ImportError:
 class SpeechProcessor:
     """Speech recognition and synthesis using local models."""
     
-    def __init__(self, whisper_model: str = "base", tts_engine: str = "espeak"):
+    def __init__(self, whisper_model: str = "base", tts_engine: str = "espeak", piper_voices: dict = None):
         self.whisper_model = None
-        self.piper_voice = None
+        self.piper_voices = {}  # Dictionary of language -> PiperVoice
+        self.piper_voice_paths = piper_voices or {}  # Dictionary of language -> voice path
         self.tts_engine = tts_engine
         
         # Load Whisper
@@ -51,29 +52,53 @@ class SpeechProcessor:
         
         # Setup TTS
         if tts_engine == "piper" and PIPER_OK:
-            self._init_piper()
+            self._init_piper_voices()
         else:
             self._check_espeak()
     
-    def _init_piper(self):
-        """Initialize Piper TTS."""
-        voice_paths = [
-            os.path.expanduser("~/.local/share/piper-voices/en_US-lessac-medium.onnx"),
-            os.path.expanduser("~/.local/share/piper-voices/en_US-hfc_male-medium.onnx"),
-            "./voices/en_US-lessac-medium.onnx",
-        ]
+    def _init_piper_voices(self):
+        """Initialize Piper TTS voices for multiple languages."""
+        if not self.piper_voice_paths:
+            logger.info("No Piper voice paths configured, using espeak")
+            self._check_espeak()
+            return
         
-        for path in voice_paths:
+        # Try to load at least one voice (preferably English)
+        loaded_count = 0
+        for lang, path in self.piper_voice_paths.items():
             if os.path.exists(path):
                 try:
-                    self.piper_voice = PiperVoice.load(path)
-                    logger.info(f"✅ Piper ready: {os.path.basename(path)}")
-                    return
+                    self.piper_voices[lang] = PiperVoice.load(path)
+                    logger.info(f"✅ Piper voice loaded for {lang}: {os.path.basename(path)}")
+                    loaded_count += 1
                 except Exception as e:
-                    logger.warning(f"Piper load failed: {e}")
+                    logger.warning(f"Failed to load Piper voice for {lang}: {e}")
         
-        logger.info("No Piper voice found, using espeak")
-        self._check_espeak()
+        if loaded_count > 0:
+            logger.info(f"✅ Piper ready with {loaded_count} language(s)")
+        else:
+            logger.info("No Piper voices loaded, using espeak")
+            self._check_espeak()
+    
+    def _load_piper_voice(self, language: str) -> Optional[Any]:
+        """Lazy-load a Piper voice for a specific language."""
+        # If already loaded, return it
+        if language in self.piper_voices:
+            return self.piper_voices[language]
+        
+        # Try to load it
+        if language in self.piper_voice_paths:
+            path = self.piper_voice_paths[language]
+            if os.path.exists(path):
+                try:
+                    voice = PiperVoice.load(path)
+                    self.piper_voices[language] = voice
+                    logger.info(f"✅ Loaded Piper voice for {language}: {os.path.basename(path)}")
+                    return voice
+                except Exception as e:
+                    logger.warning(f"Failed to load Piper voice for {language}: {e}")
+        
+        return None
     
     def _check_espeak(self):
         """Check if espeak is available."""
@@ -150,21 +175,34 @@ class SpeechProcessor:
         text = self._preprocess(text)
         logger.info(f"Synthesizing ({language}): '{text[:50]}...'")
         
-        if self.piper_voice and PIPER_OK:
-            # Note: Current Piper voice may be English-only
-            # To support multiple languages, load language-specific Piper voices
-            return self._synth_piper(text)
-        elif self.tts_engine == "espeak":
+        # Try Piper first if available
+        if self.tts_engine == "piper" and PIPER_OK:
+            # Try to get or load the voice for this language
+            voice = self._load_piper_voice(language)
+            
+            if voice:
+                logger.info(f"Using Piper for {language}")
+                return self._synth_piper(text, voice)
+            else:
+                # Fall back to English voice if available
+                if language != "en" and "en" in self.piper_voices:
+                    logger.info(f"No Piper voice for {language}, using English voice")
+                    return self._synth_piper(text, self.piper_voices["en"])
+                else:
+                    logger.info(f"No Piper voice available for {language}, falling back to espeak")
+        
+        # Fall back to espeak
+        if self.tts_engine == "espeak" or (self.tts_engine == "piper" and not self.piper_voices):
             return self._synth_espeak(text, language=language)
         else:
             logger.warning("No TTS engine available")
             return None
     
-    def _synth_piper(self, text: str) -> Optional[bytes]:
-        """Synthesize using Piper."""
+    def _synth_piper(self, text: str, voice: Any) -> Optional[bytes]:
+        """Synthesize using Piper with the specified voice."""
         try:
             audio_data = []
-            for chunk in self.piper_voice.synthesize_stream_raw(text):
+            for chunk in voice.synthesize_stream_raw(text):
                 audio_data.append(chunk)
             
             if not audio_data:
