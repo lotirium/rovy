@@ -1114,18 +1114,25 @@ async def speech_to_text(audio: UploadFile = File(...)):
 
 @app.post("/tts", tags=["AI"])
 async def text_to_speech(request: dict):
-    """Convert text to speech (English only)."""
+    """
+    Convert text to speech with language support.
+    
+    Request body:
+        text: Text to synthesize (required)
+        language: ISO language code (optional, default: 'en')
+    """
     speech = _get_speech()
     if not speech:
         raise HTTPException(status_code=503, detail="Speech processor not available")
     
     text = request.get("text", "")
+    language = request.get("language", "en")
     
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
     
     try:
-        audio_bytes = await anyio.to_thread.run_sync(speech.synthesize, text)
+        audio_bytes = await anyio.to_thread.run_sync(speech.synthesize, text, language)
         if audio_bytes:
             return Response(content=audio_bytes, media_type="audio/wav")
         else:

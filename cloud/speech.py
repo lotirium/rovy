@@ -153,23 +153,34 @@ class SpeechProcessor:
             logger.error(f"Transcription failed: {e}")
             return None
     
-    def synthesize(self, text: str) -> Optional[bytes]:
-        """Convert text to speech audio (WAV bytes) - English only."""
+    def synthesize(self, text: str, language: str = "en") -> Optional[bytes]:
+        """
+        Convert text to speech audio (WAV bytes).
+        
+        Args:
+            text: Text to synthesize
+            language: ISO language code (e.g., 'en', 'es', 'fr', 'de', etc.) - default 'en'
+        """
         if not text:
             return None
         
         # Preprocess for TTS
         text = self._preprocess(text)
-        logger.info(f"Synthesizing: '{text[:50]}...'")
+        logger.info(f"Synthesizing ({language}): '{text[:50]}...'")
         
         # Try Piper first if available
         if self.tts_engine == "piper" and PIPER_OK:
-            voice = self._load_piper_voice("en")
+            voice = self._load_piper_voice(language)
             if voice:
                 return self._synth_piper(text, voice)
+            # Fallback to English voice if language not available
+            elif language != "en":
+                voice = self._load_piper_voice("en")
+                if voice:
+                    return self._synth_piper(text, voice)
         
         # Fall back to espeak
-        return self._synth_espeak(text)
+        return self._synth_espeak(text, language=language)
     
     def _synth_piper(self, text: str, voice: Any) -> Optional[bytes]:
         """Synthesize using Piper with the specified voice."""
@@ -197,14 +208,30 @@ class SpeechProcessor:
             logger.error(f"Piper synthesis failed: {e}")
             return None
     
-    def _synth_espeak(self, text: str, speed: int = 150) -> Optional[bytes]:
-        """Synthesize using espeak (English only)."""
+    def _synth_espeak(self, text: str, speed: int = 150, language: str = "en") -> Optional[bytes]:
+        """
+        Synthesize using espeak with language support.
+        
+        Args:
+            text: Text to synthesize
+            speed: Speech speed
+            language: ISO language code (espeak supports 100+ languages)
+        """
         try:
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                 temp_path = f.name
             
+            # Language code mapping for espeak
+            voice_map = {
+                'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 
+                'it': 'it', 'pt': 'pt', 'ru': 'ru', 'zh': 'zh',
+                'ja': 'ja', 'ko': 'ko', 'ar': 'ar', 'hi': 'hi',
+                'nl': 'nl', 'pl': 'pl', 'tr': 'tr',
+            }
+            espeak_voice = voice_map.get(language, 'en')
+            
             subprocess.run(
-                ['espeak', '-w', temp_path, '-s', str(speed), text],
+                ['espeak', '-v', espeak_voice, '-w', temp_path, '-s', str(speed), text],
                 capture_output=True,
                 timeout=30
             )
