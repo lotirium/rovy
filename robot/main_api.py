@@ -742,16 +742,20 @@ async def get_mode():
 
 @app.post("/speak")
 async def speak_text(request: dict):
-    """Speak text using robot's TTS (from cloud AI response)."""
+    """Speak text using robot's TTS (from cloud AI response) with language support."""
     robot = get_robot()
     
     text = request.get("text", "")
     audio_base64 = request.get("audio", None)
+    language = request.get("language", "en")  # Get language for Piper voice selection
     
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
     
-    print(f"[Speak] {text[:80]}...")
+    if language != "en":
+        print(f"[Speak] ({language}) {text[:80]}...")
+    else:
+        print(f"[Speak] {text[:80]}...")
     
     # Run TTS in background thread so it doesn't block API response
     def do_speak():
