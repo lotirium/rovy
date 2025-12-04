@@ -111,14 +111,8 @@ class SpeechProcessor:
             logger.warning("espeak not available")
             self.tts_engine = "none"
     
-    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> Optional[dict]:
-        """
-        Transcribe audio to text using Whisper with automatic language detection.
-        
-        Returns:
-            dict with 'text' and 'language' keys, or None on failure
-            Example: {"text": "Hello world", "language": "en"}
-        """
+    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe audio to text using Whisper (English only)."""
         if not self.whisper_model:
             logger.error("Whisper not loaded")
             return None
@@ -137,12 +131,11 @@ class SpeechProcessor:
                     audio
                 )
             
-            # Transcribe with automatic language detection
-            # Better parameters for improved accuracy:
+            # Transcribe (English only, better accuracy)
             result = self.whisper_model.transcribe(
                 audio,
-                language=None,  # Auto-detect language
-                task="transcribe",  # Don't translate, just transcribe
+                language="en",  # Force English
+                task="transcribe",
                 fp16=False,
                 verbose=False,
                 temperature=0.0,  # Use greedy decoding for better accuracy
@@ -152,61 +145,31 @@ class SpeechProcessor:
             )
             
             text = result["text"].strip()
-            detected_language = result.get("language", "en")
-            
-            # Log detection confidence if available
-            if "language_probability" in result:
-                confidence = result["language_probability"]
-                logger.info(f"Transcribed ({detected_language}, confidence: {confidence:.2%}): '{text}'")
-            else:
-                logger.info(f"Transcribed ({detected_language}): '{text}'")
-            
-            return {
-                "text": text if text else None,
-                "language": detected_language
-            } if text else None
+            if text:
+                logger.info(f"Transcribed: '{text}'")
+            return text if text else None
             
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
             return None
     
-    def synthesize(self, text: str, language: str = "en") -> Optional[bytes]:
-        """
-        Convert text to speech audio (WAV bytes) in the specified language.
-        
-        Args:
-            text: Text to synthesize
-            language: ISO language code (e.g., 'en', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'zh')
-        """
+    def synthesize(self, text: str) -> Optional[bytes]:
+        """Convert text to speech audio (WAV bytes) - English only."""
         if not text:
             return None
         
         # Preprocess for TTS
         text = self._preprocess(text)
-        logger.info(f"Synthesizing ({language}): '{text[:50]}...'")
+        logger.info(f"Synthesizing: '{text[:50]}...'")
         
         # Try Piper first if available
         if self.tts_engine == "piper" and PIPER_OK:
-            # Try to get or load the voice for this language
-            voice = self._load_piper_voice(language)
-            
+            voice = self._load_piper_voice("en")
             if voice:
-                logger.info(f"Using Piper for {language}")
                 return self._synth_piper(text, voice)
-            else:
-                # Fall back to English voice if available
-                if language != "en" and "en" in self.piper_voices:
-                    logger.info(f"No Piper voice for {language}, using English voice")
-                    return self._synth_piper(text, self.piper_voices["en"])
-                else:
-                    logger.info(f"No Piper voice available for {language}, falling back to espeak")
         
         # Fall back to espeak
-        if self.tts_engine == "espeak" or (self.tts_engine == "piper" and not self.piper_voices):
-            return self._synth_espeak(text, language=language)
-        else:
-            logger.warning("No TTS engine available")
-            return None
+        return self._synth_espeak(text)
     
     def _synth_piper(self, text: str, voice: Any) -> Optional[bytes]:
         """Synthesize using Piper with the specified voice."""
@@ -234,53 +197,14 @@ class SpeechProcessor:
             logger.error(f"Piper synthesis failed: {e}")
             return None
     
-    def _synth_espeak(self, text: str, speed: int = 150, language: str = "en") -> Optional[bytes]:
-        """
-        Synthesize using espeak with language support.
-        
-        Supported languages (espeak voice codes):
-        - en: English
-        - es: Spanish
-        - fr: French
-        - de: German
-        - it: Italian
-        - pt: Portuguese
-        - ru: Russian
-        - zh: Chinese (Mandarin)
-        - ja: Japanese
-        - ko: Korean
-        - ar: Arabic
-        - hi: Hindi
-        And many more...
-        """
+    def _synth_espeak(self, text: str, speed: int = 150) -> Optional[bytes]:
+        """Synthesize using espeak (English only)."""
         try:
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                 temp_path = f.name
             
-            # Map language codes to espeak voices
-            # espeak uses similar ISO codes, but some need adjustment
-            voice_map = {
-                'en': 'en',
-                'es': 'es',
-                'fr': 'fr',
-                'de': 'de',
-                'it': 'it',
-                'pt': 'pt',
-                'ru': 'ru',
-                'zh': 'zh',
-                'ja': 'ja',
-                'ko': 'ko',
-                'ar': 'ar',
-                'hi': 'hi',
-                'nl': 'nl',
-                'pl': 'pl',
-                'tr': 'tr',
-            }
-            
-            espeak_voice = voice_map.get(language, 'en')
-            
             subprocess.run(
-                ['espeak', '-v', espeak_voice, '-w', temp_path, '-s', str(speed), text],
+                ['espeak', '-w', temp_path, '-s', str(speed), text],
                 capture_output=True,
                 timeout=30
             )

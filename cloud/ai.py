@@ -346,8 +346,8 @@ Answer:"""
             if tool_result and not tool_result.get("success"):
                 tool_ctx = f"(Note: Tried to use external tool but it failed: {tool_result.get('result', 'Unknown error')}). "
             
-            # Ultra-concise system prompt - multilingual support
-            system_instruction = "You are Jarvis. Respond in the SAME language as the user's question. Keep replies under 20 words."
+            # Ultra-concise system prompt
+            system_instruction = "You are Jarvis. Reply in under 20 words."
             prompt = f"{system_instruction}\n{time_ctx}{tool_ctx}{question}"
             messages = [
                 {
@@ -536,128 +536,30 @@ Answer:"""
             return loop
     
     def extract_movement(self, response: str, query: str) -> Optional[Dict[str, Any]]:
-        """Extract movement commands from text in multiple languages."""
+        """Extract movement commands from text (English only)."""
         text = f"{query} {response}".lower()
         
-        # Multilingual movement patterns
         patterns = {
-            'forward': [
-                # English
-                r'go\s+forward', r'move\s+forward', r'ahead', r'drive\s+forward',
-                # Spanish
-                r'avanza', r'adelante', r've\s+adelante', r'mueve\s+adelante',
-                # French
-                r'avance', r'en\s+avant', r'vers\s+l\'avant',
-                # German
-                r'vorwärts', r'nach\s+vorne', r'fahre\s+vorwärts',
-                # Italian
-                r'avanti', r'vai\s+avanti',
-                # Portuguese
-                r'para\s+frente', r'em\s+frente',
-                # Russian
-                r'вперёд', r'вперед',
-                # Japanese
-                r'前', r'進め',
-                # Chinese
-                r'前进', r'向前'
-            ],
-            'backward': [
-                # English
-                r'go\s+back', r'move\s+back', r'reverse', r'backward',
-                # Spanish
-                r'retrocede', r'atrás', r'para\s+atrás', r've\s+atrás',
-                # French
-                r'recule', r'en\s+arrière', r'vers\s+l\'arrière',
-                # German
-                r'rückwärts', r'zurück', r'nach\s+hinten',
-                # Italian
-                r'indietro', r'vai\s+indietro',
-                # Portuguese
-                r'para\s+trás', r'ré',
-                # Russian
-                r'назад',
-                # Japanese
-                r'後ろ', r'バック',
-                # Chinese
-                r'后退', r'向后'
-            ],
-            'left': [
-                # English
-                r'turn\s+left', r'go\s+left', r'\bleft\b',
-                # Spanish
-                r'gira\s+izquierda', r'a\s+la\s+izquierda', r'izquierda',
-                # French
-                r'tourne\s+à\s+gauche', r'à\s+gauche', r'gauche',
-                # German
-                r'nach\s+links', r'links',
-                # Italian
-                r'gira\s+a\s+sinistra', r'sinistra',
-                # Portuguese
-                r'vire\s+à\s+esquerda', r'esquerda',
-                # Russian
-                r'налево', r'влево',
-                # Japanese
-                r'左', r'左に',
-                # Chinese
-                r'左转', r'向左'
-            ],
-            'right': [
-                # English
-                r'turn\s+right', r'go\s+right', r'\bright\b',
-                # Spanish
-                r'gira\s+derecha', r'a\s+la\s+derecha', r'derecha',
-                # French
-                r'tourne\s+à\s+droite', r'à\s+droite', r'droite',
-                # German
-                r'nach\s+rechts', r'rechts',
-                # Italian
-                r'gira\s+a\s+destra', r'destra',
-                # Portuguese
-                r'vire\s+à\s+direita', r'direita',
-                # Russian
-                r'направо', r'вправо',
-                # Japanese
-                r'右', r'右に',
-                # Chinese
-                r'右转', r'向右'
-            ],
-            'stop': [
-                # English
-                r'\bstop\b', r'halt',
-                # Spanish
-                r'para', r'detente', r'alto',
-                # French
-                r'arrête', r'stop',
-                # German
-                r'halt', r'stopp',
-                # Italian
-                r'fermati', r'stop',
-                # Portuguese
-                r'pare', r'para',
-                # Russian
-                r'стой', r'остановись',
-                # Japanese
-                r'止まれ', r'ストップ',
-                # Chinese
-                r'停止', r'停'
-            ]
+            'forward': [r'go\s+forward', r'move\s+forward', r'ahead'],
+            'backward': [r'go\s+back', r'move\s+back', r'reverse'],
+            'left': [r'turn\s+left', r'go\s+left'],
+            'right': [r'turn\s+right', r'go\s+right'],
+            'stop': [r'\bstop\b', r'halt']
         }
         
         for direction, pats in patterns.items():
             for pat in pats:
                 if re.search(pat, text):
                     dist = 0.5
-                    # Distance modifiers in multiple languages
-                    if any(word in text for word in ['little', 'bit', 'poco', 'un peu', 'wenig', 'piccolo', 'pouco', 'немного', '少し', '一点']):
+                    if 'little' in text:
                         dist = 0.2
-                    elif any(word in text for word in ['far', 'lot', 'much', 'mucho', 'beaucoup', 'viel', 'molto', 'muito', 'много', 'たくさん', '很多']):
+                    elif 'far' in text or 'lot' in text:
                         dist = 1.0
                     
                     speed = 'medium'
-                    # Speed modifiers in multiple languages
-                    if any(word in text for word in ['slow', 'slowly', 'lento', 'lentement', 'langsam', 'lentamente', 'devagar', 'медленно', 'ゆっくり', '慢']):
+                    if 'slow' in text:
                         speed = 'slow'
-                    elif any(word in text for word in ['fast', 'quickly', 'rápido', 'vite', 'schnell', 'veloce', 'rápido', 'быстро', '速く', '快']):
+                    elif 'fast' in text:
                         speed = 'fast'
                     
                     return {'direction': direction, 'distance': dist, 'speed': speed}

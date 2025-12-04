@@ -71,7 +71,6 @@ class RobotConnection:
         self.clients: Set[WebSocketServerProtocol] = set()
         self.last_image: Optional[bytes] = None
         self.last_sensors = {}
-        self.last_language: str = "en"  # Track detected language for responses
     
     async def handle_connection(self, websocket: WebSocketServerProtocol, path: str = "/"):
         """Handle robot WebSocket connection."""
@@ -113,7 +112,7 @@ class RobotConnection:
             await websocket.send(json.dumps({"type": "pong"}))
     
     async def handle_audio(self, websocket: WebSocketServerProtocol, msg: dict):
-        """Process audio from robot microphone with automatic language detection."""
+        """Process audio from robot microphone."""
         if not self.server.speech:
             return
         
@@ -123,19 +122,13 @@ class RobotConnection:
             audio_bytes = base64.b64decode(msg.get('audio_base64', ''))
             sample_rate = msg.get('sample_rate', 16000)
             
-            # Run Whisper STT with auto language detection
-            result = await asyncio.get_event_loop().run_in_executor(
+            # Run Whisper STT
+            text = await asyncio.get_event_loop().run_in_executor(
                 None, self.server.speech.transcribe, audio_bytes, sample_rate
             )
             
-            if result:
-                text = result.get('text')
-                language = result.get('language', 'en')
-                
-                # Store detected language for response
-                self.last_language = language
-                
-                logger.info(f"📝 Heard ({language}): '{text}'")
+            if text:
+                logger.info(f"📝 Heard: '{text}'")
                 
                 # Check for wake word
                 text_lower = text.lower()
@@ -147,11 +140,11 @@ class RobotConnection:
                         query = query.replace(wake, "").strip()
                     
                     if query:
-                        await self.process_query(websocket, query, language=language)
+                        await self.process_query(websocket, query)
                     else:
-                        await self.send_speak(websocket, "Yes? How can I help?", language=language)
+                        await self.send_speak(websocket, "Yes? How can I help?")
                 else:
-                    await self.process_query(websocket, text, language=language)
+                    await self.process_query(websocket, text)
                     
         except Exception as e:
             logger.error(f"Audio error: {e}")
@@ -188,17 +181,13 @@ class RobotConnection:
             }
         }
     
-    async def process_query(self, websocket: WebSocketServerProtocol, query: str, use_vision: bool = None, language: str = None):
-        """Process query using AI models and respond in the same language."""
+    async def process_query(self, websocket: WebSocketServerProtocol, query: str, use_vision: bool = None):
+        """Process query using AI models."""
         if not self.server.assistant:
-            await self.send_speak(websocket, "AI not available", language=language)
+            await self.send_speak(websocket, "AI not available")
             return
         
-        # Use detected language or fallback to last known language
-        if language is None:
-            language = self.last_language
-        
-        logger.info(f"🎯 Processing ({language}): '{query}'")
+        logger.info(f"🎯 Processing: '{query}'")
         
         # Auto-detect vision need
         if use_vision is None:
@@ -222,7 +211,7 @@ class RobotConnection:
                     None, self.server.assistant.ask, query
                 )
             
-            await self.send_speak(websocket, response, language=language)
+            await self.send_speak(websocket, response)
             
             # Check for movement commands
             movement = self.server.assistant.extract_movement(response, query)
@@ -231,21 +220,17 @@ class RobotConnection:
                 
         except Exception as e:
             logger.error(f"Query error: {e}")
-            await self.send_speak(websocket, "Sorry, I had trouble with that.", language=language)
+            await self.send_speak(websocket, "Sorry, I had trouble with that.")
     
     # === Commands to robot ===
     
-    async def send_speak(self, websocket: WebSocketServerProtocol, text: str, language: str = None):
-        """Send TTS to robot in the specified language."""
-        # Use provided language or fallback to last detected language
-        if language is None:
-            language = self.last_language
-            
+    async def send_speak(self, websocket: WebSocketServerProtocol, text: str):
+        """Send TTS to robot."""
         audio_b64 = None
         if self.server.speech:
             try:
                 audio_bytes = await asyncio.get_event_loop().run_in_executor(
-                    None, self.server.speech.synthesize, text, language
+                    None, self.server.speech.synthesize, text
                 )
                 if audio_bytes:
                     audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
@@ -254,7 +239,7 @@ class RobotConnection:
         
         msg = {"type": "speak", "text": text, "audio_base64": audio_b64}
         await websocket.send(json.dumps(msg))
-        logger.info(f"🔊 Sent ({language}): '{text[:50]}...'")
+        logger.info(f"🔊 Sent: '{text[:50]}...'")
     
     async def send_move(self, websocket: WebSocketServerProtocol,
                         direction: str, distance: float = 0.5, speed: str = "medium"):
