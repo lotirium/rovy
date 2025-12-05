@@ -1,0 +1,14 @@
+# Robot2 - Raspberry Pi Server for Cloud2
+# Simple REST API server for TTS playback
+
+# REST API Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# Audio playback
+sounddevice>=0.4.0
+soundfile>=0.12.0
+
+# Text-to-speech (Piper - optional, falls back to espeak)
+# Install piper separately: https://github.com/rhasspy/piper
+

@@ -1,0 +1,20 @@
+# Cloud 2 - Autonomous Personality Service Requirements
+# Uses OpenAI API, OAK D camera, and Pi speakers
+
+# OpenAI API
+openai>=1.0.0
+
+# OAK D Camera
+depthai>=2.24.0
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# HTTP client for Pi communication
+httpx>=0.25.0
+
+# Async support
+asyncio-compat>=0.1.0
+
