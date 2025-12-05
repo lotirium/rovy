@@ -488,8 +488,15 @@ class RobotServer:
         # For OAK-D, always get fresh frame for better FPS (cache only 0.02s = 50 FPS max)
         # For USB camera, cache longer to reduce load
         cache_time = 0.02 if self.camera_type == 'oakd' else 0.1
+        max_stale_time = 0.5  # Don't return images older than 500ms (indicates camera failure)
+        
         if self.last_image and (time.time() - self.last_image_time) < cache_time:
             return self.last_image
+        
+        # If cached image is too stale, don't return it (camera likely failed)
+        if self.last_image and (time.time() - self.last_image_time) > max_stale_time:
+            self.last_image = None  # Clear stale cache
+        
         return self.capture_image()
     
     async def connect_cloud(self):
@@ -599,8 +606,14 @@ class RobotServer:
                 else:
                     self.current_gesture = 'none'
         except Exception as e:
-            # Silently fail - don't spam logs
-            pass
+            # Log errors but don't spam - only log every 10th error
+            if not hasattr(self, '_gesture_error_count'):
+                self._gesture_error_count = 0
+            self._gesture_error_count += 1
+            if self._gesture_error_count % 10 == 1:
+                print(f"[Gesture] Detection error (logged every 10th): {e}")
+            self.current_gesture = 'none'
+            self.gesture_confidence = 0.0
     
     async def stream_to_cloud(self):
         """Stream audio/video to cloud for AI processing."""
@@ -637,12 +650,15 @@ class RobotServer:
                 # Detect gestures from OAK-D frames (throttled to every 500ms)
                 if (self.camera_type == 'oakd' and 
                     CAMERA_OK and 
-                    self.camera and 
+                    self.oakd_queue is not None and 
                     (now - last_gesture_time) >= gesture_interval):
                     image_bytes = self.capture_image()
                     if image_bytes:
                         # Run gesture detection in background (don't block streaming)
                         asyncio.create_task(self.detect_gesture_from_frame(image_bytes))
+                        if not hasattr(self, '_gesture_debug_logged'):
+                            print("[Gesture] Starting gesture detection from OAK-D frames")
+                            self._gesture_debug_logged = True
                     last_gesture_time = now
                 
                 # Send sensor data periodically
@@ -934,12 +950,21 @@ async def video_stream():
     frame_interval = 1.0 / manual_fps
     
     def generate_frames():
+        consecutive_failures = 0
+        max_failures = 30  # Allow more failures for MJPEG (1 second at 30fps)
+        
         while True:
             start_time = time.time()
             image_bytes = robot.capture_image()
             if image_bytes:
+                consecutive_failures = 0  # Reset on success
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + image_bytes + b'\r\n')
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    print(f"[API] MJPEG stream failed {max_failures} times, ending stream")
+                    break
             
             # Sleep only the remaining time to maintain target FPS
             elapsed = time.time() - start_time
@@ -971,14 +996,24 @@ async def camera_websocket(websocket: WebSocket):
     frame_interval = 1.0 / manual_fps
     
     try:
+        consecutive_failures = 0
+        max_failures = 10  # If 10 consecutive frames fail, close connection
+        
         while True:
             start_time = time.time()
             image_bytes = robot.get_cached_image()
             if image_bytes:
+                consecutive_failures = 0  # Reset on success
                 await websocket.send_json({
                     "frame": base64.b64encode(image_bytes).decode('utf-8'),
                     "timestamp": time.time()
                 })
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    print(f"[API] Camera stream failed {max_failures} times, closing connection")
+                    await websocket.close(code=1011, reason="Camera capture failed")
+                    break
             
             # Sleep only the remaining time to maintain target FPS
             elapsed = time.time() - start_time
