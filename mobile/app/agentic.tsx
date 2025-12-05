@@ -219,6 +219,15 @@ export default function AgenticVoiceScreen() {
         if (data.frame) {
           setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
         }
+
+        // Extract gesture data from camera stream (real-time updates)
+        if (data.gesture !== undefined) {
+          const gesture = data.gesture as 'like' | 'heart' | 'none';
+          // Only update if confidence is above threshold (gesture handler will check for changes)
+          if (gesture === 'none' || (data.gesture_confidence ?? 0) > 0.5) {
+            handleGestureDetected(gesture);
+          }
+        }
       } catch (error) {
         console.warn('Camera stream parse error', error);
       }
@@ -248,7 +257,7 @@ export default function AgenticVoiceScreen() {
         }, 1000);
       }
     };
-  }, [cameraWsUrl, isFocused]);
+  }, [cameraWsUrl, isFocused, handleGestureDetected]);
 
   const disconnectCamera = useCallback(() => {
     // Clear any pending reconnect

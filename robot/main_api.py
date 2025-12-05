@@ -1006,7 +1006,9 @@ async def camera_websocket(websocket: WebSocket):
                 consecutive_failures = 0  # Reset on success
                 await websocket.send_json({
                     "frame": base64.b64encode(image_bytes).decode('utf-8'),
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
+                    "gesture": robot.current_gesture,
+                    "gesture_confidence": robot.gesture_confidence
                 })
             else:
                 consecutive_failures += 1
