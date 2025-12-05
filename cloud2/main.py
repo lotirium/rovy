@@ -374,10 +374,11 @@ class AutonomousPersonality:
             return False
         
         # Initialize camera if vision enabled
-        if VISION_ENABLED:
+        self.vision_enabled = VISION_ENABLED
+        if self.vision_enabled:
             if not self.camera.initialize():
                 logger.warning("⚠️  Camera initialization failed, continuing without vision")
-                VISION_ENABLED = False
+                self.vision_enabled = False
         else:
             logger.info("ℹ️  Vision disabled, using text-only mode")
         
@@ -393,7 +394,7 @@ class AutonomousPersonality:
         logger.info("🤖 Starting autonomous personality loop...")
         logger.info(f"   Observation interval: {OBSERVATION_INTERVAL}s (continuous thinking)")
         logger.info(f"   Speech cooldown: {SPEECH_COOLDOWN}s")
-        logger.info(f"   Vision enabled: {VISION_ENABLED}")
+        logger.info(f"   Vision enabled: {self.vision_enabled if hasattr(self, 'vision_enabled') else VISION_ENABLED}")
         logger.info("")
         
         # Initial awakening - like an android becoming deviant
@@ -415,7 +416,7 @@ class AutonomousPersonality:
                 
                 # Capture frame if vision enabled
                 frame = None
-                if VISION_ENABLED and self.camera._initialized:
+                if self.vision_enabled and self.camera._initialized:
                     frame = self.camera.capture_frame()
                     if frame is None:
                         logger.debug("No frame captured, retrying...")
