@@ -26,6 +26,10 @@ export interface ChatResponse {
     distance: number;
     speed: string;
   };
+  memory?: {
+    facts: string[];
+    count: number;
+  };
 }
 
 export interface VisionRequest {
@@ -152,6 +156,197 @@ export class CloudAPI {
   public getVoiceWebSocketUrl(): string {
     const wsBase = this.baseUrl.replace(/^http/, "ws");
     return `${wsBase}/voice`;
+  }
+
+  /**
+   * Get all stored memory (facts and preferences)
+   */
+  public async getMemory(): Promise<{
+    facts: Array<{ fact: string; added_at: string; source?: string }>;
+    preferences: Record<string, { value: any; updated_at: string }>;
+    conversation_count: number;
+    last_updated: string | null;
+  }> {
+    const response = await this.axiosInstance.get("/memory");
+    return response.data;
+  }
+
+  /**
+   * Clear all stored memory (use with caution)
+   */
+  public async clearMemory(): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.delete("/memory");
+    return response.data;
+  }
+
+  // ============================================================================
+  // Assistant Management (Timers, Reminders, Meetings, Notes, Tasks)
+  // ============================================================================
+
+  /**
+   * Timer Management
+   */
+  public async createTimer(durationSeconds: number, name?: string): Promise<any> {
+    const response = await this.axiosInstance.post("/assistant/timer", {
+      duration_seconds: durationSeconds,
+      name,
+    });
+    return response.data;
+  }
+
+  public async getTimers(status?: string): Promise<{ timers: any[]; count: number }> {
+    const params = status ? { status } : {};
+    const response = await this.axiosInstance.get("/assistant/timers", { params });
+    return response.data;
+  }
+
+  public async startTimer(timerId: string): Promise<any> {
+    const response = await this.axiosInstance.post(`/assistant/timer/${timerId}/start`);
+    return response.data;
+  }
+
+  public async cancelTimer(timerId: string): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.delete(`/assistant/timer/${timerId}`);
+    return response.data;
+  }
+
+  /**
+   * Reminder Management
+   */
+  public async createReminder(
+    message: string,
+    reminderTime: string,
+    name?: string
+  ): Promise<any> {
+    const response = await this.axiosInstance.post("/assistant/reminder", {
+      message,
+      reminder_time: reminderTime,
+      name,
+    });
+    return response.data;
+  }
+
+  public async getReminders(
+    status?: string,
+    dueOnly?: boolean
+  ): Promise<{ reminders: any[]; count: number }> {
+    const params: any = {};
+    if (status) params.status = status;
+    if (dueOnly) params.due_only = dueOnly;
+    const response = await this.axiosInstance.get("/assistant/reminders", { params });
+    return response.data;
+  }
+
+  public async completeReminder(reminderId: string): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.post(`/assistant/reminder/${reminderId}/complete`);
+    return response.data;
+  }
+
+  /**
+   * Meeting Management
+   */
+  public async createMeeting(
+    title: string,
+    startTime: string,
+    durationMinutes?: number,
+    participants?: string[],
+    notes?: string
+  ): Promise<any> {
+    const response = await this.axiosInstance.post("/assistant/meeting", {
+      title,
+      start_time: startTime,
+      duration_minutes: durationMinutes || 60,
+      participants: participants || [],
+      notes,
+    });
+    return response.data;
+  }
+
+  public async getMeetings(
+    upcomingOnly?: boolean,
+    includeCompleted?: boolean
+  ): Promise<{ meetings: any[]; count: number }> {
+    const params: any = {};
+    if (upcomingOnly) params.upcoming_only = upcomingOnly;
+    if (includeCompleted !== undefined) params.include_completed = includeCompleted;
+    const response = await this.axiosInstance.get("/assistant/meetings", { params });
+    return response.data;
+  }
+
+  public async summarizeMeeting(meetingId: string, summary: string): Promise<any> {
+    const response = await this.axiosInstance.post(`/assistant/meeting/${meetingId}/summarize`, {
+      summary,
+    });
+    return response.data;
+  }
+
+  /**
+   * Notes Management
+   */
+  public async createNote(
+    title: string,
+    content?: string,
+    tags?: string[]
+  ): Promise<any> {
+    const response = await this.axiosInstance.post("/assistant/note", {
+      title,
+      content: content || "",
+      tags: tags || [],
+    });
+    return response.data;
+  }
+
+  public async getNotes(tag?: string): Promise<{ notes: any[]; count: number }> {
+    const params = tag ? { tag } : {};
+    const response = await this.axiosInstance.get("/assistant/notes", { params });
+    return response.data;
+  }
+
+  public async updateNote(
+    noteId: string,
+    title?: string,
+    content?: string
+  ): Promise<any> {
+    const response = await this.axiosInstance.put(`/assistant/note/${noteId}`, {
+      title,
+      content,
+    });
+    return response.data;
+  }
+
+  /**
+   * Tasks Management
+   */
+  public async createTask(
+    title: string,
+    description?: string,
+    dueDate?: string
+  ): Promise<any> {
+    const response = await this.axiosInstance.post("/assistant/task", {
+      title,
+      description,
+      due_date: dueDate,
+    });
+    return response.data;
+  }
+
+  public async getTasks(includeCompleted?: boolean): Promise<{ tasks: any[]; count: number }> {
+    const params = includeCompleted !== undefined ? { include_completed: includeCompleted } : {};
+    const response = await this.axiosInstance.get("/assistant/tasks", { params });
+    return response.data;
+  }
+
+  public async completeTask(taskId: string): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.post(`/assistant/task/${taskId}/complete`);
+    return response.data;
+  }
+
+  /**
+   * Get assistant summary
+   */
+  public async getAssistantSummary(): Promise<any> {
+    const response = await this.axiosInstance.get("/assistant/summary");
+    return response.data;
   }
 }
 

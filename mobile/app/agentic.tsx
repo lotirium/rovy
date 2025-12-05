@@ -233,6 +233,35 @@ export default function AgenticVoiceScreen() {
           return;
         }
 
+        // Handle AI response with memory
+        if (data.type === 'response') {
+          appendLog({
+            label: 'Jarvis',
+            message: data.text || data.response || 'Response received',
+            tone: 'info'
+          });
+          
+          // Log memory if present
+          if (data.memory && data.memory.facts && data.memory.facts.length > 0) {
+            appendLog({
+              label: 'Memory',
+              message: `Remembered ${data.memory.count} fact(s) about you`,
+              tone: 'info'
+            });
+          }
+          return;
+        }
+
+        // Handle transcription responses
+        if (data.type === 'transcript') {
+          appendLog({
+            label: 'Transcript',
+            message: data.text || data.finalTranscript || '',
+            tone: 'final'
+          });
+          return;
+        }
+
         // Handle transcription responses (for future)
         if (data.finalTranscript || data.text) {
           appendLog({

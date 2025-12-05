@@ -155,6 +155,8 @@ from .models import (
     WiFiScanResponse,
     WiFiStatusResponse,
 )
+from .memory import MemoryManager
+from .assistant_manager import AssistantManager, TimerStatus, ReminderStatus
 
 APP_NAME = "rovy-api"
 APP_VERSION = "0.1.0"
@@ -774,6 +776,8 @@ async def json_control_websocket(websocket: WebSocket):
 # Global AI instances (lazy loaded)
 _assistant = None
 _speech = None
+_memory_manager = None
+_assistant_manager = None
 
 def _get_assistant():
     """Get or create CloudAssistant instance."""
@@ -807,6 +811,28 @@ def _get_speech():
         except Exception as e:
             LOGGER.error(f"Failed to load SpeechProcessor: {e}")
     return _speech
+
+def _get_memory_manager():
+    """Get or create MemoryManager instance."""
+    global _memory_manager
+    if _memory_manager is None:
+        try:
+            _memory_manager = MemoryManager()
+            LOGGER.info("MemoryManager initialized")
+        except Exception as e:
+            LOGGER.error(f"Failed to initialize MemoryManager: {e}")
+    return _memory_manager
+
+def _get_assistant_manager():
+    """Get or create AssistantManager instance."""
+    global _assistant_manager
+    if _assistant_manager is None:
+        try:
+            _assistant_manager = AssistantManager()
+            LOGGER.info("AssistantManager initialized")
+        except Exception as e:
+            LOGGER.error(f"Failed to initialize AssistantManager: {e}")
+    return _assistant_manager
 
 
 @app.websocket("/voice")
@@ -873,7 +899,14 @@ async def voice_websocket(websocket: WebSocket):
                                 
                                 # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
+                                memory_manager = _get_memory_manager()
+                                
                                 if assistant:
+                                    # Get memory context
+                                    memory_context = ""
+                                    if memory_manager:
+                                        memory_context = memory_manager.get_memory_context(max_facts=5)
+                                    
                                     # Use keyword matching to determine if vision is needed
                                     transcript_lower = transcript.lower()
                                     
@@ -892,6 +925,11 @@ async def voice_websocket(websocket: WebSocket):
                                     if use_vision:
                                         LOGGER.info("Vision query detected via keywords")
                                     
+                                    # Add memory context to transcript
+                                    transcript_with_context = transcript
+                                    if memory_context:
+                                        transcript_with_context = f"{memory_context}\n\nUser: {transcript}"
+                                    
                                     if use_vision:
                                         # Fetch latest frame from Pi camera
                                         try:
@@ -904,28 +942,50 @@ async def voice_websocket(websocket: WebSocket):
                                                 if frame_response.status_code == 200:
                                                     image_bytes = frame_response.content
                                                     response = await anyio.to_thread.run_sync(
-                                                        assistant.ask_with_vision, transcript, image_bytes
+                                                        assistant.ask_with_vision, transcript_with_context, image_bytes
                                                     )
                                                 else:
                                                     LOGGER.warning(f"Failed to get frame: {frame_response.status_code}")
                                                     response = await anyio.to_thread.run_sync(
-                                                        assistant.ask, transcript
+                                                        assistant.ask, transcript_with_context
                                                     )
                                         except Exception as frame_error:
                                             LOGGER.error(f"Error fetching frame: {frame_error}", exc_info=True)
                                             response = await anyio.to_thread.run_sync(
-                                                assistant.ask, transcript
+                                                assistant.ask, transcript_with_context
                                             )
                                     else:
                                         response = await anyio.to_thread.run_sync(
-                                            assistant.ask, transcript
+                                            assistant.ask, transcript_with_context
                                         )
+                                    
+                                    # Store conversation in memory
+                                    if memory_manager:
+                                        memory_manager.add_conversation(transcript, response)
+                                        
+                                        # Extract facts from conversation
+                                        try:
+                                            facts = memory_manager.extract_facts_from_conversation(
+                                                transcript, response, assistant
+                                            )
+                                            for fact in facts:
+                                                memory_manager.add_fact(fact, source=transcript)
+                                        except Exception as e:
+                                            LOGGER.warning(f"Failed to extract facts: {e}")
                                     
                                     LOGGER.info(f"🤖 AI Response: {response}")
                                     
+                                    # Get memory facts to send to app
+                                    memory_data = None
+                                    if memory_manager:
+                                        facts = memory_manager.get_facts(limit=10)
+                                        if facts:
+                                            memory_data = {"facts": facts, "count": len(facts)}
+                                    
                                     await websocket.send_json({
                                         "type": "response",
-                                        "text": response
+                                        "text": response,
+                                        "memory": memory_data
                                     })
                                     
                                     # Send TTS command to Pi speakers via HTTP with language support
@@ -987,13 +1047,48 @@ async def voice_websocket(websocket: WebSocket):
                 text = data.get("text", "")
                 if text:
                     assistant = _get_assistant()
+                    memory_manager = _get_memory_manager()
+                    
                     if assistant:
+                        # Get memory context
+                        memory_context = ""
+                        if memory_manager:
+                            memory_context = memory_manager.get_memory_context(max_facts=5)
+                        
+                        # Add memory context to message
+                        text_with_context = text
+                        if memory_context:
+                            text_with_context = f"{memory_context}\n\nUser: {text}"
+                        
                         response = await anyio.to_thread.run_sync(
-                            assistant.ask, text
+                            assistant.ask, text_with_context
                         )
+                        
+                        # Store conversation in memory
+                        if memory_manager:
+                            memory_manager.add_conversation(text, response)
+                            
+                            # Extract facts from conversation
+                            try:
+                                facts = memory_manager.extract_facts_from_conversation(
+                                    text, response, assistant
+                                )
+                                for fact in facts:
+                                    memory_manager.add_fact(fact, source=text)
+                            except Exception as e:
+                                LOGGER.warning(f"Failed to extract facts: {e}")
+                        
+                        # Get memory facts to send to app
+                        memory_data = None
+                        if memory_manager:
+                            facts = memory_manager.get_facts(limit=10)
+                            if facts:
+                                memory_data = {"facts": facts, "count": len(facts)}
+                        
                         await websocket.send_json({
                             "type": "response",
-                            "text": response
+                            "text": response,
+                            "memory": memory_data
                         })
                     else:
                         await websocket.send_json({
@@ -1027,6 +1122,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     movement: dict | None = None
+    memory: dict | None = None  # Memory facts sent to app
 
 class VisionRequest(BaseModel):
     question: str
@@ -1038,6 +1134,126 @@ class VisionResponse(BaseModel):
     movement: dict | None = None
 
 
+def _detect_and_execute_assistant_actions(message: str, assistant_manager) -> tuple[str, dict]:
+    """
+    Detect assistant actions from natural language and execute them.
+    Returns (response_message, action_data)
+    """
+    import re
+    from datetime import datetime, timedelta
+    
+    message_lower = message.lower()
+    action_data = {}
+    response_additions = []
+    
+    # Timer detection: "set timer for 5 minutes", "timer 30 seconds", etc.
+    timer_patterns = [
+        r'(?:set\s+)?timer\s+(?:for\s+)?(\d+)\s*(?:minute|min|second|sec|hour|hr)s?',
+        r'(\d+)\s*(?:minute|min|second|sec|hour|hr)s?\s+timer',
+    ]
+    
+    for pattern in timer_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            duration_str = match.group(1)
+            duration = int(duration_str)
+            
+            # Determine unit
+            if 'hour' in message_lower or 'hr' in message_lower:
+                duration_seconds = duration * 3600
+            elif 'minute' in message_lower or 'min' in message_lower:
+                duration_seconds = duration * 60
+            else:
+                duration_seconds = duration
+            
+            try:
+                timer = assistant_manager.create_timer(duration_seconds, f"Timer for {duration} {'hour' if duration_seconds >= 3600 else 'minute' if duration_seconds >= 60 else 'second'}(s)")
+                response_additions.append(f"⏱️ Timer set for {duration} {'hour' if duration_seconds >= 3600 else 'minute' if duration_seconds >= 60 else 'second'}(s)")
+                action_data["timer"] = timer
+            except Exception as e:
+                LOGGER.error(f"Failed to create timer: {e}")
+            break
+    
+    # Reminder detection: "remind me to...", "reminder at...", etc.
+    reminder_patterns = [
+        r'remind\s+me\s+(?:to\s+)?(.+?)(?:\s+at\s+|\s+in\s+|\s+on\s+)(.+?)(?:\.|$)',
+        r'reminder\s+(?:to\s+)?(.+?)(?:\s+at\s+|\s+in\s+|\s+on\s+)(.+?)(?:\.|$)',
+    ]
+    
+    for pattern in reminder_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            reminder_text = match.group(1).strip()
+            time_str = match.group(2).strip()
+            
+            # Try to parse time
+            reminder_time = None
+            try:
+                # Try relative time: "in 1 hour", "in 30 minutes"
+                if 'in' in time_str.lower():
+                    time_match = re.search(r'(\d+)\s*(?:hour|hr|minute|min)', time_str.lower())
+                    if time_match:
+                        amount = int(time_match.group(1))
+                        if 'hour' in time_str.lower() or 'hr' in time_str.lower():
+                            reminder_time = (datetime.now() + timedelta(hours=amount)).isoformat()
+                        else:
+                            reminder_time = (datetime.now() + timedelta(minutes=amount)).isoformat()
+                # Try absolute time: "at 3pm", "at 15:00"
+                elif 'at' in time_str.lower():
+                    # Simple parsing - could be improved
+                    reminder_time = (datetime.now() + timedelta(hours=1)).isoformat()  # Default to 1 hour from now
+            except Exception as e:
+                LOGGER.warning(f"Failed to parse reminder time: {e}")
+                reminder_time = (datetime.now() + timedelta(hours=1)).isoformat()
+            
+            if reminder_time:
+                try:
+                    reminder = assistant_manager.create_reminder(reminder_text, reminder_time)
+                    response_additions.append(f"🔔 Reminder set: {reminder_text}")
+                    action_data["reminder"] = reminder
+                except Exception as e:
+                    LOGGER.error(f"Failed to create reminder: {e}")
+            break
+    
+    # Task detection: "add task", "create task", "todo"
+    task_patterns = [
+        r'(?:add|create|new)\s+task[:\s]+(.+?)(?:\.|$)',
+        r'todo[:\s]+(.+?)(?:\.|$)',
+    ]
+    
+    for pattern in task_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            task_title = match.group(1).strip()
+            try:
+                task = assistant_manager.create_task(task_title)
+                response_additions.append(f"✅ Task created: {task_title}")
+                action_data["task"] = task
+            except Exception as e:
+                LOGGER.error(f"Failed to create task: {e}")
+            break
+    
+    # Note detection: "note that", "remember that", "save note"
+    note_patterns = [
+        r'(?:note|remember|save)\s+(?:that\s+)?(.+?)(?:\.|$)',
+    ]
+    
+    for pattern in note_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            note_content = match.group(1).strip()
+            try:
+                note = assistant_manager.create_note(f"Note: {note_content[:50]}", note_content)
+                response_additions.append(f"📝 Note saved")
+                action_data["note"] = note
+            except Exception as e:
+                LOGGER.error(f"Failed to create note: {e}")
+            break
+    
+    response_text = " ".join(response_additions) if response_additions else ""
+    return response_text, action_data
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["AI"])
 async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     """Chat with Jarvis AI (text only)."""
@@ -1045,15 +1261,89 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     if not assistant:
         raise HTTPException(status_code=503, detail="AI assistant not available")
     
+    memory_manager = _get_memory_manager()
+    assistant_manager = _get_assistant_manager()
+    
     try:
+        # Get memory context for the conversation
+        memory_context = ""
+        if memory_manager:
+            memory_context = memory_manager.get_memory_context(max_facts=5)
+        
+        # Get assistant context (upcoming meetings, due reminders, etc.)
+        assistant_context = ""
+        if assistant_manager:
+            try:
+                upcoming_meetings = assistant_manager.get_upcoming_meetings(hours_ahead=24)
+                due_reminders = assistant_manager.get_due_reminders()
+                pending_tasks = [t for t in assistant_manager.get_tasks(include_completed=False) if not t.get("completed", False)]
+                
+                if upcoming_meetings:
+                    assistant_context += f"Upcoming meetings: {', '.join([m['title'] for m in upcoming_meetings[:3]])}\n"
+                if due_reminders:
+                    assistant_context += f"Due reminders: {', '.join([r['message'] for r in due_reminders[:3]])}\n"
+                if pending_tasks:
+                    assistant_context += f"Pending tasks: {', '.join([t['title'] for t in pending_tasks[:3]])}\n"
+            except Exception as e:
+                LOGGER.warning(f"Failed to get assistant context: {e}")
+        
+        # Add memory context to the message if available
+        message_with_context = request.message
+        if memory_context or assistant_context:
+            context_parts = []
+            if memory_context:
+                context_parts.append(memory_context)
+            if assistant_context:
+                context_parts.append(assistant_context)
+            message_with_context = "\n".join(context_parts) + f"\n\nUser: {request.message}"
+        
+        # Detect and execute assistant actions (timers, reminders, etc.)
+        action_response, action_data = "", {}
+        if assistant_manager:
+            try:
+                action_response, action_data = _detect_and_execute_assistant_actions(request.message, assistant_manager)
+            except Exception as e:
+                LOGGER.warning(f"Failed to detect assistant actions: {e}")
+        
         response = await anyio.to_thread.run_sync(
-            assistant.ask, request.message, request.max_tokens, request.temperature
+            assistant.ask, message_with_context, request.max_tokens, request.temperature
         )
+        
+        # Combine AI response with action responses
+        if action_response:
+            response = f"{response}\n\n{action_response}"
+        
+        # Store conversation in memory
+        if memory_manager:
+            memory_manager.add_conversation(request.message, response)
+            
+            # Extract facts from conversation
+            try:
+                facts = memory_manager.extract_facts_from_conversation(
+                    request.message, response, assistant
+                )
+                for fact in facts:
+                    memory_manager.add_fact(fact, source=request.message)
+            except Exception as e:
+                LOGGER.warning(f"Failed to extract facts: {e}")
         
         # Check for movement commands
         movement = None
         if hasattr(assistant, 'extract_movement'):
             movement = assistant.extract_movement(response, request.message)
+        
+        # Get memory facts to send to app
+        memory_data = None
+        if memory_manager:
+            facts = memory_manager.get_facts(limit=10)
+            if facts:
+                memory_data = {"facts": facts, "count": len(facts)}
+        
+        # Add assistant actions to response
+        if action_data:
+            if not memory_data:
+                memory_data = {}
+            memory_data["assistant_actions"] = action_data
         
         # Broadcast response to robot for TTS playback on Pi speakers
         try:
@@ -1064,7 +1354,7 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         except Exception as e:
             LOGGER.warning(f"Could not broadcast to robot: {e}")
         
-        return ChatResponse(response=response, movement=movement)
+        return ChatResponse(response=response, movement=movement, memory=memory_data)
     except Exception as e:
         LOGGER.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1077,13 +1367,29 @@ async def vision_endpoint(request: VisionRequest) -> VisionResponse:
     if not assistant:
         raise HTTPException(status_code=503, detail="AI assistant not available")
     
+    memory_manager = _get_memory_manager()
+    
     try:
         # Decode image
         image_bytes = base64.b64decode(request.image_base64)
         
+        # Get memory context
+        memory_context = ""
+        if memory_manager:
+            memory_context = memory_manager.get_memory_context(max_facts=5)
+        
+        # Add memory context to question
+        question_with_context = request.question
+        if memory_context:
+            question_with_context = f"{memory_context}\n\nUser: {request.question}"
+        
         response = await anyio.to_thread.run_sync(
-            assistant.ask_with_vision, request.question, image_bytes, request.max_tokens
+            assistant.ask_with_vision, question_with_context, image_bytes, request.max_tokens
         )
+        
+        # Store conversation in memory
+        if memory_manager:
+            memory_manager.add_conversation(request.question, response)
         
         # Check for movement commands
         movement = None
@@ -1118,6 +1424,365 @@ async def speech_to_text(audio: UploadFile = File(...)):
             return {"text": None, "success": False}
     except Exception as e:
         LOGGER.error(f"STT error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory", tags=["AI"])
+async def get_memory():
+    """Get all stored memory (facts and preferences) for the mobile app."""
+    memory_manager = _get_memory_manager()
+    if not memory_manager:
+        raise HTTPException(status_code=503, detail="Memory manager not available")
+    
+    try:
+        memory_data = memory_manager.get_all_memory()
+        return memory_data
+    except Exception as e:
+        LOGGER.error(f"Failed to get memory: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/memory", tags=["AI"])
+async def clear_memory():
+    """Clear all stored memory (use with caution)."""
+    memory_manager = _get_memory_manager()
+    if not memory_manager:
+        raise HTTPException(status_code=503, detail="Memory manager not available")
+    
+    try:
+        memory_manager.clear_memory()
+        return {"status": "success", "message": "Memory cleared"}
+    except Exception as e:
+        LOGGER.error(f"Failed to clear memory: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Assistant Management Endpoints (Timers, Reminders, Meetings, Notes, Tasks)
+# ============================================================================
+
+@app.post("/assistant/timer", tags=["Assistant"])
+async def create_timer(request: dict):
+    """Create a new timer."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    duration = request.get("duration_seconds")
+    name = request.get("name")
+    
+    if not duration or duration <= 0:
+        raise HTTPException(status_code=400, detail="duration_seconds must be positive")
+    
+    try:
+        timer = manager.create_timer(duration, name)
+        return timer
+    except Exception as e:
+        LOGGER.error(f"Failed to create timer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/timers", tags=["Assistant"])
+async def get_timers(status: Optional[str] = None):
+    """Get all timers, optionally filtered by status."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        timers = manager.get_timers(status=status)
+        return {"timers": timers, "count": len(timers)}
+    except Exception as e:
+        LOGGER.error(f"Failed to get timers: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/timer/{timer_id}/start", tags=["Assistant"])
+async def start_timer(timer_id: str):
+    """Start a timer."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        timer = manager.start_timer(timer_id)
+        if not timer:
+            raise HTTPException(status_code=404, detail="Timer not found or cannot be started")
+        return timer
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to start timer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/assistant/timer/{timer_id}", tags=["Assistant"])
+async def cancel_timer(timer_id: str):
+    """Cancel a timer."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        timer = manager.cancel_timer(timer_id)
+        if not timer:
+            raise HTTPException(status_code=404, detail="Timer not found")
+        return {"status": "success", "message": "Timer cancelled"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to cancel timer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/reminder", tags=["Assistant"])
+async def create_reminder(request: dict):
+    """Create a new reminder."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    message = request.get("message")
+    reminder_time = request.get("reminder_time")
+    name = request.get("name")
+    
+    if not message or not reminder_time:
+        raise HTTPException(status_code=400, detail="message and reminder_time are required")
+    
+    try:
+        reminder = manager.create_reminder(message, reminder_time, name)
+        return reminder
+    except Exception as e:
+        LOGGER.error(f"Failed to create reminder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/reminders", tags=["Assistant"])
+async def get_reminders(status: Optional[str] = None, due_only: bool = False):
+    """Get all reminders, optionally filtered by status or due only."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        if due_only:
+            reminders = manager.get_due_reminders()
+        else:
+            reminders = manager.get_reminders(status=status)
+        return {"reminders": reminders, "count": len(reminders)}
+    except Exception as e:
+        LOGGER.error(f"Failed to get reminders: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/reminder/{reminder_id}/complete", tags=["Assistant"])
+async def complete_reminder(reminder_id: str):
+    """Mark a reminder as completed."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        reminder = manager.complete_reminder(reminder_id)
+        if not reminder:
+            raise HTTPException(status_code=404, detail="Reminder not found")
+        return {"status": "success", "message": "Reminder completed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to complete reminder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/meeting", tags=["Assistant"])
+async def create_meeting(request: dict):
+    """Create a new meeting."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    title = request.get("title")
+    start_time = request.get("start_time")
+    duration_minutes = request.get("duration_minutes", 60)
+    participants = request.get("participants", [])
+    notes = request.get("notes")
+    
+    if not title or not start_time:
+        raise HTTPException(status_code=400, detail="title and start_time are required")
+    
+    try:
+        meeting = manager.create_meeting(title, start_time, duration_minutes, participants, notes)
+        return meeting
+    except Exception as e:
+        LOGGER.error(f"Failed to create meeting: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/meetings", tags=["Assistant"])
+async def get_meetings(upcoming_only: bool = False, include_completed: bool = True):
+    """Get all meetings, optionally filtered."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        if upcoming_only:
+            meetings = manager.get_upcoming_meetings()
+        else:
+            meetings = manager.get_meetings(include_completed=include_completed)
+        return {"meetings": meetings, "count": len(meetings)}
+    except Exception as e:
+        LOGGER.error(f"Failed to get meetings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/meeting/{meeting_id}/summarize", tags=["Assistant"])
+async def summarize_meeting(meeting_id: str, request: dict):
+    """Add a summary to a meeting."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    summary = request.get("summary")
+    if not summary:
+        raise HTTPException(status_code=400, detail="summary is required")
+    
+    try:
+        meeting = manager.summarize_meeting(meeting_id, summary)
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        return {"status": "success", "message": "Meeting summarized", "meeting": meeting}
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to summarize meeting: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/note", tags=["Assistant"])
+async def create_note(request: dict):
+    """Create a new note."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    title = request.get("title")
+    content = request.get("content", "")
+    tags = request.get("tags", [])
+    
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    
+    try:
+        note = manager.create_note(title, content, tags)
+        return note
+    except Exception as e:
+        LOGGER.error(f"Failed to create note: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/notes", tags=["Assistant"])
+async def get_notes(tag: Optional[str] = None):
+    """Get all notes, optionally filtered by tag."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        notes = manager.get_notes(tag=tag)
+        return {"notes": notes, "count": len(notes)}
+    except Exception as e:
+        LOGGER.error(f"Failed to get notes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/assistant/note/{note_id}", tags=["Assistant"])
+async def update_note(note_id: str, request: dict):
+    """Update a note."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        note = manager.update_note(note_id, request.get("title"), request.get("content"))
+        if not note:
+            raise HTTPException(status_code=404, detail="Note not found")
+        return note
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to update note: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/task", tags=["Assistant"])
+async def create_task(request: dict):
+    """Create a new task."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    title = request.get("title")
+    description = request.get("description")
+    due_date = request.get("due_date")
+    
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    
+    try:
+        task = manager.create_task(title, description, due_date)
+        return task
+    except Exception as e:
+        LOGGER.error(f"Failed to create task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/tasks", tags=["Assistant"])
+async def get_tasks(include_completed: bool = True):
+    """Get all tasks."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        tasks = manager.get_tasks(include_completed=include_completed)
+        return {"tasks": tasks, "count": len(tasks)}
+    except Exception as e:
+        LOGGER.error(f"Failed to get tasks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/task/{task_id}/complete", tags=["Assistant"])
+async def complete_task(task_id: str):
+    """Mark a task as completed."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        task = manager.complete_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"status": "success", "message": "Task completed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Failed to complete task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistant/summary", tags=["Assistant"])
+async def get_assistant_summary():
+    """Get a summary of all assistant data."""
+    manager = _get_assistant_manager()
+    if not manager:
+        raise HTTPException(status_code=503, detail="Assistant manager not available")
+    
+    try:
+        summary = manager.get_summary()
+        return summary
+    except Exception as e:
+        LOGGER.error(f"Failed to get assistant summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
