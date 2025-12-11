@@ -197,6 +197,17 @@ class RobotConnection:
         
         query_lower = query.lower().strip()
         
+        # Debug: Log the processed query
+        logger.debug(f"Processing query_lower: '{query_lower}'")
+        
+        # Check for "come to me" / "come here" commands (check this FIRST before other navigation commands)
+        if 'come' in query_lower:
+            if 'to me' in query_lower or 'here' in query_lower or 'to you' in query_lower or 'come to' in query_lower:
+                logger.info(f"🧍 Come to me command detected: '{query}'")
+                await self.send_navigation(websocket, action='come_to_me')
+                await self.send_speak(websocket, "I'm coming to you! Looking for you now...")
+                return
+        
         # Check for navigation commands
         if ('start' in query_lower or 'begin' in query_lower) and ('auto' in query_lower or 'autonomous' in query_lower) and 'navigation' in query_lower:
             logger.info(f"🤖 Auto navigation command detected: '{query}'")
@@ -208,13 +219,6 @@ class RobotConnection:
             logger.info(f"🤖 Explore command detected: '{query}'")
             await self.send_navigation(websocket, action='start_explore', duration=None)
             await self.send_speak(websocket, "Starting exploration mode.")
-            return
-        
-        # Check for "come to me" / "come here" commands
-        if ('come' in query_lower) and ('to me' in query_lower or 'here' in query_lower or 'to you' in query_lower):
-            logger.info(f"🧍 Come to me command detected: '{query}'")
-            await self.send_navigation(websocket, action='come_to_me')
-            await self.send_speak(websocket, "I'm coming to you! Looking for you now...")
             return
         
         # Check for stop exploring command (explore start is handled by tool system)
@@ -316,8 +320,9 @@ class RobotConnection:
             msg["x"] = x
         if y is not None:
             msg["y"] = y
+        logger.info(f"🧭 Sending navigation command: {action} -> {msg}")
         await websocket.send(json.dumps(msg))
-        logger.info(f"🧭 Navigation: {action}")
+        logger.info(f"🧭 Navigation message sent successfully")
     
     async def start_exploration(self, websocket: WebSocketServerProtocol):
         """Start exploration mode - uses camera to navigate autonomously."""
