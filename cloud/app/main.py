@@ -880,6 +880,9 @@ async def voice_websocket(websocket: WebSocket):
                                     "text": transcript
                                 })
                                 
+                                # Note: explore command is now handled by the tool system in assistant.ask()
+                                # The tool system will detect "explore" and call explore_robot tool automatically
+                                
                                 # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
                                 if assistant:

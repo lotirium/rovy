@@ -35,5 +35,13 @@ Write-Host ""
 Write-Host "Logs will appear below:"
 Write-Host ""
 
+# Load environment variables from registry (User scope)
+$envVars = [System.Environment]::GetEnvironmentVariables([System.EnvironmentVariableTarget]::User)
+foreach ($key in $envVars.Keys) {
+    if (-not [System.Environment]::GetEnvironmentVariable($key, [System.EnvironmentVariableTarget]::Process)) {
+        [System.Environment]::SetEnvironmentVariable($key, $envVars[$key], [System.EnvironmentVariableTarget]::Process)
+    }
+}
+
 python main.py
 

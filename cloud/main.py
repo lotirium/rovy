@@ -70,7 +70,11 @@ class RobotConnection:
         self.server = server
         self.clients: Set[WebSocketServerProtocol] = set()
         self.last_image: Optional[bytes] = None
+        self.last_image_time: float = 0.0
         self.last_sensors = {}
+        self.exploring: bool = False
+        self.exploration_task: Optional[asyncio.Task] = None
+        self.exploration_websocket: Optional[WebSocketServerProtocol] = None
     
     async def handle_connection(self, websocket: WebSocketServerProtocol, path: str = "/"):
         """Handle robot WebSocket connection."""
@@ -91,6 +95,9 @@ class RobotConnection:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"🔌 Robot disconnected: {client_addr}")
         finally:
+            # Stop exploration if this was the exploring robot
+            if self.exploring and self.exploration_websocket == websocket:
+                await self.stop_exploration()
             self.clients.discard(websocket)
     
     async def handle_message(self, websocket: WebSocketServerProtocol, raw_message: str):
@@ -155,6 +162,7 @@ class RobotConnection:
             img_data = msg.get('image_base64', '')
             if img_data:
                 self.last_image = base64.b64decode(img_data)
+                self.last_image_time = time.time()
                 logger.debug(f"📷 Image received ({len(self.last_image)} bytes)")
             else:
                 logger.warning("Empty image_base64 in message")
@@ -187,12 +195,21 @@ class RobotConnection:
             await self.send_speak(websocket, "AI not available")
             return
         
+        query_lower = query.lower().strip()
+        
+        # Check for stop exploring command (explore start is handled by tool system)
+        if ('stop' in query_lower and 'explor' in query_lower) or ('stop explor' in query_lower):
+            logger.info(f"🛑 Stop explore command detected: '{query}'")
+            await self.stop_exploration()
+            await self.send_speak(websocket, "Stopping exploration.")
+            return
+        
         logger.info(f"🎯 Processing: '{query}'")
         
         # Auto-detect vision need
         if use_vision is None:
             vision_keywords = ['see', 'look', 'what is', 'who is', 'describe', 'camera', 'front']
-            use_vision = any(kw in query.lower() for kw in vision_keywords)
+            use_vision = any(kw in query_lower for kw in vision_keywords)
         
         # Log vision status
         if use_vision:
@@ -264,6 +281,210 @@ class RobotConnection:
         msg = {"type": "gimbal", "pan": pan, "tilt": tilt, "action": "move"}
         await websocket.send(json.dumps(msg))
     
+    async def start_exploration(self, websocket: WebSocketServerProtocol):
+        """Start exploration mode - uses camera to navigate autonomously."""
+        if self.exploring:
+            try:
+                await self.send_speak(websocket, "Already exploring!")
+            except:
+                pass  # Ignore if WebSocket is closed
+            return
+        
+        logger.info("🚀 Starting exploration mode")
+        
+        # Check if WebSocket is still open
+        if websocket.closed:
+            raise ConnectionError("WebSocket connection is closed")
+        
+        self.exploring = True
+        self.exploration_websocket = websocket
+        
+        # Start exploration task - MUST be created on the main server event loop
+        # The tool executor runs in a thread pool with a temporary loop, so we need
+        # to schedule the task on the main server loop
+        main_loop = self.server.main_loop
+        if main_loop and main_loop.is_running():
+            logger.info(f"🔧 Scheduling exploration task on main server loop: {main_loop}")
+            # Use run_coroutine_threadsafe to schedule on main loop from any thread
+            future = asyncio.run_coroutine_threadsafe(
+                self.exploration_loop(websocket),
+                main_loop
+            )
+            # Store the future as our task reference
+            self.exploration_task = future
+            logger.info(f"✅ Exploration task scheduled on main loop: {future}")
+        else:
+            # Fallback: try to create task on current loop (might not work if temporary)
+            try:
+                loop = asyncio.get_running_loop()
+                logger.warning(f"⚠️ Main loop not available, using current loop: {loop}")
+                self.exploration_task = loop.create_task(self.exploration_loop(websocket))
+            except RuntimeError:
+                logger.error("❌ Cannot create exploration task - no event loop available")
+                self.exploring = False
+                raise RuntimeError("Cannot start exploration - no event loop available")
+        
+        # Try to send message, but don't fail if WebSocket is closed
+        try:
+            await self.send_speak(websocket, "Starting exploration mode. I'll navigate using my camera.")
+        except Exception as e:
+            logger.warning(f"Could not send speak message via WebSocket: {e}, but exploration will continue")
+    
+    async def stop_exploration(self):
+        """Stop exploration mode."""
+        if not self.exploring:
+            return
+        
+        logger.info("🛑 Stopping exploration mode")
+        self.exploring = False
+        
+        # Cancel exploration task
+        if self.exploration_task:
+            if isinstance(self.exploration_task, asyncio.Task):
+                if not self.exploration_task.done():
+                    self.exploration_task.cancel()
+                    try:
+                        await self.exploration_task
+                    except asyncio.CancelledError:
+                        pass
+            elif hasattr(self.exploration_task, 'cancel'):  # Future from run_coroutine_threadsafe
+                if not self.exploration_task.done():
+                    self.exploration_task.cancel()
+        
+        # Stop robot movement
+        if self.exploration_websocket:
+            await self.send_move(self.exploration_websocket, direction='stop')
+        
+        self.exploration_websocket = None
+        self.exploration_task = None
+    
+    async def exploration_loop(self, websocket: WebSocketServerProtocol):
+        """Main exploration loop - analyzes images while stationary, then moves smoothly."""
+        logger.info("🔍 Exploration loop started - smooth continuous movement mode")
+        
+        iteration = 0
+        current_direction = 'forward'  # Track current movement direction
+        
+        while self.exploring:
+            try:
+                iteration += 1
+                logger.info(f"🔄 Exploration iteration {iteration}")
+                
+                # Step 1: Stop the robot briefly to capture a clear, stable image
+                logger.debug("🛑 Stopping robot for clear image capture...")
+                await self.send_move(websocket, direction='stop', distance=0, speed='medium')
+                
+                # Step 2: Wait for robot to settle (brief pause)
+                await asyncio.sleep(0.3)
+                
+                # Step 3: Wait for a fresh image to arrive (robot streams continuously)
+                image_wait_start = time.time()
+                initial_image_time = self.last_image_time
+                max_wait = 2.0  # Maximum time to wait for new image
+                
+                logger.debug("📷 Waiting for fresh image...")
+                while self.exploring:
+                    if self.last_image and self.last_image_time > initial_image_time:
+                        logger.debug(f"✅ Fresh image received (waited {time.time() - image_wait_start:.2f}s)")
+                        break
+                    
+                    if time.time() - image_wait_start > max_wait:
+                        logger.warning("⏱️ Timeout waiting for fresh image, using existing")
+                        break
+                    
+                    await asyncio.sleep(0.1)
+                
+                if not self.exploring:
+                    break
+                
+                if not self.last_image:
+                    logger.warning("⚠️ No image available, skipping this iteration")
+                    await asyncio.sleep(1.0)
+                    continue
+                
+                # Step 4: Analyze the clear, stationary image
+                logger.info(f"📸 Analyzing image for navigation decision (size: {len(self.last_image)} bytes)...")
+                
+                navigation_prompt = """You are navigating a robot. Look at this camera image and decide the best direction to move to explore the area while avoiding obstacles.
+
+Analyze the image and respond with ONLY one of these words:
+- "forward" - if the path ahead is clear
+- "left" - if you should turn left to avoid obstacles or explore
+- "right" - if you should turn right to avoid obstacles or explore
+- "stop" - if there are obstacles blocking all directions
+
+Consider:
+- Avoid walls, furniture, and other obstacles
+- Prefer open spaces
+- If forward is blocked, choose left or right based on which side looks more open
+- Be cautious and safe
+
+Respond with only the word: forward, left, right, or stop"""
+                
+                # Get navigation decision from AI
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None, self.server.assistant.ask_with_vision, navigation_prompt, self.last_image
+                )
+                
+                # Extract direction from response
+                response_lower = response.lower().strip()
+                direction = None
+                
+                if 'forward' in response_lower or 'ahead' in response_lower:
+                    direction = 'forward'
+                elif 'left' in response_lower:
+                    direction = 'left'
+                elif 'right' in response_lower:
+                    direction = 'right'
+                elif 'stop' in response_lower or 'blocked' in response_lower:
+                    direction = 'stop'
+                else:
+                    # Default to forward if unclear
+                    logger.warning(f"Unclear navigation response: '{response}', defaulting to forward")
+                    direction = 'forward'
+                
+                logger.info(f"🧭 Navigation decision: {direction} (AI: '{response[:60]}')")
+                
+                # Step 5: Execute movement smoothly
+                if direction == 'stop':
+                    # Obstacle detected - stay stopped briefly, then try turning
+                    logger.info("🛑 Obstacle detected, will try alternate direction")
+                    await asyncio.sleep(1.0)
+                    # Try turning left on next iteration
+                    if current_direction == 'forward':
+                        direction = 'left'
+                    elif current_direction == 'left':
+                        direction = 'right'
+                    elif current_direction == 'right':
+                        direction = 'forward'
+                
+                # Move in the chosen direction for a longer distance/time for smooth continuous movement
+                if direction != 'stop':
+                    current_direction = direction
+                    # Use longer distance for smoother continuous movement
+                    distance = 0.5 if direction == 'forward' else 0.3
+                    await self.send_move(websocket, direction=direction, distance=distance, speed='medium')
+                    logger.info(f"🚗 Moving {direction} ({distance}m)")
+                    
+                    # Continue moving for a bit before next check
+                    # This allows smooth continuous movement between image checks
+                    await asyncio.sleep(1.5)
+                
+            except asyncio.CancelledError:
+                logger.info("Exploration loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Exploration loop error: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+        
+        # Ensure robot stops when exploration ends
+        try:
+            await self.send_move(websocket, direction='stop', distance=0, speed='medium')
+        except:
+            pass
+        
+        logger.info("🔍 Exploration loop ended")
+    
     async def broadcast(self, msg: dict):
         """Send to all connected robots."""
         for client in self.clients:
@@ -286,6 +507,7 @@ class RovyCloudServer:
         self.assistant = None
         self.speech = None
         self.robot = RobotConnection(self)
+        self.main_loop: Optional[asyncio.AbstractEventLoop] = None
         
         logger.info("=" * 60)
         logger.info("  ROVY CLOUD SERVER")
@@ -303,9 +525,19 @@ class RovyCloudServer:
         
         if AI_OK and CloudAssistant:
             try:
-                # Qwen2-VL - no parameters needed, uses defaults
-                self.assistant = CloudAssistant()
-                logger.info("✅ AI assistant ready (Qwen2-VL)")
+                # OpenAI API - pass configuration from config
+                self.assistant = CloudAssistant(
+                    api_key=config.OPENAI_API_KEY,
+                    model=config.OPENAI_MODEL,
+                    vision_model=config.OPENAI_VISION_MODEL,
+                    temperature=config.OPENAI_TEMPERATURE,
+                    enable_tools=True
+                )
+                # Pass server reference to tool executor
+                if self.assistant.tool_executor:
+                    self.assistant.tool_executor.server = self
+                    logger.info(f"✅ Server reference set on tool executor: {self.assistant.tool_executor.server is not None}")
+                logger.info(f"✅ AI assistant ready (OpenAI {config.OPENAI_MODEL})")
             except Exception as e:
                 logger.error(f"AI init failed: {e}")
         
@@ -405,7 +637,7 @@ async def main():
     ║  Services:                                                    ║
     ║  • REST API (port 8000) - Mobile app connection              ║
     ║  • WebSocket (port 8765) - Robot connection                  ║
-    ║  • AI: LLM + Vision + Speech (local models)                  ║
+    ║  • AI: LLM + Vision + Speech (OpenAI API)                    ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
     

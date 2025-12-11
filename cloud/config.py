@@ -18,19 +18,14 @@ PC_SERVER_IP = os.getenv("ROVY_PC_IP", "100.121.110.125")
 ROBOT_IP = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
 
 # =============================================================================
-# AI Model Configuration (Local Models via llama.cpp)
+# AI Model Configuration (OpenAI API)
 # =============================================================================
 
-# Text model (Gemma, Llama, Mistral)
-TEXT_MODEL_PATH = os.getenv("ROVY_TEXT_MODEL", None)  # Auto-detect if None
-
-# Vision model (LLaVA, Phi-3-Vision)
-VISION_MODEL_PATH = os.getenv("ROVY_VISION_MODEL", None)
-VISION_MMPROJ_PATH = os.getenv("ROVY_VISION_MMPROJ", None)
-
-# Model settings
-N_GPU_LAYERS = int(os.getenv("ROVY_GPU_LAYERS", "-1"))  # -1 = all on GPU
-N_CTX = int(os.getenv("ROVY_CTX", "2048"))
+# OpenAI API Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # Required: Set your OpenAI API key
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # Model for text queries
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")  # Model for vision queries
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))  # Higher = more creative/personality
 
 # =============================================================================
 # Speech Configuration
