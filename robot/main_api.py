@@ -2054,14 +2054,18 @@ async def trigger_dance(request: dict):
     if style not in valid_styles:
         raise HTTPException(status_code=400, detail=f"Invalid style. Must be one of: {valid_styles}")
     
-    # Validate duration
-    if not isinstance(duration, (int, float)) or duration <= 0 or duration > 60:
-        raise HTTPException(status_code=400, detail="Duration must be between 0 and 60 seconds")
+    # Validate duration (allow up to 1 hour for continuous dancing)
+    if not isinstance(duration, (int, float)) or duration <= 0 or duration > 3600:
+        raise HTTPException(status_code=400, detail="Duration must be between 0 and 3600 seconds")
     
     print(f"[Dance] 💃 Starting {style} dance for {duration}s" + (f" with {music_genre} music" if with_music else ""))
     
     # Run dance in background thread
     def do_dance():
+        global dance_running, dance_stop_flag
+        dance_running = True
+        dance_stop_flag = False
+        
         try:
             # Display on OLED
             robot.rover.display_lines([
@@ -2091,8 +2095,19 @@ async def trigger_dance(request: dict):
                 except Exception as music_error:
                     print(f"[Dance] ⚠️ Music error: {music_error}, dancing without music")
             
-            # Perform dance
-            robot.rover.dance(style=style, duration=duration)
+            # Perform dance with interrupt checking
+            # Break the dance into smaller chunks to check stop flag
+            import time
+            chunk_duration = 1.0  # Check every 1 second
+            elapsed = 0.0
+            
+            while elapsed < duration and not dance_stop_flag:
+                remaining = min(chunk_duration, duration - elapsed)
+                robot.rover.dance(style=style, duration=remaining)
+                elapsed += remaining
+                if dance_stop_flag:
+                    print("[Dance] ⏹️ Dance interrupted by stop command")
+                    break
             
             # Stop music after dance
             if music_started:
@@ -2118,6 +2133,9 @@ async def trigger_dance(request: dict):
             print(f"[Dance] Error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            dance_running = False
+            dance_stop_flag = False
     
     threading.Thread(target=do_dance, daemon=True).start()
     
@@ -2131,11 +2149,34 @@ async def trigger_dance(request: dict):
     }
 
 
+@app.post("/dance/stop")
+async def stop_dance(request: dict = None):
+    """Stop the currently running dance."""
+    global dance_stop_flag, dance_running
+    
+    if not dance_running:
+        print("[Dance] No dance is currently running")
+        return {"status": "ok", "message": "No dance is currently running"}
+    
+    print("[Dance] 🛑 Stopping dance...")
+    dance_stop_flag = True
+    
+    # Wait a moment for dance to stop
+    import asyncio
+    await asyncio.sleep(0.5)
+    
+    return {"status": "ok", "message": "Dance stopped"}
+
+
 # Global music player state
 music_player_process = None
 music_paused = False
 current_search_term = None
 music_track_index = 0  # Track which result to play from search
+
+# Dance control
+dance_stop_flag = False
+dance_running = False
 
 @app.post("/music")
 async def control_music_simple(request: dict):
@@ -2278,7 +2319,7 @@ async def control_music(action: str, request: dict = None):
                     search_term = query
                 else:
                     # Default: popular music mix
-                    search_term = "popular music mix 2024"
+                    search_term = "popular music"
                 
                 current_search_term = search_term
                 music_paused = False
@@ -2339,7 +2380,7 @@ async def control_music(action: str, request: dict = None):
                 if current_search_term:
                     search_term = current_search_term
                 else:
-                    search_term = "popular music mix 2024"
+                    search_term = "popular music"
                 
                 # Stop current playback
                 if music_player_process and music_player_process.poll() is None:
@@ -2380,7 +2421,7 @@ async def control_music(action: str, request: dict = None):
                 if current_search_term:
                     search_term = current_search_term
                 else:
-                    search_term = "popular music mix 2024"
+                    search_term = "popular music"
                 
                 # Stop current playback
                 if music_player_process and music_player_process.poll() is None:

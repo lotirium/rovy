@@ -1119,13 +1119,14 @@ async def voice_websocket(websocket: WebSocket):
                                                 LOGGER.warning(f"Music start failed: {music_response.status_code}, dancing without music")
                                         
                                         # Now send dance command (without music flag since music is already playing)
+                                        # Use very long duration (1 hour) - will be stopped by "stop dancing" command
                                         dance_url = f"http://{pi_ip}:8000/dance"
                                         async with httpx.AsyncClient(timeout=5.0) as client:
                                             dance_response = await client.post(
                                                 dance_url,
                                                 json={
                                                     "style": style, 
-                                                    "duration": 10, 
+                                                    "duration": 3600,  # 1 hour - continues until "stop dancing" command
                                                     "with_music": False,  # Music already started separately
                                                     "music_genre": music_genre
                                                 }
@@ -1144,6 +1145,39 @@ async def voice_websocket(websocket: WebSocket):
                                                 LOGGER.warning(f"Dance request failed: {dance_response.status_code}")
                                     except Exception as dance_error:
                                         LOGGER.error(f"Dance command failed: {dance_error}")
+                                
+                                # Stop dancing command
+                                if ('stop' in transcript_lower or 'end' in transcript_lower) and 'danc' in transcript_lower:
+                                    LOGGER.info(f"🛑 Stop dancing command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        
+                                        # Stop dance
+                                        dance_stop_url = f"http://{pi_ip}:8000/dance/stop"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            dance_stop_response = await client.post(dance_stop_url, json={})
+                                            if dance_stop_response.status_code == 200:
+                                                LOGGER.info("✅ Dance stopped")
+                                            else:
+                                                LOGGER.warning(f"Dance stop failed: {dance_stop_response.status_code}")
+                                        
+                                        # Stop music
+                                        music_url = f"http://{pi_ip}:8000/music/stop"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            music_response = await client.post(music_url, json={})
+                                            if music_response.status_code == 200:
+                                                LOGGER.info("✅ Music stopped")
+                                            else:
+                                                LOGGER.warning(f"Music stop failed: {music_response.status_code}")
+                                        
+                                        response_text = "Stopping dance and music."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": response_text
+                                        })
+                                        continue
+                                    except Exception as stop_error:
+                                        LOGGER.error(f"Stop dancing command failed: {stop_error}")
                                 
                                 # Music commands
                                 if 'play music' in transcript_lower or 'play some music' in transcript_lower:
