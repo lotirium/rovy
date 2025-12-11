@@ -63,7 +63,7 @@ WHISPER_DEVICE = "cpu"  # Use CPU on Pi
 WHISPER_COMPUTE_TYPE = "int8"  # int8 for CPU efficiency
 
 # Audio recording after wake word detected
-QUERY_RECORD_DURATION = 5.0  # Record 5 seconds after wake word for full query
+QUERY_RECORD_DURATION = 3.0  # Record 3 seconds after wake word for full query (shorter = more responsive)
 QUERY_TIMEOUT = 10.0  # Max time to wait for query after wake word
 
 # USB Microphone settings (card 4, device 0 - USB Headphone Set microphone)

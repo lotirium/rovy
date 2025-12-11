@@ -678,6 +678,30 @@ class RobotServer:
                         
                         audio_bytes = b''.join(frames)
                         
+                        # Apply AGC (Automatic Gain Control) to normalize volume
+                        try:
+                            import numpy as np
+                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                            
+                            # Check audio energy
+                            rms = np.sqrt(np.mean(audio_array ** 2))
+                            max_amplitude = np.max(np.abs(audio_array))
+                            print(f"[WakeWord] Audio stats: RMS={rms:.4f}, Max={max_amplitude:.4f}")
+                            
+                            # Apply AGC if audio is too quiet (target RMS ~0.15)
+                            target_rms = 0.15
+                            if rms > 0.001:  # Only if there's some audio
+                                gain = min(target_rms / rms, 10.0)  # Limit gain to 10x
+                                audio_array = np.clip(audio_array * gain, -1.0, 1.0)
+                                print(f"[WakeWord] Applied AGC: gain={gain:.2f}x")
+                            else:
+                                print(f"[WakeWord] ⚠️ Audio is very quiet (RMS < 0.001), may be silence")
+                            
+                            # Convert back to bytes
+                            audio_bytes = (audio_array * 32768.0).astype(np.int16).tobytes()
+                        except Exception as agc_error:
+                            print(f"[WakeWord] AGC failed: {agc_error}, using raw audio")
+                        
                         # Send to voice WebSocket
                         if audio_bytes and self.voice_ws:
                             print(f"[WakeWord] 📤 Sending {len(audio_bytes)} bytes to cloud...")
@@ -755,6 +779,14 @@ class RobotServer:
                     elif msg_type == 'status':
                         status = data.get('message', '')
                         print(f"[Voice] Status: {status}")
+                        
+                        # Speak important status messages to user
+                        if 'could not transcribe' in status.lower():
+                            await asyncio.to_thread(self.speak_acknowledgment, "Sorry, I didn't catch that. Please speak clearly after the beep.")
+                        elif 'no audio' in status.lower():
+                            await asyncio.to_thread(self.speak_acknowledgment, "I didn't hear anything. Please try again.")
+                        elif 'not available' in status.lower():
+                            await asyncio.to_thread(self.speak_acknowledgment, "Voice service is not available right now.")
                     
                 except asyncio.TimeoutError:
                     continue  # No message, continue waiting

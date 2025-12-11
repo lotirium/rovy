@@ -984,11 +984,15 @@ async def voice_websocket(websocket: WebSocket):
                     if speech:
                         try:
                             audio_bytes = base64.b64decode(full_audio_b64)
+                            audio_duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes per sample (16-bit)
+                            LOGGER.info(f"🎤 Transcribing {len(audio_bytes)} bytes ({audio_duration:.2f}s) at {sample_rate}Hz")
+                            
                             transcript = await anyio.to_thread.run_sync(
                                 speech.transcribe, audio_bytes, sample_rate
                             )
                             
                             if transcript:
+                                LOGGER.info(f"✅ Transcription successful: '{transcript}'")
                                 await websocket.send_json({
                                     "type": "transcript",
                                     "text": transcript
@@ -1306,6 +1310,7 @@ async def voice_websocket(websocket: WebSocket):
                                         "text": "AI assistant not available"
                                     })
                             else:
+                                LOGGER.warning(f"⚠️ Transcription returned empty result (audio: {len(audio_bytes)} bytes, {audio_duration:.2f}s)")
                                 await websocket.send_json({
                                     "type": "status",
                                     "message": "Could not transcribe audio"

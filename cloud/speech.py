@@ -121,6 +121,17 @@ class SpeechProcessor:
             # Convert bytes to float array
             audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
+            # Check audio energy/volume
+            audio_energy = np.sqrt(np.mean(audio ** 2))
+            audio_max = np.max(np.abs(audio))
+            logger.info(f"Audio diagnostics: energy={audio_energy:.4f}, max_amplitude={audio_max:.4f}, samples={len(audio)}")
+            
+            # Warn if audio is very quiet
+            if audio_energy < 0.001:
+                logger.warning("⚠️ Audio is very quiet (energy < 0.001), may be silence or poor recording")
+            elif audio_max < 0.01:
+                logger.warning("⚠️ Audio amplitude is very low (max < 0.01), may be too quiet to transcribe")
+            
             # Resample to 16kHz if needed
             if sample_rate != 16000:
                 from scipy import signal
@@ -145,6 +156,8 @@ class SpeechProcessor:
             text = result["text"].strip()
             if text:
                 logger.info(f"Transcribed: '{text}'")
+            else:
+                logger.warning("Whisper returned empty text")
             return text if text else None
             
         except Exception as e:
