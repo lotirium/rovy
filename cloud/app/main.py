@@ -1106,13 +1106,15 @@ async def voice_websocket(websocket: WebSocket):
                                         
                                         # Start music first using the working music endpoint (same as AI tool uses)
                                         music_url = f"http://{pi_ip}:8000/music/play"
-                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                        async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout for music search
                                             music_response = await client.post(
                                                 music_url,
                                                 json={"query": music_genre}  # Old endpoint format
                                             )
                                             if music_response.status_code == 200:
                                                 LOGGER.info(f"🎵 Started {music_genre} music on robot")
+                                                # Wait for music to buffer and start playing before dancing
+                                                await anyio.sleep(2.0)
                                             else:
                                                 LOGGER.warning(f"Music start failed: {music_response.status_code}, dancing without music")
                                         
@@ -1134,17 +1136,8 @@ async def voice_websocket(websocket: WebSocket):
                                                     "type": "response",
                                                     "text": response_text
                                                 })
-                                                # Send TTS
-                                                try:
-                                                    pi_url = f"http://{pi_ip}:8000/speak"
-                                                    async with httpx.AsyncClient(timeout=10.0) as tts_client:
-                                                        tts_response = await tts_client.post(pi_url, json={"text": response_text})
-                                                        if tts_response.status_code == 200:
-                                                            LOGGER.info("✅ TTS sent to Pi for dance")
-                                                        else:
-                                                            LOGGER.warning(f"TTS request returned status {tts_response.status_code}")
-                                                except Exception as tts_error:
-                                                    LOGGER.error(f"Failed to send TTS to Pi: {tts_error}")
+                                                # Skip TTS for dance to avoid audio conflict with music
+                                                LOGGER.info("Skipping TTS for dance command to allow music to play")
                                                 
                                                 continue
                                             else:
