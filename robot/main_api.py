@@ -170,6 +170,7 @@ class RobotServer:
         
         # State
         self.is_listening = False
+        self.is_speaking = False  # Flag to pause wake word detection during TTS
         self.audio_buffer = []
         self.last_image = None
         self.last_image_time = 0
@@ -346,10 +347,12 @@ class RobotServer:
                 import tempfile
                 import os
                 
+                self.is_speaking = True  # Pause wake word detection
                 print(f"[WakeWord] Playing acknowledgment: '{text}'")
                 piper_voice = config.PIPER_VOICES.get("en")
                 if not os.path.exists(piper_voice):
                     print(f"[WakeWord] Piper voice not found: {piper_voice}")
+                    self.is_speaking = False
                     return
                 
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -383,6 +386,11 @@ class RobotServer:
                 print(f"[WakeWord] Acknowledgment error: {e}")
                 import traceback
                 traceback.print_exc()
+            finally:
+                # Wait 0.5s for audio to clear from mic before resuming detection
+                import time
+                time.sleep(0.5)
+                self.is_speaking = False  # Resume wake word detection
         
         # Run in background thread
         threading.Thread(target=do_speak, daemon=True).start()
@@ -641,6 +649,12 @@ class RobotServer:
         
         while self.running and not self.is_recording:
             try:
+                # Skip detection if robot is speaking (prevent hearing own voice)
+                if self.is_speaking:
+                    # Don't spam logs, just wait quietly
+                    await asyncio.sleep(0.1)
+                    continue
+                
                 # Run wake word detection using async cloud detector
                 detected = await self.wake_word_detector.listen_for_wake_word_async(timeout=10)
                 
@@ -1943,6 +1957,8 @@ async def speak_text(request: dict):
             import tempfile
             import os
             
+            robot.is_speaking = True  # Pause wake word detection
+            
             # Select Piper voice based on language
             piper_voice = config.PIPER_VOICES.get(language, config.PIPER_VOICES.get("en"))
             
@@ -1953,6 +1969,7 @@ async def speak_text(request: dict):
                 piper_voice = config.PIPER_VOICES.get("en")
                 if not os.path.exists(piper_voice):
                     print(f"[Speak] Error: No Piper voices available")
+                    robot.is_speaking = False
                     return
                 print(f"[Speak] Using English voice as fallback")
             
@@ -1999,6 +2016,11 @@ async def speak_text(request: dict):
             print(f"[Speak] TTS error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Wait 0.5s for audio to clear from mic before resuming detection
+            import time
+            time.sleep(0.5)
+            robot.is_speaking = False  # Resume wake word detection
     
     # Start speaking in background
     threading.Thread(target=do_speak, daemon=True).start()
