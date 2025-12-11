@@ -2256,13 +2256,13 @@ async def control_music(action: str, request: dict = None):
     # Run music control in background
     def do_music_control():
         global music_player_process, music_paused, current_search_term, music_track_index
+        import os
+        import signal
         
         try:
             if action == "play":
                 # Resume if paused
                 if music_paused and music_player_process and music_player_process.poll() is None:
-                    import os
-                    import signal
                     os.kill(music_player_process.pid, signal.SIGCONT)
                     music_paused = False
                     print(f"[Music] ✅ Resumed")
@@ -2317,8 +2317,6 @@ async def control_music(action: str, request: dict = None):
             elif action == "pause":
                 if music_player_process and music_player_process.poll() is None:
                     if not music_paused:
-                        import os
-                        import signal
                         os.kill(music_player_process.pid, signal.SIGSTOP)
                         music_paused = True
                         print(f"[Music] ✅ Paused")

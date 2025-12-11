@@ -1101,23 +1101,22 @@ async def voice_websocket(websocket: WebSocket):
                                         elif 'electronic' in transcript_lower or 'edm' in transcript_lower:
                                             music_genre = 'electronic'
                                         
-                                        # Start music playback on cloud server (where YouTube Music is authenticated)
-                                        music_started = False
-                                        try:
-                                            from robot.music_player import get_music_player
-                                            music_player = get_music_player()
-                                            if music_player and music_player.yt_music:
-                                                LOGGER.info(f"🎵 Starting {music_genre} music on cloud server")
-                                                await anyio.to_thread.run_sync(music_player.play_random, music_genre)
-                                                music_started = True
-                                                await anyio.sleep(2)  # Let music start
-                                            else:
-                                                LOGGER.warning("Music player not available on cloud, dancing without music")
-                                        except Exception as music_error:
-                                            LOGGER.warning(f"Failed to start music on cloud: {music_error}")
-                                        
-                                        # Tell robot to dance WITHOUT music (music plays from cloud)
+                                        # Use the music endpoint to start music, then dance endpoint
                                         pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        
+                                        # Start music first using the working music endpoint (same as AI tool uses)
+                                        music_url = f"http://{pi_ip}:8000/music/play"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            music_response = await client.post(
+                                                music_url,
+                                                json={"query": music_genre}  # Old endpoint format
+                                            )
+                                            if music_response.status_code == 200:
+                                                LOGGER.info(f"🎵 Started {music_genre} music on robot")
+                                            else:
+                                                LOGGER.warning(f"Music start failed: {music_response.status_code}, dancing without music")
+                                        
+                                        # Now send dance command (without music flag since music is already playing)
                                         dance_url = f"http://{pi_ip}:8000/dance"
                                         async with httpx.AsyncClient(timeout=5.0) as client:
                                             dance_response = await client.post(
@@ -1125,7 +1124,7 @@ async def voice_websocket(websocket: WebSocket):
                                                 json={
                                                     "style": style, 
                                                     "duration": 10, 
-                                                    "with_music": False,  # Robot doesn't play music
+                                                    "with_music": False,  # Music already started separately
                                                     "music_genre": music_genre
                                                 }
                                             )
@@ -1136,20 +1135,20 @@ async def voice_websocket(websocket: WebSocket):
                                                     "text": response_text
                                                 })
                                                 # Send TTS
-                                                pi_url = f"http://{pi_ip}:8000/speak"
-                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
-                                                    await tts_client.post(pi_url, json={"text": response_text})
-                                                
-                                                # Wait for dance to complete (10 seconds), then stop music
-                                                if music_started:
-                                                    await anyio.sleep(10)
-                                                    try:
-                                                        music_player.stop()
-                                                        LOGGER.info("🎵 Stopped music after dance")
-                                                    except Exception as stop_error:
-                                                        LOGGER.warning(f"Failed to stop music: {stop_error}")
+                                                try:
+                                                    pi_url = f"http://{pi_ip}:8000/speak"
+                                                    async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                        tts_response = await tts_client.post(pi_url, json={"text": response_text})
+                                                        if tts_response.status_code == 200:
+                                                            LOGGER.info("✅ TTS sent to Pi for dance")
+                                                        else:
+                                                            LOGGER.warning(f"TTS request returned status {tts_response.status_code}")
+                                                except Exception as tts_error:
+                                                    LOGGER.error(f"Failed to send TTS to Pi: {tts_error}")
                                                 
                                                 continue
+                                            else:
+                                                LOGGER.warning(f"Dance request failed: {dance_response.status_code}")
                                     except Exception as dance_error:
                                         LOGGER.error(f"Dance command failed: {dance_error}")
                                 
@@ -1175,11 +1174,11 @@ async def voice_websocket(websocket: WebSocket):
                                             genre = 'electronic'
                                         
                                         pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
-                                        music_url = f"http://{pi_ip}:8000/music"
+                                        music_url = f"http://{pi_ip}:8000/music/play"
                                         async with httpx.AsyncClient(timeout=5.0) as client:
                                             music_response = await client.post(
                                                 music_url,
-                                                json={"action": "play", "genre": genre}
+                                                json={"query": genre}  # Old endpoint format
                                             )
                                             if music_response.status_code == 200:
                                                 response_text = f"Playing {genre} music for you!"
@@ -1200,11 +1199,11 @@ async def voice_websocket(websocket: WebSocket):
                                     LOGGER.info(f"⏹️ Stop music command detected: '{transcript}'")
                                     try:
                                         pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
-                                        music_url = f"http://{pi_ip}:8000/music"
+                                        music_url = f"http://{pi_ip}:8000/music/stop"
                                         async with httpx.AsyncClient(timeout=5.0) as client:
                                             music_response = await client.post(
                                                 music_url,
-                                                json={"action": "stop"}
+                                                json={}  # Old endpoint format (no body needed)
                                             )
                                             if music_response.status_code == 200:
                                                 response_text = "Stopping music."
@@ -1708,18 +1707,20 @@ async def trigger_dance(request: dict):
         raise HTTPException(status_code=501, detail="Dance function not supported by this rover")
     
     try:
-        # If music requested, play it on cloud server (where YouTube Music is authenticated)
+        # If music requested, try to play it locally
         music_player = None
         if with_music:
             try:
                 from robot.music_player import get_music_player
                 music_player = get_music_player()
                 if music_player and music_player.yt_music:
-                    LOGGER.info(f"🎵 Starting {music_genre} music on cloud server")
+                    LOGGER.info(f"🎵 Starting {music_genre} music")
                     await anyio.to_thread.run_sync(music_player.play_random, music_genre)
                     await anyio.sleep(2)  # Let music start
                 else:
-                    LOGGER.warning("Music player not available on cloud, dancing without music")
+                    LOGGER.info("YouTube Music not configured, dancing without music")
+            except ImportError as import_error:
+                LOGGER.info(f"Music player module not available: {import_error}, dancing without music")
             except Exception as music_error:
                 LOGGER.warning(f"Music failed, dancing without: {music_error}")
         
