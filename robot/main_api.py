@@ -67,6 +67,13 @@ except ImportError:
     print("WARNING: sounddevice not installed. Audio playback disabled.")
 
 try:
+    from wake_word_detector_cloud import CloudWakeWordDetector
+    WAKE_WORD_OK = True
+except ImportError:
+    WAKE_WORD_OK = False
+    print("WARNING: Wake word detector not available. Install with: bash install_wake_word.sh")
+
+try:
     from rover import Rover
     ROVER_OK = True
 except Exception as e:
@@ -130,6 +137,12 @@ class ClaimControlResponse(BaseModel):
 class VolumeCommand(BaseModel):
     volume: int  # 0-100
 
+class NavigationCommand(BaseModel):
+    action: str  # start_explore, stop, goto
+    duration: Optional[float] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
+
 
 # ==============================================================================
 # Robot Client with API
@@ -162,6 +175,13 @@ class RobotServer:
         self.last_image_time = 0
         self.oakd_error_count = 0
         self.oakd_last_reinit = 0
+        
+        # Wake word detection
+        self.wake_word_model = None
+        self.wake_word_enabled = False
+        self.is_recording = False
+        self.voice_ws = None  # WebSocket connection to cloud /voice endpoint
+        self.audio_sample_rate = config.SAMPLE_RATE  # Default, will be updated in init_audio
         
         print("=" * 60)
         print("  ROVY ROBOT SERVER")
@@ -303,25 +323,53 @@ class RobotServer:
             return True
     
     def init_audio(self):
-        """Initialize audio input (ReSpeaker)."""
+        """Initialize audio input (microphone)."""
         if not AUDIO_OK:
             return False
         
         try:
             self.pyaudio = pyaudio.PyAudio()
             
-            # Find ReSpeaker device
+            # Find microphone device (USB Headphone Set or ReSpeaker)
             device_index = None
             for i in range(self.pyaudio.get_device_count()):
                 info = self.pyaudio.get_device_info_by_index(i)
                 name = info.get('name', '').lower()
-                if 'respeaker' in name or 'seeed' in name:
-                    device_index = i
-                    print(f"[Audio] Found ReSpeaker: {info['name']}")
-                    break
+                max_input_channels = info.get('maxInputChannels', 0)
+                
+                # Prefer USB Headphone Set, fallback to ReSpeaker
+                if device_index is None and max_input_channels > 0:
+                    if 'headphone' in name or 'set' in name:
+                        device_index = i
+                        print(f"[Audio] Found USB Headphone Set: {info['name']}")
+                    elif 'respeaker' in name or 'seeed' in name:
+                        device_index = i
+                        print(f"[Audio] Found ReSpeaker: {info['name']}")
+            
+            if device_index is None:
+                # Fallback: use default input device
+                try:
+                    default_info = self.pyaudio.get_default_input_device_info()
+                    device_index = default_info.get('index')
+                    print(f"[Audio] Using default input device: {default_info.get('name')}")
+                except:
+                    print("[Audio] No microphone found")
+                    return False
             
             self.audio_device_index = device_index
-            print("[Audio] Ready")
+            
+            # Get device's default sample rate
+            device_info = self.pyaudio.get_device_info_by_index(device_index)
+            device_sample_rate = int(device_info.get('defaultSampleRate', 48000))
+            self.audio_sample_rate = device_sample_rate
+            
+            # If device doesn't support 16kHz, we'll record at device rate and resample
+            if device_sample_rate != config.SAMPLE_RATE:
+                print(f"[Audio] Device sample rate: {device_sample_rate}Hz (will resample to {config.SAMPLE_RATE}Hz)")
+            else:
+                print(f"[Audio] Using device sample rate: {device_sample_rate}Hz")
+            
+            print(f"[Audio] Ready (device index: {device_index})")
             return True
         except Exception as e:
             print(f"[Audio] Init failed: {e}")
@@ -339,7 +387,7 @@ class RobotServer:
             return
         
         try:
-            # Set hardware volume to 125 (85% of 147) for optimal quality
+            # Set hardware volume to 125 (85% of 147) to prevent clipping
             result = subprocess.run(
                 ['amixer', '-c', str(HW_CARD), 'sset', 'PCM', str(HW_VOLUME_MAX)],
                 capture_output=True,
@@ -352,6 +400,436 @@ class RobotServer:
                 print(f"[Volume] Hardware init failed: {result.stderr}")
         except Exception as e:
             print(f"[Volume] Hardware init failed: {e}")
+    
+    def speak_acknowledgment(self, text="Yes?"):
+        """Quick non-blocking speech for acknowledgments using Piper."""
+        def do_speak():
+            try:
+                import tempfile
+                import os
+                
+                print(f"[WakeWord] Playing acknowledgment: '{text}'")
+                piper_voice = config.PIPER_VOICES.get("en")
+                if not os.path.exists(piper_voice):
+                    print(f"[WakeWord] Piper voice not found: {piper_voice}")
+                    return
+                
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    wav_path = f.name
+                
+                # Generate with Piper
+                proc = subprocess.run(
+                    ['piper', '--model', piper_voice, '--output_file', wav_path],
+                    input=text,
+                    text=True,
+                    capture_output=True,
+                    timeout=5
+                )
+                
+                if proc.returncode == 0 and os.path.exists(wav_path):
+                    print(f"[WakeWord] Generated audio, playing on {config.SPEAKER_DEVICE}")
+                    # Play with aplay
+                    play_result = subprocess.run(
+                        ['aplay', '-D', config.SPEAKER_DEVICE, wav_path],
+                        capture_output=True,
+                        timeout=5
+                    )
+                    if play_result.returncode == 0:
+                        print(f"[WakeWord] ✅ Acknowledgment played")
+                    else:
+                        print(f"[WakeWord] aplay error: {play_result.stderr.decode()[:100]}")
+                    os.unlink(wav_path)
+                else:
+                    print(f"[WakeWord] Piper generation failed: {proc.stderr.decode()[:100]}")
+            except Exception as e:
+                print(f"[WakeWord] Acknowledgment error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Run in background thread
+        threading.Thread(target=do_speak, daemon=True).start()
+    
+    def init_wake_word(self):
+        """Initialize wake word detection with Silero VAD + Whisper."""
+        if not WAKE_WORD_OK:
+            print("[WakeWord] Wake word detection not available")
+            return False
+        
+        try:
+            print("[WakeWord] Loading Cloud-based Wake Word Detector (Silero VAD + Cloud Whisper)...")
+            device_rate = self.audio_sample_rate if hasattr(self, 'audio_sample_rate') else config.VAD_SAMPLE_RATE
+            device_idx = self.audio_device_index if hasattr(self, 'audio_device_index') else None
+            print(f"[WakeWord] Config: device_rate={device_rate}, device_index={device_idx}, vad_rate={config.VAD_SAMPLE_RATE}")
+            self.wake_word_detector = CloudWakeWordDetector(
+                wake_words=config.WAKE_WORDS,
+                cloud_url=f"ws://{config.PC_SERVER_IP}:{config.API_PORT}/voice",
+                sample_rate=config.VAD_SAMPLE_RATE,
+                device_sample_rate=device_rate,
+                device_index=device_idx,
+                vad_threshold=config.VAD_THRESHOLD,
+                min_speech_duration=config.VAD_MIN_SPEECH_DURATION,
+                min_silence_duration=config.VAD_MIN_SILENCE_DURATION,
+            )
+            self.wake_word_enabled = True
+            print(f"[WakeWord] Ready! Listening for: {config.WAKE_WORDS}")
+            return True
+        except Exception as e:
+            print(f"[WakeWord] Init failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    async def connect_voice_websocket(self):
+        """Connect to cloud /voice WebSocket endpoint."""
+        if not WEBSOCKETS_OK:
+            return False
+        
+        try:
+            # Get cloud HTTP URL and convert to WebSocket
+            cloud_http_url = config.SERVER_URL.replace('ws://', 'http://').replace('wss://', 'https://')
+            cloud_http_url = cloud_http_url.replace(':8765', ':8000')  # FastAPI runs on 8000
+            voice_ws_url = cloud_http_url.replace('http://', 'ws://').replace('https://', 'wss://')
+            voice_ws_url = f"{voice_ws_url}/voice"
+            
+            print(f"[Voice] Connecting to {voice_ws_url}...")
+            self.voice_ws = await websockets.connect(voice_ws_url)
+            print("[Voice] Connected to cloud voice endpoint")
+            return True
+        except Exception as e:
+            print(f"[Voice] Connection failed: {e}")
+            self.voice_ws = None
+            return False
+    
+    def calculate_audio_energy(self, audio_data):
+        """Calculate audio energy for VAD (Voice Activity Detection)."""
+        if not audio_data:
+            return 0.0
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+        return np.sqrt(np.mean(audio_array**2))
+    
+    async def record_and_stream_audio(self, duration=5.0, silence_threshold=500, silence_duration=1.5):
+        """Record audio and stream to cloud /voice endpoint."""
+        if not AUDIO_OK or not self.pyaudio or self.audio_device_index is None:
+            print("[Voice] Audio not available")
+            return
+        
+        if not self.voice_ws:
+            if not await self.connect_voice_websocket():
+                print("[Voice] Could not connect to cloud")
+                return
+        
+        print("[Voice] 🎤 Recording...")
+        self.is_recording = True
+        
+        try:
+            # Try to open stream
+            try:
+                stream = self.pyaudio.open(
+                    format=pyaudio.paInt16,
+                    channels=config.CHANNELS,
+                    rate=self.audio_sample_rate,  # Use device's native sample rate
+                    input=True,
+                    input_device_index=self.audio_device_index,
+                    frames_per_buffer=config.CHUNK_SIZE
+                )
+            except Exception as stream_error:
+                print(f"[Voice] Failed to open audio stream: {stream_error}")
+                return
+            
+            audio_chunks = []
+            chunk_count = 0
+            last_silence_time = None
+            start_time = time.time()
+            
+            while self.is_recording and (time.time() - start_time) < duration:
+                try:
+                    audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
+                    energy = self.calculate_audio_energy(audio_data)
+                    
+                    # Check for silence
+                    if energy < silence_threshold:
+                        if last_silence_time is None:
+                            last_silence_time = time.time()
+                        elif (time.time() - last_silence_time) > silence_duration:
+                            # Silence detected, stop recording
+                            print("[Voice] Silence detected, stopping recording")
+                            break
+                    else:
+                        # Audio detected, reset silence timer
+                        last_silence_time = None
+                    
+                    # Resample if needed (device rate -> 16kHz for cloud)
+                    if self.audio_sample_rate != config.SAMPLE_RATE:
+                        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                        # Resample using scipy if available
+                        try:
+                            from scipy import signal
+                            num_samples = int(len(audio_array) * config.SAMPLE_RATE / self.audio_sample_rate)
+                            audio_array = signal.resample(audio_array, num_samples).astype(np.int16)
+                            audio_data = audio_array.tobytes()
+                        except ImportError:
+                            # Fallback: simple decimation (not ideal but works)
+                            decimation_factor = int(self.audio_sample_rate / config.SAMPLE_RATE)
+                            audio_array = audio_array[::decimation_factor]
+                            audio_data = audio_array.tobytes()
+                    
+                    # Encode chunk as base64
+                    audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                    audio_chunks.append(audio_b64)
+                    chunk_count += 1
+                    
+                    # Send chunk to cloud
+                    try:
+                        await self.voice_ws.send(json.dumps({
+                            "type": "audio_chunk",
+                            "encoding": "base64",
+                            "data": audio_b64
+                        }))
+                    except Exception as e:
+                        print(f"[Voice] Error sending chunk: {e}")
+                        break
+                    
+                except Exception as e:
+                    print(f"[Voice] Recording error: {e}")
+                    break
+            
+            stream.stop_stream()
+            stream.close()
+            
+            # Send audio_end signal
+            if chunk_count > 0:
+                try:
+                    await self.voice_ws.send(json.dumps({
+                        "type": "audio_end",
+                        "encoding": "base64",
+                        "sampleRate": config.SAMPLE_RATE
+                    }))
+                    print(f"[Voice] ✅ Sent {chunk_count} audio chunks to cloud")
+                except Exception as e:
+                    print(f"[Voice] Error sending audio_end: {e}")
+            
+        except Exception as e:
+            print(f"[Voice] Recording failed: {e}")
+        finally:
+            self.is_recording = False
+    
+    async def listen_for_wake_word(self):
+        """Continuously listen for wake word 'Rovy'."""
+        if not AUDIO_OK or not self.pyaudio or self.audio_device_index is None:
+            return
+        
+        if not self.wake_word_enabled:
+            return
+        
+        print("[WakeWord] 👂 Listening for 'Rovy'...")
+        
+        try:
+            stream = self.pyaudio.open(
+                format=pyaudio.paInt16,
+                channels=config.CHANNELS,
+                rate=self.audio_sample_rate,  # Use device's native sample rate
+                input=True,
+                output=False,  # Explicitly input-only
+                input_device_index=self.audio_device_index,
+                frames_per_buffer=config.CHUNK_SIZE
+            )
+            
+            # Buffer for accumulating audio (for text-based detection)
+            audio_buffer = []
+            buffer_duration = 3.0  # seconds
+            buffer_size = int(config.SAMPLE_RATE / config.CHUNK_SIZE * buffer_duration)
+            
+            while self.running and not self.is_recording:
+                try:
+                    audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
+                    energy = self.calculate_audio_energy(audio_data)
+                    
+                    # Simple VAD: if energy is above threshold, accumulate audio
+                    vad_threshold = 300  # Adjust based on your microphone
+                    if energy > vad_threshold:
+                        audio_buffer.append(audio_data)
+                        # Keep buffer size limited
+                        if len(audio_buffer) > buffer_size:
+                            audio_buffer.pop(0)
+                    else:
+                        # Check buffer for wake word if we have enough audio
+                        if len(audio_buffer) > int(config.SAMPLE_RATE / config.CHUNK_SIZE * 0.5):  # At least 0.5s
+                            # Try to detect wake word using Whisper (via cloud)
+                            # For now, use a simpler approach: send to cloud for transcription
+                            # and check for "rovy" in the text
+                            
+                            # Combine buffer audio
+                            combined_audio = b''.join(audio_buffer)
+                            audio_buffer = []  # Clear buffer
+                            
+                            # Quick check: send to cloud for transcription
+                            # We'll use a lightweight approach: send short audio clip
+                            # to cloud /voice endpoint for wake word detection
+                            
+                            # For efficiency, we'll use a simpler method:
+                            # Check if we should trigger based on pattern
+                            # For now, let's use a hybrid: if energy spikes, check with cloud
+                            
+                            # Actually, let's use a simpler approach:
+                            # Periodically send audio to cloud for wake word detection
+                            # But to avoid too many requests, we'll only do this when energy is high
+                            
+                            # For now, implement a simple pattern: if we detect speech-like
+                            # patterns, send to cloud for transcription
+                            pass
+                    
+                    await asyncio.sleep(0.01)  # Small delay to avoid busy waiting
+                    
+                except Exception as e:
+                    print(f"[WakeWord] Error: {e}")
+                    await asyncio.sleep(0.1)
+            
+            stream.stop_stream()
+            stream.close()
+            
+        except Exception as e:
+            print(f"[WakeWord] Listening failed: {e}")
+    
+    async def wake_word_detection_loop(self):
+        """Main loop for wake word detection using Cloud-based detector."""
+        if not self.wake_word_enabled or not hasattr(self, 'wake_word_detector'):
+            print("[WakeWord] Wake word detector not available")
+            return
+        
+        # Connect to voice WebSocket for sending queries after wake word
+        await self.connect_voice_websocket()
+        
+        print("[WakeWord] 👂 Starting cloud-based wake word detection (Silero VAD + Cloud Whisper)...")
+        
+        while self.running and not self.is_recording:
+            try:
+                # Run wake word detection using async cloud detector
+                detected = await self.wake_word_detector.listen_for_wake_word_async(timeout=10)
+                
+                if detected and not self.is_recording:
+                    print("[WakeWord] ✅ Wake word detected!")
+                    
+                    # Play acknowledgment via Piper (non-blocking)
+                    try:
+                        await asyncio.to_thread(self.speak_acknowledgment, "Yes?")
+                        await asyncio.sleep(0.5)  # Brief pause for acknowledgment to play
+                    except Exception as e:
+                        print(f"[WakeWord] Could not play acknowledgment: {e}")
+                    
+                    # Record full query using pyaudio
+                    print("[WakeWord] 🎤 Recording your question...")
+                    try:
+                        # Record audio for query
+                        frames = []
+                        stream = self.pyaudio.open(
+                            format=pyaudio.paInt16,
+                            channels=config.CHANNELS,
+                            rate=self.audio_sample_rate,
+                            input=True,
+                            input_device_index=self.audio_device_index,
+                            frames_per_buffer=config.CHUNK_SIZE
+                        )
+                        
+                        num_chunks = int(self.audio_sample_rate / config.CHUNK_SIZE * config.QUERY_RECORD_DURATION)
+                        for _ in range(num_chunks):
+                            data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
+                            frames.append(data)
+                        
+                        stream.stop_stream()
+                        stream.close()
+                        
+                        audio_bytes = b''.join(frames)
+                        
+                        # Send to voice WebSocket
+                        if audio_bytes and self.voice_ws:
+                            print(f"[WakeWord] 📤 Sending {len(audio_bytes)} bytes to cloud...")
+                            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                            
+                            try:
+                                await self.voice_ws.send(json.dumps({
+                                    "type": "audio_chunk",
+                                    "encoding": "base64",
+                                    "data": audio_b64
+                                }))
+                                await self.voice_ws.send(json.dumps({
+                                    "type": "audio_end",
+                                    "encoding": "base64",
+                                    "sampleRate": self.audio_sample_rate
+                                }))
+                                print("[WakeWord] ✅ Audio sent to cloud for processing")
+                            except Exception as e:
+                                if "closed" in str(e).lower() or "connection" in str(e).lower():
+                                    print("[WakeWord] Reconnecting to voice endpoint...")
+                                    await self.connect_voice_websocket()
+                                else:
+                                    print(f"[WakeWord] Error sending audio: {e}")
+                    except Exception as e:
+                        print(f"[WakeWord] Error recording query: {e}")
+                
+                # Small delay before next detection cycle
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                print(f"[WakeWord] Error in detection loop: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(1)
+    
+    async def receive_voice_responses(self):
+        """Receive responses from voice WebSocket (transcripts, AI responses, etc.)."""
+        while self.running:
+            try:
+                if not self.voice_ws:
+                    await asyncio.sleep(1)
+                    continue
+                
+                try:
+                    message = await asyncio.wait_for(self.voice_ws.recv(), timeout=1.0)
+                    data = json.loads(message)
+                    
+                    msg_type = data.get('type', '')
+                    
+                    if msg_type == 'transcript':
+                        transcript = data.get('text', '')
+                        print(f"[Voice] Transcript: {transcript}")
+                        # Check for wake word in transcript
+                        transcript_lower = transcript.lower()
+                        if 'rovy' in transcript_lower and not self.is_recording:
+                            print("[Voice] ✅ Wake word detected in transcript!")
+                            # Extract query after wake word
+                            query = transcript_lower
+                            for wake in ['rovy', 'hey rovy']:
+                                query = query.replace(wake, '').strip()
+                            
+                            # If there's a query after wake word, start recording to capture full query
+                            if query:
+                                print(f"[Voice] Query detected: '{query}', starting full recording...")
+                                await self.record_and_stream_audio(duration=10.0)
+                            else:
+                                # Just wake word, start recording for user's next command
+                                print("[Voice] Wake word only, starting recording for command...")
+                                await self.record_and_stream_audio(duration=10.0)
+                    
+                    elif msg_type == 'response':
+                        response = data.get('text', '')
+                        print(f"[Voice] 🤖 AI Response: {response}")
+                    
+                    elif msg_type == 'status':
+                        status = data.get('message', '')
+                        print(f"[Voice] Status: {status}")
+                    
+                except asyncio.TimeoutError:
+                    continue  # No message, continue waiting
+                except websockets.exceptions.ConnectionClosed:
+                    print("[Voice] Connection closed, reconnecting...")
+                    await self.connect_voice_websocket()
+                except Exception as e:
+                    print(f"[Voice] Error receiving message: {e}")
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                print(f"[Voice] Receive loop error: {e}")
+                await asyncio.sleep(1.0)
     
     def _reinit_oakd(self):
         """Reinitialize OAK-D camera after error."""
@@ -805,7 +1283,7 @@ AUDIO_STATE = {
 
 # Hardware volume mapping
 # Map app volume 0-100% to hardware 0-125 (85% of max 147)
-# This prevents overdrive/clipping at max volume
+# This prevents overdrive/clipping at max volume (USB speaker HK-5008 clips at 100%)
 HW_VOLUME_MAX = 125  # 85% of 147
 
 def detect_audio_card() -> Optional[int]:
@@ -1278,6 +1756,93 @@ async def get_mode():
     return {"mode": "autonomous"}
 
 
+@app.post("/navigation")
+async def control_navigation(command: NavigationCommand):
+    """Control autonomous navigation with OAK-D camera."""
+    robot = get_robot()
+    
+    print(f"[Navigation API] {command.action}")
+    
+    # Import navigator dynamically when needed
+    if not hasattr(robot, 'navigator'):
+        try:
+            import sys
+            import os
+            # Add oakd_navigation to path
+            nav_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'oakd_navigation')
+            if nav_path not in sys.path:
+                sys.path.insert(0, nav_path)
+            
+            from rovy_integration import RovyNavigator
+            robot.navigator = None  # Will be initialized on start
+            print("[Navigation API] Module loaded")
+        except Exception as e:
+            print(f"[Navigation API] Failed to import: {e}")
+            raise HTTPException(status_code=500, detail=f"Navigation not available: {e}")
+    
+    # Handle different navigation actions
+    if command.action == 'start_explore':
+        def start_nav():
+            try:
+                if robot.navigator is None:
+                    from rovy_integration import RovyNavigator
+                    robot.navigator = RovyNavigator(rover_instance=robot.rover)
+                    robot.navigator.start()
+                
+                print(f"[Navigation API] Starting exploration (duration={command.duration})")
+                robot.navigator.explore(duration=command.duration)
+            except Exception as e:
+                print(f"[Navigation API] Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Run navigation in separate thread
+        threading.Thread(target=start_nav, daemon=True).start()
+        return {"status": "started", "action": "explore"}
+    
+    elif command.action == 'stop':
+        if hasattr(robot, 'navigator') and robot.navigator:
+            def stop_nav():
+                try:
+                    robot.navigator.stop()
+                    robot.navigator.cleanup()
+                    robot.navigator = None
+                except Exception as e:
+                    print(f"[Navigation API] Stop error: {e}")
+            
+            threading.Thread(target=stop_nav, daemon=True).start()
+            return {"status": "stopped", "action": "stop"}
+        else:
+            return {"status": "already_stopped"}
+    
+    elif command.action == 'goto':
+        x = command.x
+        y = command.y
+        
+        if x is None or y is None:
+            raise HTTPException(status_code=400, detail="x and y coordinates required for goto")
+        
+        def navigate_to():
+            try:
+                if robot.navigator is None:
+                    from rovy_integration import RovyNavigator
+                    robot.navigator = RovyNavigator(rover_instance=robot.rover)
+                    robot.navigator.start()
+                
+                print(f"[Navigation API] Navigating to ({x}, {y})")
+                robot.navigator.navigate_to(x, y)
+            except Exception as e:
+                print(f"[Navigation API] Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        threading.Thread(target=navigate_to, daemon=True).start()
+        return {"status": "started", "action": "goto", "target": {"x": x, "y": y}}
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {command.action}")
+
+
 @app.post("/speak")
 async def speak_text(request: dict):
     """Speak text using robot's TTS (from cloud AI response) with language support."""
@@ -1332,21 +1897,21 @@ async def speak_text(request: dict):
                 file_size = os.path.getsize(wav_path)
                 print(f"[Speak] Generated {file_size} bytes, playing...")
                 
-                # Use ffplay - more reliable for full playback
-                # -nodisp: no video window, -autoexit: exit when done, -loglevel quiet
+                # Use aplay with correct device - most reliable on Pi
+                # -D specifies the device, plughw:2,0 for USB speaker (Card 2)
                 play_proc = subprocess.run(
-                    ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', wav_path],
+                    ['aplay', '-D', config.SPEAKER_DEVICE, wav_path],
                     capture_output=True,
                     timeout=30
                 )
                 
                 if play_proc.returncode == 0:
-                    print(f"[Speak] Played successfully with ffplay")
+                    print(f"[Speak] Played successfully with aplay on {config.SPEAKER_DEVICE}")
                 else:
-                    # Fallback to pw-play
-                    print(f"[Speak] Trying pw-play...")
-                    subprocess.run(['pw-play', wav_path], capture_output=True, timeout=30)
-                    print(f"[Speak] Played with pw-play fallback")
+                    # Fallback to ffplay (but may not use correct device)
+                    print(f"[Speak] aplay failed, trying ffplay...")
+                    subprocess.run(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', wav_path], capture_output=True, timeout=30)
+                    print(f"[Speak] Played with ffplay fallback")
                 
                 os.unlink(wav_path)
             else:
@@ -1433,9 +1998,11 @@ async def control_music(action: str, request: dict = None):
                     audio_url = result.stdout.strip()
                     print(f"[Music] Found audio, starting playback...")
                     
-                    # Play the audio URL with ffplay
+                    # Play the audio URL with ffmpeg to speaker device
+                    # Use ffmpeg to decode and aplay to output to correct device
                     music_player_process = subprocess.Popen(
-                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_url],
+                        f'ffmpeg -i "{audio_url}" -f wav -ac 2 -ar 44100 - 2>/dev/null | aplay -D {config.SPEAKER_DEVICE} -',
+                        shell=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
@@ -1498,7 +2065,8 @@ async def control_music(action: str, request: dict = None):
                 if result.returncode == 0 and result.stdout.strip():
                     audio_url = result.stdout.strip()
                     music_player_process = subprocess.Popen(
-                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_url],
+                        f'ffmpeg -i "{audio_url}" -f wav -ac 2 -ar 44100 - 2>/dev/null | aplay -D {config.SPEAKER_DEVICE} -',
+                        shell=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
@@ -1537,7 +2105,8 @@ async def control_music(action: str, request: dict = None):
                 if result.returncode == 0 and result.stdout.strip():
                     audio_url = result.stdout.strip()
                     music_player_process = subprocess.Popen(
-                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_url],
+                        f'ffmpeg -i "{audio_url}" -f wav -ac 2 -ar 44100 - 2>/dev/null | aplay -D {config.SPEAKER_DEVICE} -',
+                        shell=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
@@ -1774,6 +2343,9 @@ async def run_robot_server():
     robot_server.init_audio()
     robot_server.init_volume()
     
+    # Initialize wake word detection
+    robot_server.init_wake_word()
+    
     # Try to connect to cloud (non-blocking)
     if WEBSOCKETS_OK:
         if await robot_server.connect_cloud():
@@ -1782,6 +2354,12 @@ async def run_robot_server():
             asyncio.create_task(robot_server.receive_from_cloud())
         else:
             print("[Cloud] Continuing without cloud connection")
+    
+    # Start wake word detection loop in background
+    if robot_server.wake_word_enabled:
+        asyncio.create_task(robot_server.wake_word_detection_loop())
+        # Also start a task to receive responses from voice WebSocket
+        asyncio.create_task(robot_server.receive_voice_responses())
     
     # Keep running
     try:

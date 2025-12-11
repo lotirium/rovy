@@ -994,8 +994,86 @@ async def voice_websocket(websocket: WebSocket):
                                     "text": transcript
                                 })
                                 
-                                # Note: explore command is now handled by the tool system in assistant.ask()
-                                # The tool system will detect "explore" and call explore_robot tool automatically
+                                # Check for navigation commands first
+                                transcript_lower = transcript.lower().strip()
+                                
+                                # Start navigation commands
+                                if ('start' in transcript_lower or 'begin' in transcript_lower) and \
+                                   ('auto' in transcript_lower or 'autonomous' in transcript_lower) and \
+                                   'navigation' in transcript_lower:
+                                    LOGGER.info(f"🤖 Auto navigation command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "start_explore", "duration": None}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Starting autonomous navigation. I will explore and avoid obstacles."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Navigation command failed: {nav_error}")
+                                
+                                # Start explore commands
+                                if ('start' in transcript_lower or 'begin' in transcript_lower) and 'explor' in transcript_lower:
+                                    LOGGER.info(f"🤖 Explore command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "start_explore", "duration": None}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Starting exploration mode."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Exploration command failed: {nav_error}")
+                                
+                                # Stop navigation commands
+                                if ('stop' in transcript_lower or 'end' in transcript_lower) and \
+                                   ('navigation' in transcript_lower or 'explor' in transcript_lower):
+                                    LOGGER.info(f"🛑 Stop navigation command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "stop"}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Stopping navigation."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Stop navigation command failed: {nav_error}")
                                 
                                 # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
