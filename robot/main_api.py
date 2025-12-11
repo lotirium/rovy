@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import subprocess
+import random
 from datetime import datetime
 from typing import Optional
 from io import BytesIO
@@ -143,11 +144,6 @@ class NavigationCommand(BaseModel):
     x: Optional[float] = None
     y: Optional[float] = None
 
-class MeetingRecordingCommand(BaseModel):
-    action: str  # start, stop
-    title: Optional[str] = None
-    meeting_type: str = "meeting"  # meeting, lecture, conversation, note
-
 
 # ==============================================================================
 # Robot Client with API
@@ -191,13 +187,6 @@ class RobotServer:
         
         # Navigation state (for USB bandwidth management)
         self.is_navigating = False  # True when OAK-D navigation is active
-        
-        # Meeting recording state
-        self.is_recording_meeting = False
-        self.meeting_start_time = None
-        self.meeting_audio_chunks = []
-        self.meeting_title = None
-        self.meeting_type = "meeting"
         
         print("=" * 60)
         print("  ROVY ROBOT SERVER")
@@ -360,6 +349,12 @@ class RobotServer:
                 import os
                 
                 self.is_speaking = True  # Pause wake word detection
+                # Pause wake word detector audio stream to release device
+                if hasattr(self, 'wake_word_detector') and self.wake_word_detector:
+                    try:
+                        self.wake_word_detector.pause()
+                    except:
+                        pass
                 print(f"[WakeWord] Playing acknowledgment: '{text}'")
                 piper_voice = config.PIPER_VOICES.get("en")
                 if not os.path.exists(piper_voice):
@@ -403,6 +398,12 @@ class RobotServer:
                 import time
                 time.sleep(0.5)
                 self.is_speaking = False  # Resume wake word detection
+                # Resume wake word detector audio stream
+                if hasattr(self, 'wake_word_detector') and self.wake_word_detector:
+                    try:
+                        self.wake_word_detector.resume()
+                    except:
+                        pass
         
         # Run in background thread
         threading.Thread(target=do_speak, daemon=True).start()
@@ -450,9 +451,22 @@ class RobotServer:
             voice_ws_url = f"{voice_ws_url}/voice"
             
             print(f"[Voice] Connecting to {voice_ws_url}...")
-            self.voice_ws = await websockets.connect(voice_ws_url)
+            # Add connection timeout to prevent hanging
+            self.voice_ws = await asyncio.wait_for(
+                websockets.connect(
+                    voice_ws_url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=5
+                ),
+                timeout=10.0
+            )
             print("[Voice] Connected to cloud voice endpoint")
             return True
+        except asyncio.TimeoutError:
+            print(f"[Voice] Connection timeout")
+            self.voice_ws = None
+            return False
         except Exception as e:
             print(f"[Voice] Connection failed: {e}")
             self.voice_ws = None
@@ -503,10 +517,6 @@ class RobotServer:
                 try:
                     audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
                     energy = self.calculate_audio_energy(audio_data)
-                    
-                    # If meeting recording is active, save original audio chunk
-                    if self.is_recording_meeting:
-                        self.meeting_audio_chunks.append(audio_data)
                     
                     # Check for silence
                     if energy < silence_threshold:
@@ -662,8 +672,14 @@ class RobotServer:
         await self.connect_voice_websocket()
         
         print("[WakeWord] 👂 Starting cloud-based wake word detection (Silero VAD + Cloud Whisper)...")
+        last_health_check = time.time()
         
         while self.running and not self.is_recording:
+            # Health check
+            now = time.time()
+            if now - last_health_check > 60:
+                print(f"[WakeWord] Health check: loop running normally")
+                last_health_check = now
             try:
                 # Skip detection if robot is speaking (prevent hearing own voice)
                 if self.is_speaking:
@@ -767,47 +783,16 @@ class RobotServer:
                 traceback.print_exc()
                 await asyncio.sleep(1)
     
-    async def continuous_meeting_recording(self):
-        """Continuously record audio for meeting while is_recording_meeting is True."""
-        if not AUDIO_OK or not self.pyaudio or self.audio_device_index is None:
-            print("[Meeting] Audio not available")
-            return
-        
-        print("[Meeting] Starting continuous audio recording...")
-        
-        try:
-            stream = self.pyaudio.open(
-                format=pyaudio.paInt16,
-                channels=config.CHANNELS,
-                rate=self.audio_sample_rate,
-                input=True,
-                input_device_index=self.audio_device_index,
-                frames_per_buffer=config.CHUNK_SIZE
-            )
-            
-            while self.running and self.is_recording_meeting:
-                try:
-                    audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
-                    # Store raw audio chunk for meeting
-                    self.meeting_audio_chunks.append(audio_data)
-                    
-                    # Small delay to prevent CPU overload
-                    await asyncio.sleep(0.01)
-                    
-                except Exception as e:
-                    print(f"[Meeting] Recording error: {e}")
-                    break
-            
-            stream.stop_stream()
-            stream.close()
-            print("[Meeting] Stopped continuous recording")
-            
-        except Exception as e:
-            print(f"[Meeting] Recording failed: {e}")
-    
     async def receive_voice_responses(self):
         """Receive responses from voice WebSocket (transcripts, AI responses, etc.)."""
+        last_health_check = time.time()
+        
         while self.running:
+            # Health check
+            now = time.time()
+            if now - last_health_check > 60:
+                print(f"[Voice Receive] Health check: loop running normally")
+                last_health_check = now
             try:
                 if not self.voice_ws:
                     await asyncio.sleep(1)
@@ -1052,11 +1037,14 @@ class RobotServer:
             try:
                 # Get the latest frame (drop old ones if queue has multiple)
                 frame_data = None
-                while True:
+                max_drain = 10  # Prevent infinite loop - max 10 frames to drain
+                drain_count = 0
+                while drain_count < max_drain:
                     new_frame = self.oakd_queue.tryGet()
                     if new_frame is None:
                         break
                     frame_data = new_frame  # Keep the latest frame
+                    drain_count += 1
                 
                 if frame_data is not None:
                     frame = frame_data.getCvFrame()
@@ -1107,18 +1095,25 @@ class RobotServer:
         """Connect to cloud PC server via WebSocket."""
         if not WEBSOCKETS_OK:
             print("[Cloud] WebSocket not available, skipping cloud connection")
-            return
+            return False
         
         attempt = 0
-        while self.running:
+        max_attempts = config.MAX_RECONNECT_ATTEMPTS if config.MAX_RECONNECT_ATTEMPTS > 0 else 5
+        
+        while self.running and attempt < max_attempts:
             attempt += 1
             try:
-                print(f"[Cloud] Connecting to {config.SERVER_URL} (attempt {attempt})...")
+                print(f"[Cloud] Connecting to {config.SERVER_URL} (attempt {attempt}/{max_attempts})...")
                 
-                self.ws = await websockets.connect(
-                    config.SERVER_URL,
-                    ping_interval=30,
-                    ping_timeout=10
+                # Add connection timeout to prevent hanging
+                self.ws = await asyncio.wait_for(
+                    websockets.connect(
+                        config.SERVER_URL,
+                        ping_interval=30,
+                        ping_timeout=10,
+                        close_timeout=5
+                    ),
+                    timeout=10.0
                 )
                 
                 print("[Cloud] Connected!")
@@ -1133,15 +1128,15 @@ class RobotServer:
                 
                 return True
                 
+            except asyncio.TimeoutError:
+                print(f"[Cloud] Connection timeout (attempt {attempt}/{max_attempts})")
             except Exception as e:
                 print(f"[Cloud] Connection failed: {e}")
-                
-                if config.MAX_RECONNECT_ATTEMPTS > 0 and attempt >= config.MAX_RECONNECT_ATTEMPTS:
-                    print("[Cloud] Max reconnect attempts reached, continuing without cloud")
-                    return False
-                
+            
+            if attempt < max_attempts:
                 await asyncio.sleep(config.RECONNECT_DELAY)
         
+        print("[Cloud] Could not connect after max attempts, continuing without cloud")
         return False
     
     async def detect_gesture_from_frame(self, image_bytes: bytes):
@@ -1233,24 +1228,34 @@ class RobotServer:
         last_image_time = 0
         last_sensor_time = 0
         last_gesture_time = 0
+        last_health_check = time.time()
         
         while self.running and self.ws:
+            # Health check - detect if loop is hanging
+            now = time.time()
+            if now - last_health_check > 30:
+                print(f"[Cloud Stream] Health check: loop running normally")
+                last_health_check = now
             try:
                 now = time.time()
                 
                 # Send image periodically - use USB camera for cloud streaming
                 if CAMERA_OK and self.usb_camera and (now - last_image_time) >= image_interval:
-                    ret, frame = self.usb_camera.read()
-                    if ret and frame is not None:
-                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
-                        image_bytes = buffer.tobytes()
-                        await self.ws.send(json.dumps({
-                            "type": "image_data",
-                            "image_base64": base64.b64encode(image_bytes).decode('utf-8'),
-                            "width": config.CAMERA_WIDTH,
-                            "height": config.CAMERA_HEIGHT,
-                            "timestamp": datetime.utcnow().isoformat()
-                        }))
+                    try:
+                        ret, frame = self.usb_camera.read()
+                        if ret and frame is not None:
+                            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
+                            image_bytes = buffer.tobytes()
+                            await self.ws.send(json.dumps({
+                                "type": "image_data",
+                                "image_base64": base64.b64encode(image_bytes).decode('utf-8'),
+                                "width": config.CAMERA_WIDTH,
+                                "height": config.CAMERA_HEIGHT,
+                                "timestamp": datetime.now(datetime.UTC).isoformat()
+                            }))
+                    except Exception as e:
+                        print(f"[Cloud Stream] Camera error: {e}")
+                        # Continue anyway - don't crash the whole loop
                     last_image_time = now
                 
                 # Gesture detection DISABLED in cloud streaming - only enable on-demand
@@ -1265,7 +1270,7 @@ class RobotServer:
                             "battery_voltage": status.get('voltage'),
                             "battery_percent": self.rover.voltage_to_percent(status.get('voltage')),
                             "temperature": status.get('temperature'),
-                            "timestamp": datetime.utcnow().isoformat()
+                            "timestamp": datetime.now(datetime.UTC).isoformat()
                         }))
                     last_sensor_time = now
                 
@@ -1284,8 +1289,15 @@ class RobotServer:
             return
         
         print("[Cloud Receive] Starting...")
+        last_health_check = time.time()
         
         while self.running and self.ws:
+            # Health check
+            now = time.time()
+            if now - last_health_check > 30:
+                print(f"[Cloud Receive] Health check: loop running normally")
+                last_health_check = now
+            
             try:
                 message = await asyncio.wait_for(self.ws.recv(), timeout=1.0)
                 msg = json.loads(message)
@@ -1683,25 +1695,31 @@ async def camera_websocket(websocket: WebSocket):
                 continue
             
             # Capture directly from USB camera
-            ret, frame = robot.usb_camera.read()
-            if ret and frame is not None:
-                # Encode to JPEG
-                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
-                image_bytes = buffer.tobytes()
-                
-                consecutive_failures = 0  # Reset on success
-                await websocket.send_json({
-                    "frame": base64.b64encode(image_bytes).decode('utf-8'),
-                    "timestamp": time.time(),
-                    "gesture": robot.current_gesture,
-                    "gesture_confidence": robot.gesture_confidence
-                })
-            else:
+            try:
+                ret, frame = robot.usb_camera.read()
+                if ret and frame is not None:
+                    # Encode to JPEG
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
+                    image_bytes = buffer.tobytes()
+                    
+                    consecutive_failures = 0  # Reset on success
+                    await websocket.send_json({
+                        "frame": base64.b64encode(image_bytes).decode('utf-8'),
+                        "timestamp": time.time(),
+                        "gesture": robot.current_gesture,
+                        "gesture_confidence": robot.gesture_confidence
+                    })
+                else:
+                    consecutive_failures += 1
+            except Exception as cam_err:
+                print(f"[API] Camera capture error: {cam_err}")
                 consecutive_failures += 1
-                if consecutive_failures >= max_failures:
-                    print(f"[API] Camera stream failed {max_failures} times, closing connection")
-                    await websocket.close(code=1011, reason="Camera capture failed")
-                    break
+            
+            if consecutive_failures >= max_failures:
+                print(f"[API] Camera stream failed {max_failures} times, closing connection")
+                await websocket.close(code=1011, reason="Camera capture failed")
+                break
+            elif consecutive_failures > 0:
                 # Add small delay on failure to avoid tight loop
                 await asyncio.sleep(0.1)
             
@@ -2012,6 +2030,12 @@ async def speak_text(request: dict):
             import os
             
             robot.is_speaking = True  # Pause wake word detection
+            # Pause wake word detector audio stream to release device
+            if hasattr(robot, 'wake_word_detector') and robot.wake_word_detector:
+                try:
+                    robot.wake_word_detector.pause()
+                except:
+                    pass
             
             # Select Piper voice based on language
             piper_voice = config.PIPER_VOICES.get(language, config.PIPER_VOICES.get("en"))
@@ -2075,6 +2099,12 @@ async def speak_text(request: dict):
             import time
             time.sleep(0.5)
             robot.is_speaking = False  # Resume wake word detection
+            # Resume wake word detector audio stream
+            if hasattr(robot, 'wake_word_detector') and robot.wake_word_detector:
+                try:
+                    robot.wake_word_detector.resume()
+                except:
+                    pass
     
     # Start speaking in background
     threading.Thread(target=do_speak, daemon=True).start()
@@ -2101,7 +2131,10 @@ async def trigger_dance(request: dict):
     style = request.get("style", "party")
     duration = request.get("duration", 10)
     with_music = request.get("with_music", False)
-    music_genre = request.get("music_genre", "dance")
+    
+    # Randomly select music genre every time when music is enabled
+    valid_genres = ['dance', 'party', 'classical', 'jazz', 'rock', 'pop', 'chill', 'electronic', 'fun']
+    music_genre = random.choice(valid_genres) if with_music else "dance"
     
     # Validate style
     valid_styles = ['party', 'wiggle', 'spin']
@@ -2370,14 +2403,22 @@ async def control_music(action: str, request: dict = None):
                     try:
                         os.killpg(os.getpgid(music_player_process.pid), signal.SIGTERM)
                     except:
-                        music_player_process.terminate()
+                        try:
+                            music_player_process.terminate()
+                        except:
+                            pass
                     try:
-                        music_player_process.wait(timeout=2)
-                    except:
+                        music_player_process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
                         try:
                             os.killpg(os.getpgid(music_player_process.pid), signal.SIGKILL)
                         except:
-                            music_player_process.kill()
+                            try:
+                                music_player_process.kill()
+                            except:
+                                pass
+                    except:
+                        pass
                 
                 # Determine search query
                 if query:
@@ -2440,17 +2481,31 @@ async def control_music(action: str, request: dict = None):
                     # Kill the entire process group to stop all child processes (ffmpeg, aplay, etc.)
                     try:
                         os.killpg(os.getpgid(music_player_process.pid), signal.SIGTERM)
-                    except:
+                    except Exception as e:
                         # Fallback to regular terminate if process group kill fails
-                        music_player_process.terminate()
+                        try:
+                            music_player_process.terminate()
+                        except:
+                            pass
+                    
+                    # Non-blocking wait with timeout - don't hang if process won't die
                     try:
-                        music_player_process.wait(timeout=2)
-                    except:
-                        # Force kill if it doesn't stop
+                        music_player_process.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        # Force kill if it doesn't stop quickly
+                        print(f"[Music] Process didn't stop, force killing...")
                         try:
                             os.killpg(os.getpgid(music_player_process.pid), signal.SIGKILL)
                         except:
-                            music_player_process.kill()
+                            try:
+                                music_player_process.kill()
+                            except:
+                                pass
+                        # Don't wait again - just move on
+                        print(f"[Music] Force killed, continuing...")
+                    except Exception as e:
+                        print(f"[Music] Error during stop: {e}")
+                    
                     music_paused = False
                     print(f"[Music] ✅ Stopped")
                 else:
@@ -2470,14 +2525,22 @@ async def control_music(action: str, request: dict = None):
                     try:
                         os.killpg(os.getpgid(music_player_process.pid), signal.SIGTERM)
                     except:
-                        music_player_process.terminate()
+                        try:
+                            music_player_process.terminate()
+                        except:
+                            pass
                     try:
-                        music_player_process.wait(timeout=2)
-                    except:
+                        music_player_process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
                         try:
                             os.killpg(os.getpgid(music_player_process.pid), signal.SIGKILL)
                         except:
-                            music_player_process.kill()
+                            try:
+                                music_player_process.kill()
+                            except:
+                                pass
+                    except:
+                        pass
                 
                 music_paused = False
                 music_track_index += 1  # Increment to get next track
@@ -2523,14 +2586,22 @@ async def control_music(action: str, request: dict = None):
                     try:
                         os.killpg(os.getpgid(music_player_process.pid), signal.SIGTERM)
                     except:
-                        music_player_process.terminate()
+                        try:
+                            music_player_process.terminate()
+                        except:
+                            pass
                     try:
-                        music_player_process.wait(timeout=2)
-                    except:
+                        music_player_process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
                         try:
                             os.killpg(os.getpgid(music_player_process.pid), signal.SIGKILL)
                         except:
-                            music_player_process.kill()
+                            try:
+                                music_player_process.kill()
+                            except:
+                                pass
+                    except:
+                        pass
                 
                 music_paused = False
                 music_track_index = max(0, music_track_index - 1)  # Decrement to get previous track
@@ -2773,159 +2844,6 @@ async def set_volume(command: VolumeCommand):
     }
 
 
-@app.post("/meeting/record")
-async def meeting_record(cmd: MeetingRecordingCommand):
-    """Start or stop meeting recording.
-    
-    Actions:
-    - start: Start recording meeting audio
-    - stop: Stop recording and send to cloud for transcription/summarization
-    """
-    robot = get_robot()
-    
-    if cmd.action == "start":
-        if robot.is_recording_meeting:
-            return {"status": "already_recording", "message": "Meeting recording already in progress"}
-        
-        # Start recording
-        robot.is_recording_meeting = True
-        robot.meeting_start_time = time.time()
-        robot.meeting_audio_chunks = []
-        robot.meeting_title = cmd.title
-        robot.meeting_type = cmd.meeting_type
-        
-        # Start background recording task
-        asyncio.create_task(robot.continuous_meeting_recording())
-        
-        print(f"[Meeting] Started recording: {cmd.title or 'Untitled'} ({cmd.meeting_type})")
-        
-        return {
-            "status": "started",
-            "message": "Meeting recording started",
-            "start_time": robot.meeting_start_time
-        }
-    
-    elif cmd.action == "stop":
-        if not robot.is_recording_meeting:
-            return {"status": "not_recording", "message": "No meeting recording in progress"}
-        
-        # Stop recording
-        robot.is_recording_meeting = False
-        duration = time.time() - robot.meeting_start_time if robot.meeting_start_time else 0
-        
-        print(f"[Meeting] Stopped recording after {duration:.1f}s, uploading to cloud...")
-        
-        # Combine audio chunks
-        if not robot.meeting_audio_chunks:
-            return {
-                "status": "error",
-                "message": "No audio recorded"
-            }
-        
-        try:
-            # Combine chunks into single audio file
-            import wave
-            import tempfile
-            import os
-            
-            # Create temporary WAV file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                wav_path = temp_file.name
-            
-            # Write audio chunks to WAV file
-            with wave.open(wav_path, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(robot.audio_sample_rate)
-                
-                # Combine all chunks
-                for chunk in robot.meeting_audio_chunks:
-                    wav_file.writeframes(chunk)
-            
-            # Read the complete WAV file
-            with open(wav_path, 'rb') as f:
-                audio_bytes = f.read()
-            
-            # Clean up temp file
-            os.unlink(wav_path)
-            
-            # Send to cloud for processing
-            import httpx
-            
-            cloud_url = config.CLOUD_API_URL.replace('/ws', '') if hasattr(config, 'CLOUD_API_URL') else "http://100.72.107.106:8001"
-            upload_url = f"{cloud_url}/meetings/upload"
-            
-            print(f"[Meeting] Uploading {len(audio_bytes)} bytes to {upload_url}")
-            
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                files = {
-                    'audio': ('meeting.wav', audio_bytes, 'audio/wav')
-                }
-                data = {
-                    'title': robot.meeting_title or f"Meeting - {datetime.now().strftime('%b %d, %Y %I:%M %p')}",
-                    'meeting_type': robot.meeting_type
-                }
-                
-                response = await client.post(upload_url, files=files, data=data)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    print(f"[Meeting] ✅ Upload successful: {result.get('meeting_id')}")
-                    
-                    # Clear recording state
-                    robot.meeting_audio_chunks = []
-                    robot.meeting_start_time = None
-                    robot.meeting_title = None
-                    
-                    return {
-                        "status": "success",
-                        "message": "Meeting recorded and uploaded successfully",
-                        "duration": duration,
-                        "meeting_id": result.get('meeting_id')
-                    }
-                else:
-                    print(f"[Meeting] ⚠️  Upload failed: {response.status_code} - {response.text}")
-                    return {
-                        "status": "error",
-                        "message": f"Upload failed: {response.status_code}"
-                    }
-        
-        except Exception as e:
-            print(f"[Meeting] Error processing recording: {e}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "status": "error",
-                "message": f"Failed to process recording: {str(e)}"
-            }
-    
-    else:
-        raise HTTPException(status_code=400, detail=f"Invalid action: {cmd.action}")
-
-
-@app.get("/meeting/status")
-async def meeting_status():
-    """Get current meeting recording status."""
-    robot = get_robot()
-    
-    if robot.is_recording_meeting:
-        duration = time.time() - robot.meeting_start_time if robot.meeting_start_time else 0
-        return {
-            "is_recording": True,
-            "started_at": datetime.fromtimestamp(robot.meeting_start_time).isoformat() if robot.meeting_start_time else None,
-            "duration": duration,
-            "title": robot.meeting_title,
-            "type": robot.meeting_type,
-            "chunks_recorded": len(robot.meeting_audio_chunks)
-        }
-    else:
-        return {
-            "is_recording": False,
-            "started_at": None,
-            "duration": 0
-        }
-
-
 # ==============================================================================
 # Main Server Startup
 # ==============================================================================
@@ -2937,35 +2855,61 @@ async def run_robot_server():
     robot_server = RobotServer()
     robot_server.running = True
     
-    # Initialize hardware
-    robot_server.init_rover()
-    robot_server.init_camera()
-    robot_server.init_audio()
-    robot_server.init_volume()
-    
-    # Initialize wake word detection
-    robot_server.init_wake_word()
-    
-    # Try to connect to cloud (non-blocking)
-    if WEBSOCKETS_OK:
-        if await robot_server.connect_cloud():
-            # Run cloud streaming in background
-            asyncio.create_task(robot_server.stream_to_cloud())
-            asyncio.create_task(robot_server.receive_from_cloud())
-        else:
-            print("[Cloud] Continuing without cloud connection")
-    
-    # Start wake word detection loop in background
-    if robot_server.wake_word_enabled:
-        asyncio.create_task(robot_server.wake_word_detection_loop())
-        # Also start a task to receive responses from voice WebSocket
-        asyncio.create_task(robot_server.receive_voice_responses())
-    
-    # Keep running
     try:
-        while robot_server.running:
-            await asyncio.sleep(1)
-    except:
+        # Initialize hardware
+        robot_server.init_rover()
+        robot_server.init_camera()
+        robot_server.init_audio()
+        robot_server.init_volume()
+        
+        # Initialize wake word detection
+        robot_server.init_wake_word()
+        
+        # Try to connect to cloud (non-blocking)
+        if WEBSOCKETS_OK:
+            if await robot_server.connect_cloud():
+                # Run cloud streaming in background
+                asyncio.create_task(robot_server.stream_to_cloud())
+                asyncio.create_task(robot_server.receive_from_cloud())
+            else:
+                print("[Cloud] Continuing without cloud connection")
+        
+        # Start wake word detection loop in background
+        if robot_server.wake_word_enabled:
+            asyncio.create_task(robot_server.wake_word_detection_loop())
+            # Also start a task to receive responses from voice WebSocket
+            asyncio.create_task(robot_server.receive_voice_responses())
+        
+        # Keep running with health monitoring
+        last_health_log = time.time()
+        last_watchdog_notify = time.time()
+        try:
+            while robot_server.running:
+                await asyncio.sleep(1)
+                
+                now = time.time()
+                
+                # Notify systemd watchdog every 60 seconds (watchdog timeout is 120s)
+                if now - last_watchdog_notify > 60:
+                    try:
+                        import systemd.daemon
+                        systemd.daemon.notify('WATCHDOG=1')
+                        last_watchdog_notify = now
+                    except:
+                        pass
+                
+                # Log health status every 5 minutes to show service is alive
+                if now - last_health_log > 300:
+                    print(f"[Health] Service running normally - uptime: {int(now - last_health_log)}s")
+                    last_health_log = now
+        except KeyboardInterrupt:
+            print("[Main] Keyboard interrupt received")
+        except Exception as e:
+            print(f"[Main] Error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+    finally:
+        print("[Main] Cleaning up...")
         robot_server.cleanup()
 
 

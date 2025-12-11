@@ -306,15 +306,26 @@ class CloudWakeWordDetector:
             else:
                 chunk_samples = required_samples_after_resample
             
-            # Open audio stream
-            self.stream = self.pyaudio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.device_sample_rate,
-                input=True,
-                input_device_index=self.device_index,
-                frames_per_buffer=chunk_samples
-            )
+            # Open audio stream with retry logic
+            max_retries = 3
+            for retry in range(max_retries):
+                try:
+                    self.stream = self.pyaudio.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=self.device_sample_rate,
+                        input=True,
+                        input_device_index=self.device_index,
+                        frames_per_buffer=chunk_samples
+                    )
+                    break  # Success
+                except Exception as e:
+                    logger.error(f"Failed to open audio stream (attempt {retry+1}/{max_retries}): {e}")
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(1.0)  # Wait before retry
+                    else:
+                        logger.error("Could not open audio stream after retries")
+                        return False
             
             # Buffer for collecting speech
             speech_buffer = []
@@ -330,9 +341,23 @@ class CloudWakeWordDetector:
                     logger.info("⏱️ Wake word detection timeout")
                     return False
                 
-                # Read audio chunk (non-blocking with small delay)
+                # Read audio chunk (non-blocking with timeout protection)
                 try:
-                    audio_bytes = self.stream.read(chunk_samples, exception_on_overflow=False)
+                    # Wrap blocking read in asyncio.to_thread with timeout to prevent hanging
+                    try:
+                        audio_bytes = await asyncio.wait_for(
+                            asyncio.to_thread(self.stream.read, chunk_samples, False),
+                            timeout=2.0  # Max 2 seconds per read
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("Audio read timeout - device may be busy, retrying...")
+                        await asyncio.sleep(0.5)
+                        continue
+                    except Exception as read_error:
+                        logger.error(f"Audio read error: {read_error}, retrying...")
+                        await asyncio.sleep(0.5)
+                        continue
+                    
                     audio_chunk = np.frombuffer(audio_bytes, dtype=np.int16)
                     
                     # Detect speech with VAD
@@ -374,21 +399,29 @@ class CloudWakeWordDetector:
                                 if speech_duration >= self.min_speech_duration:
                                     logger.info(f"🎤 Processing speech ({speech_duration:.2f}s) via cloud...")
                                     
-                                    # Transcribe via cloud
-                                    audio_data = np.concatenate(speech_buffer)
-                                    text = await self._transcribe_cloud(audio_data)
-                                    
-                                    if text:
-                                        logger.info(f"📝 Heard: '{text}'")
+                                    # Transcribe via cloud with timeout protection
+                                    try:
+                                        audio_data = np.concatenate(speech_buffer)
+                                        text = await asyncio.wait_for(
+                                            self._transcribe_cloud(audio_data),
+                                            timeout=10.0  # Max 10s for transcription
+                                        )
                                         
-                                        # Check for wake word
-                                        if self._check_wake_word(text):
-                                            logger.info(f"✅ Wake word detected!")
+                                        if text:
+                                            logger.info(f"📝 Heard: '{text}'")
                                             
-                                            if callback:
-                                                callback(text)
-                                            
-                                            return True
+                                            # Check for wake word
+                                            if self._check_wake_word(text):
+                                                logger.info(f"✅ Wake word detected!")
+                                                
+                                                if callback:
+                                                    callback(text)
+                                                
+                                                return True
+                                    except asyncio.TimeoutError:
+                                        logger.warning("Cloud transcription timeout")
+                                    except Exception as trans_error:
+                                        logger.error(f"Transcription error: {trans_error}")
                                 
                                 # Reset
                                 is_speaking = False
@@ -408,9 +441,16 @@ class CloudWakeWordDetector:
             return False
         
         finally:
+            self.running = False
             if self.stream:
-                self.stream.stop_stream()
-                self.stream.close()
+                try:
+                    self.stream.stop_stream()
+                except Exception as e:
+                    logger.error(f"Error stopping stream: {e}")
+                try:
+                    self.stream.close()
+                except Exception as e:
+                    logger.error(f"Error closing stream: {e}")
                 self.stream = None
     
     def stop(self):
@@ -419,9 +459,33 @@ class CloudWakeWordDetector:
         self.running = False
         
         if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
+            try:
+                self.stream.stop_stream()
+            except:
+                pass
+            try:
+                self.stream.close()
+            except:
+                pass
             self.stream = None
+    
+    def pause(self):
+        """Pause wake word detection temporarily (e.g., during speech/music)."""
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                logger.debug("Wake word detector paused")
+            except Exception as e:
+                logger.error(f"Error pausing stream: {e}")
+    
+    def resume(self):
+        """Resume wake word detection after pause."""
+        if self.stream:
+            try:
+                self.stream.start_stream()
+                logger.debug("Wake word detector resumed")
+            except Exception as e:
+                logger.error(f"Error resuming stream: {e}")
     
     def cleanup(self):
         """Clean up resources."""

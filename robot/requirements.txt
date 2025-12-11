@@ -36,3 +36,6 @@ faster-whisper>=0.10.0  # Optimized Whisper for CPU inference
 torch>=2.0.0  # Required for Silero VAD
 torchaudio>=2.0.0  # Required for Silero VAD
 
+# Systemd integration for watchdog notifications
+systemd-python>=235
+
