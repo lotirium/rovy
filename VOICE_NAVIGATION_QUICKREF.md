@@ -23,8 +23,6 @@
 |---------|-------------|
 | "Hey Rovy, **start auto navigation**" | Begin autonomous exploration with obstacle avoidance |
 | "Hey Rovy, **start exploring**" | Same as above - starts exploration mode |
-| "Hey Rovy, **come to me**" | Detect and navigate to you (uses person detection) |
-| "Hey Rovy, **come here**" | Same as above - robot comes to your location |
 | "Hey Rovy, **stop navigation**" | Stop autonomous navigation and return to manual control |
 | "Hey Rovy, **stop exploring**" | Stop exploration mode |
 
@@ -51,17 +49,7 @@
 - ✅ **Speed Control**: Max 0.4 m/s (safe indoor speed)
 - ✅ **Emergency Stop**: Immediate halt on critical obstacles
 - ✅ **Autonomous Turning**: Explores new directions when blocked
-- ✅ **Person Detection**: MobileNet-SSD neural network (come to me)
 - ✅ **Status Display**: Real-time info on OLED
-
-### Come to Me Feature:
-
-When you say "come to me", the robot will:
-1. 🔍 Scan for a person using OAK-D camera (5 seconds)
-2. 📍 Detect your position (distance + angle)
-3. 🔄 Turn to face you
-4. 🚶 Navigate to you with obstacle avoidance
-5. 🛑 Stop 0.8m (2.6 feet) away for safety
 
 ## System Requirements
 
@@ -169,7 +157,6 @@ When you say "come to me", the robot will:
 
 ## Example Session
 
-### Example 1: Exploration
 ```
 [Robot starts, connects to cloud server]
 
@@ -193,29 +180,6 @@ Rovy: "Stopping navigation."
 [Robot stops, navigation system shuts down]
 ```
 
-### Example 2: Come to Me
-```
-[Robot is across the room]
-
-You: "Hey Rovy"
-Rovy: "Yes?"
-
-You: "Come to me"
-Rovy: "I'm coming to you! Looking for you now..."
-
-[Robot's camera activates, scans for person]
-[OLED displays: "COME TO ME", "Looking for", "person..."]
-
-[Person detected at 2.5m, 15° to the right]
-[OLED displays: "Person: 2.5m", "Angle: 15°", "Approaching..."]
-
-[Robot turns 15° to face you]
-[Robot moves forward 1.7m with obstacle avoidance]
-[Robot stops 0.8m away from you]
-
-[OLED displays: "COME TO ME", "Arrived!", "", ""]
-```
-
 ## Testing
 
 ### Test Wake Word:
@@ -237,21 +201,6 @@ python rovy_integration.py
 # On Raspberry Pi
 cd oakd_navigation
 python debug_depth.py
-```
-
-### Test Person Detection:
-```bash
-# On Raspberry Pi
-cd oakd_navigation
-python person_detector.py
-# Stand in front of camera - should show your distance and angle
-```
-
-### Test "Come to Me" Feature:
-```bash
-# On Raspberry Pi
-python test_come_to_me.py
-# Comprehensive test of person detection + navigation
 ```
 
 ## Performance Tips

@@ -1835,37 +1835,6 @@ async def control_navigation(command: NavigationCommand):
         threading.Thread(target=start_nav, daemon=True).start()
         return {"status": "started", "action": "explore"}
     
-    elif command.action == 'come_to_me':
-        def come_to_person():
-            try:
-                robot.is_navigating = True  # Pause USB camera to avoid bandwidth contention
-                print("[Navigation API] USB camera paused (OAK-D person detection active)")
-                
-                if robot.navigator is None:
-                    from rovy_integration import RovyNavigator
-                    robot.navigator = RovyNavigator(rover_instance=robot.rover)
-                    robot.navigator.start()
-                
-                print("[Navigation API] Starting 'come to me' command")
-                success = robot.navigator.come_to_person(max_approach_distance=0.8)
-                
-                if success:
-                    print("[Navigation API] ✅ Successfully came to person!")
-                else:
-                    print("[Navigation API] ❌ Failed to come to person")
-                    
-            except Exception as e:
-                print(f"[Navigation API] Come to me error: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                robot.is_navigating = False  # Resume USB camera
-                print("[Navigation API] USB camera resumed")
-        
-        # Run navigation in separate thread
-        threading.Thread(target=come_to_person, daemon=True).start()
-        return {"status": "started", "action": "come_to_me"}
-    
     elif command.action == 'stop':
         if hasattr(robot, 'navigator') and robot.navigator:
             def stop_nav():

@@ -997,32 +997,6 @@ async def voice_websocket(websocket: WebSocket):
                                 # Check for navigation commands first
                                 transcript_lower = transcript.lower().strip()
                                 
-                                # Check for "come to me" / "come here" commands FIRST
-                                if 'come' in transcript_lower:
-                                    if 'to me' in transcript_lower or 'here' in transcript_lower or 'to you' in transcript_lower or 'come to' in transcript_lower:
-                                        LOGGER.info(f"🧍 Come to me command detected: '{transcript}'")
-                                        try:
-                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
-                                            nav_url = f"http://{pi_ip}:8000/navigation"
-                                            async with httpx.AsyncClient(timeout=5.0) as client:
-                                                nav_response = await client.post(
-                                                    nav_url,
-                                                    json={"action": "come_to_me"}
-                                                )
-                                                if nav_response.status_code == 200:
-                                                    response_text = "I'm coming to you! Looking for you now..."
-                                                    await websocket.send_json({
-                                                        "type": "response",
-                                                        "text": response_text
-                                                    })
-                                                    # Send TTS
-                                                    pi_url = f"http://{pi_ip}:8000/speak"
-                                                    async with httpx.AsyncClient(timeout=10.0) as tts_client:
-                                                        await tts_client.post(pi_url, json={"text": response_text})
-                                                    continue
-                                        except Exception as nav_error:
-                                            LOGGER.error(f"Come to me command failed: {nav_error}")
-                                
                                 # Start navigation commands
                                 if ('start' in transcript_lower or 'begin' in transcript_lower) and \
                                    ('auto' in transcript_lower or 'autonomous' in transcript_lower) and \

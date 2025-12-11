@@ -491,30 +491,6 @@ class RovyClient:
                     traceback.print_exc()
             
             threading.Thread(target=navigate_to, daemon=True).start()
-        
-        elif action == 'come_to_me':
-            def come_to_person():
-                try:
-                    if self.navigator is None:
-                        from rovy_integration import RovyNavigator
-                        # Pass existing rover instance to avoid serial port conflict
-                        self.navigator = RovyNavigator(rover_instance=self.rover)
-                        self.navigator.start()
-                    
-                    print("[Navigation] Starting 'come to me' command")
-                    success = self.navigator.come_to_person(max_approach_distance=0.8)
-                    
-                    if success:
-                        print("[Navigation] ✅ Successfully came to person!")
-                    else:
-                        print("[Navigation] ❌ Failed to come to person")
-                        
-                except Exception as e:
-                    print(f"[Navigation] Come to me error: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            threading.Thread(target=come_to_person, daemon=True).start()
     
     def capture_image(self) -> bytes:
         """Capture image from camera as JPEG bytes."""
