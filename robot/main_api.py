@@ -1975,11 +1975,204 @@ async def speak_text(request: dict):
     return {"status": "speaking", "method": "piper_async", "language": language}
 
 
+@app.post("/dance")
+async def trigger_dance(request: dict):
+    """Trigger a dance routine on the robot.
+    
+    Request body:
+        style: Dance style - 'party', 'wiggle', or 'spin' (optional, default: 'party')
+        duration: Duration in seconds (optional, default: 10)
+        with_music: Play music during dance (optional, default: False)
+        music_genre: Music genre if with_music is True (optional, default: 'dance')
+    """
+    robot = get_robot()
+    
+    if not robot.rover:
+        raise HTTPException(status_code=503, detail="Rover not connected")
+    
+    style = request.get("style", "party")
+    duration = request.get("duration", 10)
+    with_music = request.get("with_music", False)
+    music_genre = request.get("music_genre", "dance")
+    
+    # Validate style
+    valid_styles = ['party', 'wiggle', 'spin']
+    if style not in valid_styles:
+        raise HTTPException(status_code=400, detail=f"Invalid style. Must be one of: {valid_styles}")
+    
+    # Validate duration
+    if not isinstance(duration, (int, float)) or duration <= 0 or duration > 60:
+        raise HTTPException(status_code=400, detail="Duration must be between 0 and 60 seconds")
+    
+    print(f"[Dance] 💃 Starting {style} dance for {duration}s" + (f" with {music_genre} music" if with_music else ""))
+    
+    # Run dance in background thread
+    def do_dance():
+        try:
+            # Display on OLED
+            robot.rover.display_lines([
+                "DANCE MODE" + (" 🎵" if with_music else ""),
+                f"Style: {style}",
+                f"Time: {duration}s",
+                "💃🕺💃"
+            ])
+            
+            # Start music if requested
+            music_player = None
+            if with_music:
+                try:
+                    from music_player import get_music_player
+                    music_player = get_music_player()
+                    
+                    if music_player and music_player.yt_music:
+                        print(f"[Dance] 🎵 Starting {music_genre} music...")
+                        music_player.play_random(music_genre)
+                        import time
+                        time.sleep(2)  # Let music start
+                    else:
+                        print("[Dance] ⚠️ Music player not available, dancing without music")
+                except Exception as music_error:
+                    print(f"[Dance] ⚠️ Music error: {music_error}, dancing without music")
+            
+            # Perform dance
+            robot.rover.dance(style=style, duration=duration)
+            
+            # Stop music after dance
+            if music_player and music_player.is_playing:
+                print("[Dance] 🎵 Stopping music...")
+                music_player.stop()
+            
+            # Reset display after dance
+            robot.rover.display_lines([
+                "ROVY",
+                "Ready",
+                "",
+                ""
+            ])
+        except Exception as e:
+            print(f"[Dance] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    threading.Thread(target=do_dance, daemon=True).start()
+    
+    return {
+        "status": "ok",
+        "message": f"Dancing {style} style for {duration} seconds" + (" with music" if with_music else ""),
+        "style": style,
+        "duration": duration,
+        "with_music": with_music,
+        "music_genre": music_genre if with_music else None
+    }
+
+
 # Global music player state
 music_player_process = None
 music_paused = False
 current_search_term = None
 music_track_index = 0  # Track which result to play from search
+
+@app.post("/music")
+async def control_music_simple(request: dict):
+    """Control music playback using YouTube Music API (new system).
+    
+    Request body:
+        action: 'play' or 'stop' (required)
+        genre: Music genre for 'play' action (optional, default: 'dance')
+                Options: 'dance', 'party', 'classical', 'jazz', 'rock', 'pop', 'chill', 'electronic', 'fun'
+    """
+    robot = get_robot()
+    
+    action = request.get("action", "play")
+    genre = request.get("genre", "dance")
+    
+    # Validate action
+    if action not in ['play', 'stop', 'status']:
+        raise HTTPException(status_code=400, detail="Action must be 'play', 'stop', or 'status'")
+    
+    # Validate genre
+    valid_genres = ['dance', 'party', 'classical', 'jazz', 'rock', 'pop', 'chill', 'electronic', 'fun']
+    if action == 'play' and genre not in valid_genres:
+        raise HTTPException(status_code=400, detail=f"Invalid genre. Must be one of: {valid_genres}")
+    
+    try:
+        from music_player import get_music_player
+        music_player = get_music_player()
+        
+        if not music_player or not music_player.yt_music:
+            raise HTTPException(status_code=503, detail="YouTube Music not configured. Run auth_youtube.py on the robot.")
+        
+        if action == 'play':
+            print(f"[Music] 🎵 Playing {genre} music")
+            
+            if robot.rover:
+                robot.rover.display_lines([
+                    "MUSIC MODE",
+                    f"Genre: {genre}",
+                    "Loading...",
+                    "🎵"
+                ])
+            
+            def play_music():
+                success = music_player.play_random(genre)
+                if success and robot.rover:
+                    song = music_player.current_song
+                    if song:
+                        robot.rover.display_lines([
+                            "NOW PLAYING",
+                            song['title'][:21],
+                            song['artist'][:21],
+                            "🎵"
+                        ])
+                elif robot.rover:
+                    robot.rover.display_lines([
+                        "Music Error",
+                        "No songs found",
+                        f"Genre: {genre}",
+                        ""
+                    ])
+            
+            threading.Thread(target=play_music, daemon=True).start()
+            
+            return {
+                "status": "ok",
+                "action": "playing",
+                "genre": genre
+            }
+        
+        elif action == 'stop':
+            print("[Music] ⏹️ Stopping music")
+            music_player.stop()
+            
+            if robot.rover:
+                robot.rover.display_lines([
+                    "MUSIC",
+                    "Stopped",
+                    "",
+                    ""
+                ])
+            
+            return {
+                "status": "ok",
+                "action": "stopped"
+            }
+        
+        elif action == 'status':
+            status = music_player.get_status()
+            return {
+                "status": "ok",
+                "is_playing": status['is_playing'],
+                "current_song": status['current_song']
+            }
+    
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Music player module not available")
+    except Exception as exc:
+        print(f"[Music] Error: {exc}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Music control failed: {str(exc)}")
+
 
 @app.post("/music/{action}")
 async def control_music(action: str, request: dict = None):
