@@ -123,13 +123,11 @@ class SpeechProcessor:
             
             # Resample to 16kHz if needed
             if sample_rate != 16000:
+                from scipy import signal
+                # Use scipy's resample for better quality and dtype compatibility
                 factor = 16000 / sample_rate
                 new_len = int(len(audio) * factor)
-                audio = np.interp(
-                    np.linspace(0, len(audio), new_len),
-                    np.arange(len(audio)),
-                    audio
-                )
+                audio = signal.resample(audio, new_len).astype(np.float32)
             
             # Transcribe (English only, better accuracy)
             result = self.whisper_model.transcribe(
