@@ -54,6 +54,22 @@ export interface CloudHealth {
   speech_loaded: boolean;
 }
 
+export interface MeetingSummary {
+  id: string;
+  title: string;
+  type: 'meeting' | 'lecture' | 'conversation' | 'note';
+  content: string;
+  transcript?: string;
+  date: string; // ISO timestamp
+  duration?: number;
+  audio_filename?: string;
+}
+
+export interface MeetingSummaryListResponse {
+  summaries: MeetingSummary[];
+  count: number;
+}
+
 export interface CloudApiOptions {
   baseUrl?: string;
   timeout?: number;
@@ -152,6 +168,54 @@ export class CloudAPI {
   public getVoiceWebSocketUrl(): string {
     const wsBase = this.baseUrl.replace(/^http/, "ws");
     return `${wsBase}/voice`;
+  }
+
+  /**
+   * Get all meeting summaries
+   */
+  public async getMeetings(): Promise<MeetingSummaryListResponse> {
+    const response = await this.axiosInstance.get<MeetingSummaryListResponse>("/meetings");
+    return response.data;
+  }
+
+  /**
+   * Get a specific meeting by ID
+   */
+  public async getMeeting(meetingId: string): Promise<MeetingSummary> {
+    const response = await this.axiosInstance.get<MeetingSummary>(`/meetings/${meetingId}`);
+    return response.data;
+  }
+
+  /**
+   * Upload meeting audio for transcription and summarization
+   */
+  public async uploadMeeting(
+    audioBlob: Blob,
+    title?: string,
+    meetingType: 'meeting' | 'lecture' | 'conversation' | 'note' = 'meeting'
+  ): Promise<{ success: boolean; meeting_id: string; message: string }> {
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "meeting.wav");
+    if (title) {
+      formData.append("title", title);
+    }
+    formData.append("meeting_type", meetingType);
+
+    const response = await this.axiosInstance.post("/meetings/upload", formData, {
+      headers: {
+        "Content-Type": "multipart/form-data",
+      },
+      timeout: 120000, // 2 minutes for transcription/summarization
+    });
+    return response.data;
+  }
+
+  /**
+   * Delete a meeting by ID
+   */
+  public async deleteMeeting(meetingId: string): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.delete(`/meetings/${meetingId}`);
+    return response.data;
   }
 }
 

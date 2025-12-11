@@ -136,6 +136,15 @@ except ImportError as exc:
     LOGGER.warning("Gesture detection service not available: %s", exc)
     GESTURE_DETECTION_AVAILABLE = False
     detect_gesture_from_image = None
+
+# Meeting service
+try:
+    from .meeting_service import MeetingService
+    MEETING_SERVICE_AVAILABLE = True
+except ImportError as exc:
+    LOGGER.warning("Meeting service not available: %s", exc)
+    MEETING_SERVICE_AVAILABLE = False
+    MeetingService = None
 from .models import (
     AddFaceRequest,
     AddFaceResponse,
@@ -151,6 +160,11 @@ from .models import (
     HealthResponse,
     KnownFacesResponse,
     LightCommand,
+    MeetingSummary,
+    MeetingSummaryListResponse,
+    MeetingType,
+    MeetingUploadResponse,
+    MeetingRecordingStatus,
     Mode,
     ModeResponse,
     MoveCommand,
@@ -680,6 +694,24 @@ if FACE_RECOGNITION_AVAILABLE:
         app.state.face_recognition = None
 else:
     app.state.face_recognition = None
+
+# Initialize meeting service
+if MEETING_SERVICE_AVAILABLE:
+    try:
+        # Get speech processor and assistant for transcription and summarization
+        speech_processor = _get_speech()
+        assistant = _get_assistant()
+        
+        app.state.meeting_service = MeetingService(
+            speech_processor=speech_processor,
+            assistant=assistant
+        )
+        LOGGER.info("Meeting service initialized successfully")
+    except Exception as exc:
+        LOGGER.error("Failed to initialize meeting service: %s", exc, exc_info=True)
+        app.state.meeting_service = None
+else:
+    app.state.meeting_service = None
 
 
 def _find_serial_device() -> tuple[Optional[str], list[str]]:
@@ -2680,3 +2712,179 @@ async def face_recognition_stream() -> StreamingResponse:
         stream_generator(),
         media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY}",
     )
+
+
+# ==================== Meeting Summarization Endpoints ====================
+
+@app.post("/meetings/upload", response_model=MeetingUploadResponse, tags=["Meetings"])
+async def upload_meeting_audio(
+    audio: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    meeting_type: str = Form("meeting"),
+) -> MeetingUploadResponse:
+    """
+    Upload an audio file for meeting transcription and summarization.
+    
+    Args:
+        audio: Audio file (WAV, MP3, etc.)
+        title: Optional meeting title
+        meeting_type: Type of meeting (meeting, lecture, conversation, note)
+    
+    Returns:
+        MeetingUploadResponse with meeting ID and status
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        # Read audio data
+        audio_bytes = await audio.read()
+        
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+        
+        # Process audio (transcribe and summarize)
+        result = await app.state.meeting_service.process_audio(
+            audio_bytes=audio_bytes,
+            filename=audio.filename or "recording.wav",
+            title=title,
+            meeting_type=meeting_type
+        )
+        
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("message", "Failed to process audio")
+            )
+        
+        return MeetingUploadResponse(
+            success=True,
+            meeting_id=result["meeting_id"],
+            message="Meeting processed successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Meeting upload failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process meeting: {exc}"
+        ) from exc
+
+
+@app.get("/meetings", response_model=MeetingSummaryListResponse, tags=["Meetings"])
+async def get_all_meetings() -> MeetingSummaryListResponse:
+    """
+    Get all meeting summaries.
+    
+    Returns:
+        MeetingSummaryListResponse with list of all meetings
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        meetings = app.state.meeting_service.get_all_meetings()
+        
+        # Convert to response model
+        meeting_summaries = [
+            MeetingSummary(**meeting) for meeting in meetings
+        ]
+        
+        return MeetingSummaryListResponse(
+            summaries=meeting_summaries,
+            count=len(meeting_summaries)
+        )
+        
+    except Exception as exc:
+        LOGGER.error("Failed to get meetings: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve meetings: {exc}"
+        ) from exc
+
+
+@app.get("/meetings/{meeting_id}", response_model=MeetingSummary, tags=["Meetings"])
+async def get_meeting(meeting_id: str) -> MeetingSummary:
+    """
+    Get a specific meeting by ID.
+    
+    Args:
+        meeting_id: Meeting UUID
+    
+    Returns:
+        MeetingSummary with full meeting details
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        meeting = app.state.meeting_service.get_meeting(meeting_id)
+        
+        if not meeting:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found"
+            )
+        
+        return MeetingSummary(**meeting)
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Failed to get meeting: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve meeting: {exc}"
+        ) from exc
+
+
+@app.delete("/meetings/{meeting_id}", tags=["Meetings"])
+async def delete_meeting(meeting_id: str) -> dict[str, str]:
+    """
+    Delete a meeting by ID.
+    
+    Args:
+        meeting_id: Meeting UUID
+    
+    Returns:
+        Status message
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        success = app.state.meeting_service.delete_meeting(meeting_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found"
+            )
+        
+        return {
+            "status": "success",
+            "message": f"Meeting {meeting_id} deleted"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Failed to delete meeting: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete meeting: {exc}"
+        ) from exc

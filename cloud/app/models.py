@@ -159,3 +159,39 @@ class AddFaceResponse(BaseModel):
 class KnownFacesResponse(BaseModel):
     faces: list[str] = Field(..., description="List of known face names")
     count: int = Field(..., description="Number of known faces")
+
+
+# Meeting Summarization Models
+class MeetingType(str, Enum):
+    MEETING = "meeting"
+    LECTURE = "lecture"
+    CONVERSATION = "conversation"
+    NOTE = "note"
+
+
+class MeetingSummary(BaseModel):
+    id: str = Field(..., description="Unique meeting ID")
+    title: str = Field(..., description="Meeting title")
+    type: MeetingType = Field(..., description="Type of meeting")
+    content: str = Field(..., description="Summary content")
+    transcript: Optional[str] = Field(None, description="Full transcript")
+    date: str = Field(..., description="ISO timestamp of meeting")
+    duration: Optional[float] = Field(None, description="Duration in seconds")
+    audio_filename: Optional[str] = Field(None, description="Original audio filename")
+
+
+class MeetingSummaryListResponse(BaseModel):
+    summaries: list[MeetingSummary] = Field(..., description="List of meeting summaries")
+    count: int = Field(..., description="Number of summaries")
+
+
+class MeetingUploadResponse(BaseModel):
+    success: bool = Field(..., description="Whether upload was successful")
+    meeting_id: str = Field(..., description="ID of created meeting")
+    message: str = Field(..., description="Status message")
+
+
+class MeetingRecordingStatus(BaseModel):
+    is_recording: bool = Field(..., description="Whether meeting is currently being recorded")
+    started_at: Optional[str] = Field(None, description="ISO timestamp when recording started")
+    duration: Optional[float] = Field(None, description="Current recording duration in seconds")

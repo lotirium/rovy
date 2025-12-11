@@ -143,6 +143,11 @@ class NavigationCommand(BaseModel):
     x: Optional[float] = None
     y: Optional[float] = None
 
+class MeetingRecordingCommand(BaseModel):
+    action: str  # start, stop
+    title: Optional[str] = None
+    meeting_type: str = "meeting"  # meeting, lecture, conversation, note
+
 
 # ==============================================================================
 # Robot Client with API
@@ -186,6 +191,13 @@ class RobotServer:
         
         # Navigation state (for USB bandwidth management)
         self.is_navigating = False  # True when OAK-D navigation is active
+        
+        # Meeting recording state
+        self.is_recording_meeting = False
+        self.meeting_start_time = None
+        self.meeting_audio_chunks = []
+        self.meeting_title = None
+        self.meeting_type = "meeting"
         
         print("=" * 60)
         print("  ROVY ROBOT SERVER")
@@ -492,6 +504,10 @@ class RobotServer:
                     audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
                     energy = self.calculate_audio_energy(audio_data)
                     
+                    # If meeting recording is active, save original audio chunk
+                    if self.is_recording_meeting:
+                        self.meeting_audio_chunks.append(audio_data)
+                    
                     # Check for silence
                     if energy < silence_threshold:
                         if last_silence_time is None:
@@ -750,6 +766,44 @@ class RobotServer:
                 import traceback
                 traceback.print_exc()
                 await asyncio.sleep(1)
+    
+    async def continuous_meeting_recording(self):
+        """Continuously record audio for meeting while is_recording_meeting is True."""
+        if not AUDIO_OK or not self.pyaudio or self.audio_device_index is None:
+            print("[Meeting] Audio not available")
+            return
+        
+        print("[Meeting] Starting continuous audio recording...")
+        
+        try:
+            stream = self.pyaudio.open(
+                format=pyaudio.paInt16,
+                channels=config.CHANNELS,
+                rate=self.audio_sample_rate,
+                input=True,
+                input_device_index=self.audio_device_index,
+                frames_per_buffer=config.CHUNK_SIZE
+            )
+            
+            while self.running and self.is_recording_meeting:
+                try:
+                    audio_data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
+                    # Store raw audio chunk for meeting
+                    self.meeting_audio_chunks.append(audio_data)
+                    
+                    # Small delay to prevent CPU overload
+                    await asyncio.sleep(0.01)
+                    
+                except Exception as e:
+                    print(f"[Meeting] Recording error: {e}")
+                    break
+            
+            stream.stop_stream()
+            stream.close()
+            print("[Meeting] Stopped continuous recording")
+            
+        except Exception as e:
+            print(f"[Meeting] Recording failed: {e}")
     
     async def receive_voice_responses(self):
         """Receive responses from voice WebSocket (transcripts, AI responses, etc.)."""
@@ -2717,6 +2771,159 @@ async def set_volume(command: VolumeCommand):
         "volume": volume,
         "status": "ok"
     }
+
+
+@app.post("/meeting/record")
+async def meeting_record(cmd: MeetingRecordingCommand):
+    """Start or stop meeting recording.
+    
+    Actions:
+    - start: Start recording meeting audio
+    - stop: Stop recording and send to cloud for transcription/summarization
+    """
+    robot = get_robot()
+    
+    if cmd.action == "start":
+        if robot.is_recording_meeting:
+            return {"status": "already_recording", "message": "Meeting recording already in progress"}
+        
+        # Start recording
+        robot.is_recording_meeting = True
+        robot.meeting_start_time = time.time()
+        robot.meeting_audio_chunks = []
+        robot.meeting_title = cmd.title
+        robot.meeting_type = cmd.meeting_type
+        
+        # Start background recording task
+        asyncio.create_task(robot.continuous_meeting_recording())
+        
+        print(f"[Meeting] Started recording: {cmd.title or 'Untitled'} ({cmd.meeting_type})")
+        
+        return {
+            "status": "started",
+            "message": "Meeting recording started",
+            "start_time": robot.meeting_start_time
+        }
+    
+    elif cmd.action == "stop":
+        if not robot.is_recording_meeting:
+            return {"status": "not_recording", "message": "No meeting recording in progress"}
+        
+        # Stop recording
+        robot.is_recording_meeting = False
+        duration = time.time() - robot.meeting_start_time if robot.meeting_start_time else 0
+        
+        print(f"[Meeting] Stopped recording after {duration:.1f}s, uploading to cloud...")
+        
+        # Combine audio chunks
+        if not robot.meeting_audio_chunks:
+            return {
+                "status": "error",
+                "message": "No audio recorded"
+            }
+        
+        try:
+            # Combine chunks into single audio file
+            import wave
+            import tempfile
+            import os
+            
+            # Create temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                wav_path = temp_file.name
+            
+            # Write audio chunks to WAV file
+            with wave.open(wav_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(robot.audio_sample_rate)
+                
+                # Combine all chunks
+                for chunk in robot.meeting_audio_chunks:
+                    wav_file.writeframes(chunk)
+            
+            # Read the complete WAV file
+            with open(wav_path, 'rb') as f:
+                audio_bytes = f.read()
+            
+            # Clean up temp file
+            os.unlink(wav_path)
+            
+            # Send to cloud for processing
+            import httpx
+            
+            cloud_url = config.CLOUD_API_URL.replace('/ws', '') if hasattr(config, 'CLOUD_API_URL') else "http://100.72.107.106:8001"
+            upload_url = f"{cloud_url}/meetings/upload"
+            
+            print(f"[Meeting] Uploading {len(audio_bytes)} bytes to {upload_url}")
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                files = {
+                    'audio': ('meeting.wav', audio_bytes, 'audio/wav')
+                }
+                data = {
+                    'title': robot.meeting_title or f"Meeting - {datetime.now().strftime('%b %d, %Y %I:%M %p')}",
+                    'meeting_type': robot.meeting_type
+                }
+                
+                response = await client.post(upload_url, files=files, data=data)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    print(f"[Meeting] ✅ Upload successful: {result.get('meeting_id')}")
+                    
+                    # Clear recording state
+                    robot.meeting_audio_chunks = []
+                    robot.meeting_start_time = None
+                    robot.meeting_title = None
+                    
+                    return {
+                        "status": "success",
+                        "message": "Meeting recorded and uploaded successfully",
+                        "duration": duration,
+                        "meeting_id": result.get('meeting_id')
+                    }
+                else:
+                    print(f"[Meeting] ⚠️  Upload failed: {response.status_code} - {response.text}")
+                    return {
+                        "status": "error",
+                        "message": f"Upload failed: {response.status_code}"
+                    }
+        
+        except Exception as e:
+            print(f"[Meeting] Error processing recording: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "status": "error",
+                "message": f"Failed to process recording: {str(e)}"
+            }
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid action: {cmd.action}")
+
+
+@app.get("/meeting/status")
+async def meeting_status():
+    """Get current meeting recording status."""
+    robot = get_robot()
+    
+    if robot.is_recording_meeting:
+        duration = time.time() - robot.meeting_start_time if robot.meeting_start_time else 0
+        return {
+            "is_recording": True,
+            "started_at": datetime.fromtimestamp(robot.meeting_start_time).isoformat() if robot.meeting_start_time else None,
+            "duration": duration,
+            "title": robot.meeting_title,
+            "type": robot.meeting_type,
+            "chunks_recorded": len(robot.meeting_audio_chunks)
+        }
+    else:
+        return {
+            "is_recording": False,
+            "started_at": None,
+            "duration": 0
+        }
 
 
 # ==============================================================================
