@@ -150,6 +150,7 @@ class RobotServer:
         self.rover = None
         self.camera = None
         self.camera_type = None  # 'oakd' or 'usb'
+        self.usb_camera = None  # USB camera instance (always separate from OAK-D)
         self.oakd_device = None
         self.oakd_queue = None
         self.audio_stream = None
@@ -190,6 +191,7 @@ class RobotServer:
     
     def init_camera(self):
         """Initialize camera - OAK-D required for manual control, USB as fallback for other uses."""
+        oakd_initialized = False
         # Try OAK-D camera first (required for manual control)
         if DEPTHAI_OK:
             try:
@@ -236,7 +238,7 @@ class RobotServer:
                         if frame is not None:
                             self.camera_type = 'oakd'
                             print("[Camera] OAK-D camera ready")
-                            return True
+                            oakd_initialized = True
                         else:
                             self.oakd_device.close()
                             self.oakd_device = None
@@ -259,35 +261,46 @@ class RobotServer:
             print("[Camera] WARNING: DepthAI not available - OAK-D camera cannot be used")
             print("[Camera] WARNING: Manual control will not work without OAK-D camera")
         
-        # Fall back to USB camera (for cloud streaming, but not for manual control)
-        if not CAMERA_OK:
-            return False
+        # Always try to initialize USB camera (for /snapshot endpoint, even when OAK-D is present)
+        usb_initialized = False
+        if CAMERA_OK:
+            print("[Camera] Trying USB camera (for /snapshot endpoint)...")
+            # Try indices in order: 1 (USB Camera), 0, 2
+            for camera_index in [1, 0, 2]:
+                try:
+                    print(f"[Camera] Trying /dev/video{camera_index} for USB camera...")
+                    usb_cam = cv2.VideoCapture(camera_index)
+                    usb_cam.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+                    usb_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+                    usb_cam.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
+                    
+                    ret, frame = usb_cam.read()
+                    if ret and frame is not None:
+                        self.usb_camera = usb_cam
+                        print(f"[Camera] USB camera ready on /dev/video{camera_index}")
+                        usb_initialized = True
+                        break
+                    else:
+                        usb_cam.release()
+                except Exception as e:
+                    print(f"[Camera] USB camera init failed on /dev/video{camera_index}: {e}")
+                    try:
+                        usb_cam.release()
+                    except:
+                        pass
         
-        print("[Camera] Trying USB camera...")
-        # Try indices in order: 1 (USB Camera), 0, 2
-        for camera_index in [1, 0, 2]:
-            try:
-                print(f"[Camera] Trying /dev/video{camera_index}...")
-                self.camera = cv2.VideoCapture(camera_index)
-                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
-                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-                self.camera.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
-                
-                ret, frame = self.camera.read()
-                if ret and frame is not None:
-                    self.camera_type = 'usb'
-                    print(f"[Camera] USB camera ready on /dev/video{camera_index}")
-                    return True
-                else:
-                    self.camera.release()
-                    self.camera = None
-            except Exception as e:
-                if self.camera:
-                    self.camera.release()
-                    self.camera = None
-        
-        print("[Camera] No working camera found")
-        return False
+        # If OAK-D is not available, use USB camera as primary
+        if self.camera_type != 'oakd':
+            if usb_initialized:
+                self.camera = self.usb_camera
+                self.camera_type = 'usb'
+                return True
+            else:
+                print("[Camera] No working camera found")
+                return False
+        else:
+            # OAK-D is primary, USB is for /snapshot endpoint
+            return True
     
     def init_audio(self):
         """Initialize audio input (ReSpeaker)."""
@@ -444,6 +457,15 @@ class RobotServer:
                 if frame_data is not None:
                     frame = frame_data.getCvFrame()
                     self.oakd_error_count = 0  # Reset error count on success
+                else:
+                    # Queue is empty - no frame available yet
+                    # This is normal if requests come faster than camera FPS
+                    # Only log occasionally to avoid spam (every 10th occurrence)
+                    if not hasattr(self, '_empty_queue_count'):
+                        self._empty_queue_count = 0
+                    self._empty_queue_count += 1
+                    if self._empty_queue_count % 10 == 1:
+                        print(f"[Camera] OAK-D queue empty (no frame available) - request #{self._empty_queue_count}")
             except Exception as e:
                 error_str = str(e)
                 # Check if it's an X_LINK_ERROR (communication error)
@@ -717,6 +739,14 @@ class RobotServer:
         if self.camera:
             self.camera.release()
         
+        # Release USB camera separately if it's different from self.camera
+        if self.usb_camera and self.usb_camera != self.camera:
+            try:
+                self.usb_camera.release()
+            except:
+                pass
+            self.usb_camera = None
+        
         if self.oakd_device:
             try:
                 self.oakd_device.close()
@@ -929,11 +959,64 @@ async def get_shot():
     if robot.camera_type != 'oakd' or robot.oakd_queue is None:
         raise HTTPException(status_code=503, detail="OAK-D camera required for manual control")
     
+    # Try to capture a fresh frame first
     image_bytes = robot.capture_image()
+    
+    # If capture failed (queue empty), try to use cached image as fallback
     if not image_bytes:
-        raise HTTPException(status_code=500, detail="Failed to capture image from OAK-D")
+        # First try get_cached_image() which respects cache time
+        image_bytes = robot.get_cached_image()
+        
+        # If that also fails, try using last_image directly (even if slightly stale)
+        # This helps when requests come faster than camera FPS
+        if not image_bytes and robot.last_image:
+            max_stale_time = 0.5  # Use cached image up to 500ms old
+            if (time.time() - robot.last_image_time) < max_stale_time:
+                image_bytes = robot.last_image
+                # Log that we're using stale cached image (only occasionally to avoid spam)
+                if not hasattr(robot, '_stale_fallback_count'):
+                    robot._stale_fallback_count = 0
+                robot._stale_fallback_count += 1
+                if robot._stale_fallback_count % 20 == 1:
+                    age_ms = int((time.time() - robot.last_image_time) * 1000)
+                    print(f"[API] /shot using stale cached image ({age_ms}ms old, fallback #{robot._stale_fallback_count})")
+    
+    # If both capture and cache failed, return error
+    if not image_bytes:
+        raise HTTPException(status_code=503, detail="OAK-D camera frame not available (queue empty)")
     
     return Response(content=image_bytes, media_type="image/jpeg")
+
+
+@app.get("/snapshot")
+async def get_snapshot():
+    """Get single camera frame from USB camera."""
+    robot = get_robot()
+    
+    # Check if USB camera is connected and available
+    if not CAMERA_OK:
+        raise HTTPException(status_code=503, detail="OpenCV not available")
+    
+    if robot.usb_camera is None:
+        raise HTTPException(status_code=503, detail="USB camera not connected")
+    
+    # Verify camera is actually opened
+    if not robot.usb_camera.isOpened():
+        raise HTTPException(status_code=503, detail="USB camera is not opened")
+    
+    # Capture image directly from USB camera
+    try:
+        ret, frame = robot.usb_camera.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=500, detail="Failed to capture frame from USB camera")
+        
+        # Encode as JPEG
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
+        image_bytes = buffer.tobytes()
+        
+        return Response(content=image_bytes, media_type="image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to capture image from USB camera: {str(e)}")
 
 
 @app.get("/video")

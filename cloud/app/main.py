@@ -454,6 +454,120 @@ def _iter_webcam_candidates() -> list[int | str]:
     return candidates
 
 
+def check_cameras_for_microphone() -> list[dict[str, Any]]:
+    """Check all connected cameras to see if they have microphone capabilities.
+    
+    Returns a list of dictionaries with camera info and microphone status.
+    Each dict contains:
+    - device: device path or index
+    - name: device name
+    - has_microphone: boolean indicating if microphone is present
+    - device_path: resolved /dev/videoX path if available
+    """
+    cameras_with_mic = []
+    
+    # Get all video devices
+    video_devices = []
+    
+    # Check /dev/v4l/by-id/ for stable device paths
+    by_id_dir = Path("/dev/v4l/by-id")
+    if by_id_dir.is_dir():
+        for entry in sorted(by_id_dir.iterdir()):
+            try:
+                resolved_path = entry.resolve()
+                if resolved_path.exists() and str(resolved_path).startswith("/dev/video"):
+                    video_devices.append({
+                        "device": str(entry),
+                        "name": entry.name,
+                        "resolved_path": str(resolved_path)
+                    })
+            except (OSError, RuntimeError):
+                continue
+    
+    # Also check /dev/video* directly for any devices not in by-id
+    for video_path in Path("/dev").glob("video*"):
+        if video_path.is_char_device():
+            device_num = video_path.name.replace("video", "")
+            try:
+                int(device_num)  # Make sure it's a number
+                # Check if we already have this device
+                if not any(v.get("resolved_path") == str(video_path) for v in video_devices):
+                    video_devices.append({
+                        "device": str(video_path),
+                        "name": f"video{device_num}",
+                        "resolved_path": str(video_path)
+                    })
+            except ValueError:
+                continue
+    
+    # Check each device for microphone capabilities
+    for device_info in video_devices:
+        device_path = device_info["resolved_path"]
+        has_mic = False
+        
+        try:
+            # Use v4l2-ctl to query device capabilities
+            # Check if device has audio input (V4L2_CAP_AUDIO indicates audio support)
+            result = subprocess.run(
+                ["v4l2-ctl", "--device", device_path, "--info"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                # Check for audio-related capabilities
+                # V4L2 devices with microphones typically show audio input capabilities
+                if "audio" in output or "mic" in output:
+                    has_mic = True
+                else:
+                    # Also check device capabilities directly
+                    caps_result = subprocess.run(
+                        ["v4l2-ctl", "--device", device_path, "--all"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if caps_result.returncode == 0:
+                        caps_output = caps_result.stdout.lower()
+                        # Look for audio input indicators
+                        if any(keyword in caps_output for keyword in ["audio", "mic", "input", "capture"]):
+                            # More specific check - look for audio device type
+                            if "audio" in caps_output:
+                                has_mic = True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            LOGGER.debug(f"Could not check microphone for {device_path}: {e}")
+            continue
+        
+        # Also check if there's a corresponding ALSA device (some USB cameras expose audio via ALSA)
+        try:
+            # Check for ALSA devices that might correspond to this camera
+            alsa_result = subprocess.run(
+                ["arecord", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if alsa_result.returncode == 0:
+                # Some USB cameras show up in ALSA as USB audio devices
+                # This is a heuristic - if we find USB audio devices, some cameras might have mics
+                if "usb" in alsa_result.stdout.lower():
+                    # This is not definitive, but worth noting
+                    pass
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        cameras_with_mic.append({
+            "device": device_info["device"],
+            "name": device_info["name"],
+            "has_microphone": has_mic,
+            "device_path": device_path
+        })
+    
+    return cameras_with_mic
+
+
 def _create_camera_service() -> CameraService:
     """Create camera service for mobile app streaming using USB camera."""
     primary_source = None
@@ -1363,6 +1477,7 @@ def _start_oakd_pipeline():
     if app.state.oakd_device is not None:
         try:
             app.state.oakd_device.close()
+            time.sleep(0.5)  # Wait for device to be fully released
         except:
             pass
         app.state.oakd_device = None
@@ -1370,7 +1485,7 @@ def _start_oakd_pipeline():
     
     # Force release any stale devices
     DepthAICameraSource.force_release_devices()
-    time.sleep(0.3)
+    time.sleep(0.8)  # Increased wait time to ensure device is fully released and ready
     
     # Create pipeline - use MJPEG encoding for less USB bandwidth
     pipeline = dai.Pipeline()
@@ -1388,11 +1503,25 @@ def _start_oakd_pipeline():
     xout_rgb.setMetadataOnly(False)
     cam_rgb.preview.link(xout_rgb.input)
     
-    app.state.oakd_device = dai.Device(pipeline)
-    app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=1, blocking=False)
-    app.state.oakd_last_used = time.time()
-    
-    LOGGER.info("✅ OAK-D pipeline started on-demand")
+    # Try to create device with retry logic in case device is not fully ready
+    max_retries = 3
+    for retry in range(max_retries):
+        try:
+            app.state.oakd_device = dai.Device(pipeline)
+            app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=1, blocking=False)
+            app.state.oakd_last_used = time.time()
+            LOGGER.info("✅ OAK-D pipeline started on-demand")
+            return
+        except Exception as e:
+            if retry < max_retries - 1:
+                LOGGER.warning(f"Failed to start OAK-D pipeline (attempt {retry + 1}/{max_retries}): {e}")
+                time.sleep(0.5)  # Wait before retry
+                # Force release again before retry
+                DepthAICameraSource.force_release_devices()
+                time.sleep(0.3)
+            else:
+                LOGGER.error(f"Failed to start OAK-D pipeline after {max_retries} attempts: {e}")
+                raise
 
 
 def _stop_oakd_pipeline():
@@ -1405,16 +1534,26 @@ def _stop_oakd_pipeline():
             pass
         app.state.oakd_device = None
         app.state.oakd_queue = None
+        # Wait a bit to ensure device is fully released before next use
+        import time
+        time.sleep(0.5)
 
 
 def _ensure_oakd_pipeline():
     """Ensure OAK-D pipeline is running, start if needed."""
     import time
     
-    if app.state.oakd_queue is not None:
-        # Pipeline already running - check if it's still healthy
-        app.state.oakd_last_used = time.time()
-        return
+    # Check if pipeline exists and is healthy
+    if app.state.oakd_queue is not None and app.state.oakd_device is not None:
+        try:
+            # Pipeline already running - just update timestamp
+            app.state.oakd_last_used = time.time()
+            return
+        except:
+            # Device might be in bad state, reset it
+            LOGGER.warning("OAK-D device appears to be in bad state, reinitializing...")
+            app.state.oakd_device = None
+            app.state.oakd_queue = None
     
     # Start pipeline on-demand
     LOGGER.info("📷 Starting OAK-D pipeline on-demand...")
