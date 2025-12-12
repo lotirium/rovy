@@ -32,6 +32,12 @@ OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))  # Higher = m
 # =============================================================================
 
 # Speech-to-text (Whisper)
+# Use OpenAI Whisper API by default (requires API key and internet)
+# Set to True to always use API, False to always use local
+# Note: Meetings will always use API for better accuracy regardless of this setting
+USE_OPENAI_WHISPER = os.getenv("ROVY_USE_OPENAI_WHISPER", "false").lower() in ("true", "1", "yes")
+
+# Local Whisper model (only used if USE_OPENAI_WHISPER is False or API fails)
 # Model size affects accuracy: tiny < base < small < medium < large
 # For multilingual accuracy, use "small" or "medium"
 WHISPER_MODEL = os.getenv("ROVY_WHISPER_MODEL", "small")  # tiny, base, small, medium, large

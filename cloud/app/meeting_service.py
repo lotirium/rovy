@@ -6,11 +6,51 @@ import json
 import logging
 import os
 import uuid
+import tempfile
+import glob
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
+
+# Try to import pydub for audio conversion
+try:
+    from pydub import AudioSegment
+    from pydub.utils import which
+    import platform
+    PYDUB_OK = True
+    
+    # Configure ffmpeg path for Windows if not in PATH
+    if platform.system() == "Windows":
+        # Always try to find ffmpeg since which() might not work properly
+        # Try common winget installation location
+        winget_pattern = os.path.join(
+            os.getenv("LOCALAPPDATA", ""),
+            "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", 
+            "ffmpeg-*", "bin"
+        )
+        matches = glob.glob(winget_pattern)
+        if matches:
+            ffmpeg_bin = matches[0]
+            ffmpeg_exe = os.path.join(ffmpeg_bin, "ffmpeg.exe")
+            ffprobe_exe = os.path.join(ffmpeg_bin, "ffprobe.exe")
+            
+            # Verify files exist
+            if os.path.exists(ffmpeg_exe) and os.path.exists(ffprobe_exe):
+                # Add ffmpeg bin directory to PATH so pydub can find it
+                os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
+                # Also set paths directly for pydub
+                AudioSegment.converter = ffmpeg_exe
+                AudioSegment.ffprobe = ffprobe_exe
+                print(f"[meeting_service] Configured ffmpeg: {ffmpeg_exe}")  # Use print since logger may not be ready
+            else:
+                print(f"[meeting_service] ffmpeg executables not found at: {ffmpeg_bin}")
+        else:
+            print(f"[meeting_service] ffmpeg not found in winget packages (pattern: {winget_pattern})")
+except ImportError:
+    print("[meeting_service] pydub not available - audio conversion limited")
+    PYDUB_OK = False
 
 # Storage directory for meetings
 MEETINGS_DIR = Path(__file__).parent.parent / "meetings"
@@ -79,18 +119,48 @@ class MeetingService:
         meeting_id = str(uuid.uuid4())
         logger.info(f"Processing meeting {meeting_id}: {filename}")
         
-        # Save audio file
+        # Detect file format from filename or content
+        file_ext = os.path.splitext(filename)[1].lower() if filename else '.wav'
+        logger.info(f"Detected audio format: {file_ext}")
+        
+        # Save original audio file temporarily
+        temp_path = MEETINGS_DIR / f"{meeting_id}_original{file_ext}"
         audio_path = MEETINGS_DIR / f"{meeting_id}.wav"
+        
         try:
-            with open(audio_path, 'wb') as f:
+            # Save original file
+            with open(temp_path, 'wb') as f:
                 f.write(audio_bytes)
-            logger.info(f"Saved audio to {audio_path}")
+            logger.info(f"Saved original audio to {temp_path}")
+            
+            # Convert to WAV if needed
+            if file_ext != '.wav' and PYDUB_OK:
+                logger.info(f"Converting {file_ext} to WAV...")
+                audio = AudioSegment.from_file(str(temp_path), format=file_ext[1:])  # Remove leading dot
+                audio = audio.set_channels(1)  # Convert to mono
+                audio = audio.set_frame_rate(16000)  # Standardize sample rate
+                audio.export(str(audio_path), format="wav")
+                logger.info(f"Converted to WAV: {audio_path}")
+                # Clean up original file
+                os.unlink(temp_path)
+            elif file_ext != '.wav':
+                # No conversion available, rename and hope for the best
+                logger.warning(f"pydub not available - cannot convert {file_ext} to WAV")
+                os.rename(temp_path, audio_path)
+            else:
+                # Already WAV, just rename
+                os.rename(temp_path, audio_path)
+                
+            logger.info(f"Audio ready at {audio_path}")
         except Exception as e:
-            logger.error(f"Failed to save audio: {e}")
+            logger.error(f"Failed to save/convert audio: {e}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
             return {
                 "success": False,
                 "meeting_id": meeting_id,
-                "message": f"Failed to save audio: {e}"
+                "message": f"Failed to save/convert audio: {e}"
             }
         
         # Transcribe audio
@@ -98,16 +168,22 @@ class MeetingService:
         if self.speech_processor:
             try:
                 logger.info("Transcribing audio...")
-                # Detect audio format and sample rate
+                # Read PCM audio data from the converted WAV file
                 import wave
                 try:
                     with wave.open(str(audio_path), 'rb') as wav:
                         sample_rate = wav.getframerate()
                         logger.info(f"Audio sample rate: {sample_rate} Hz")
-                except:
+                        # Read the actual PCM audio frames
+                        pcm_audio_bytes = wav.readframes(wav.getnframes())
+                        logger.info(f"Extracted {len(pcm_audio_bytes)} bytes of PCM audio")
+                except Exception as wav_error:
+                    logger.error(f"Failed to read WAV file: {wav_error}")
                     sample_rate = 16000  # Default
+                    pcm_audio_bytes = audio_bytes  # Fallback to original bytes
                 
-                transcript = self.speech_processor.transcribe(audio_bytes, sample_rate=sample_rate)
+                # Use OpenAI API for meetings (better accuracy for long recordings)
+                transcript = self.speech_processor.transcribe(pcm_audio_bytes, sample_rate=sample_rate, use_api=True)
                 
                 if transcript:
                     logger.info(f"Transcription complete: {len(transcript)} chars")

@@ -695,23 +695,8 @@ if FACE_RECOGNITION_AVAILABLE:
 else:
     app.state.face_recognition = None
 
-# Initialize meeting service
-if MEETING_SERVICE_AVAILABLE:
-    try:
-        # Get speech processor and assistant for transcription and summarization
-        speech_processor = _get_speech()
-        assistant = _get_assistant()
-        
-        app.state.meeting_service = MeetingService(
-            speech_processor=speech_processor,
-            assistant=assistant
-        )
-        LOGGER.info("Meeting service initialized successfully")
-    except Exception as exc:
-        LOGGER.error("Failed to initialize meeting service: %s", exc, exc_info=True)
-        app.state.meeting_service = None
-else:
-    app.state.meeting_service = None
+# Meeting service will be initialized after helper functions are defined
+app.state.meeting_service = None
 
 
 def _find_serial_device() -> tuple[Optional[str], list[str]]:
@@ -956,12 +941,33 @@ def _get_speech():
             _speech = SpeechProcessor(
                 whisper_model=config.WHISPER_MODEL,
                 tts_engine=config.TTS_ENGINE,
-                piper_voices=config.PIPER_VOICES
+                piper_voices=config.PIPER_VOICES,
+                use_openai_whisper=config.USE_OPENAI_WHISPER,
+                openai_api_key=config.OPENAI_API_KEY
             )
             LOGGER.info("SpeechProcessor loaded for voice endpoint")
         except Exception as e:
             LOGGER.error(f"Failed to load SpeechProcessor: {e}")
     return _speech
+
+
+# Initialize meeting service (must be after helper functions are defined)
+if MEETING_SERVICE_AVAILABLE:
+    try:
+        # Get speech processor and assistant for transcription and summarization
+        speech_processor = _get_speech()
+        assistant = _get_assistant()
+        
+        app.state.meeting_service = MeetingService(
+            speech_processor=speech_processor,
+            assistant=assistant
+        )
+        LOGGER.info("Meeting service initialized successfully")
+    except Exception as exc:
+        LOGGER.error("Failed to initialize meeting service: %s", exc, exc_info=True)
+        app.state.meeting_service = None
+else:
+    app.state.meeting_service = None
 
 
 @app.websocket("/voice")
@@ -1278,6 +1284,192 @@ async def voice_websocket(websocket: WebSocket):
                                     except Exception as music_error:
                                         LOGGER.error(f"Stop music command failed: {music_error}")
                                 
+                                # Vision commands - solve problems, read text, etc.
+                                vision_solve_patterns = [
+                                    'solve this', 'solve it', 'solve the problem', 'solve that',
+                                    'what is the answer', 'help me solve'
+                                ]
+                                vision_read_patterns = [
+                                    'read this', 'read it', 'read the text', 'read that',
+                                    'what does it say', 'what does this say'
+                                ]
+                                
+                                if any(pattern in transcript_lower for pattern in vision_solve_patterns):
+                                    LOGGER.info(f"🔍 Vision solve command detected: '{transcript}'")
+                                    try:
+                                        # Import vision module
+                                        import sys
+                                        sys.path.insert(0, str(Path(__file__).parent.parent))
+                                        from vision import VisionProcessor
+                                        
+                                        # Inform user we're capturing
+                                        capture_msg = "Let me take a look and solve that for you."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": capture_msg
+                                        })
+                                        
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        pi_url = f"http://{pi_ip}:8000/speak"
+                                        async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                            await tts_client.post(pi_url, json={"text": capture_msg})
+                                        
+                                        # Fetch image from robot's camera (OAK-D or USB on robot)
+                                        LOGGER.info(f"📸 Fetching image from robot camera: {pi_ip}")
+                                        shot_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        async with httpx.AsyncClient(timeout=15.0) as client:
+                                            shot_response = await client.get(shot_url)
+                                            
+                                            if shot_response.status_code != 200:
+                                                raise Exception(f"Failed to get image from robot: {shot_response.status_code}")
+                                            
+                                            image_bytes = shot_response.content
+                                            LOGGER.info(f"✅ Got image from robot ({len(image_bytes)} bytes)")
+                                        
+                                        # Save captured image for debugging
+                                        try:
+                                            import datetime
+                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            debug_image_path = f"vision_debug_solve_{timestamp}.jpg"
+                                            with open(debug_image_path, "wb") as f:
+                                                f.write(image_bytes)
+                                            LOGGER.info(f"💾 Saved debug image: {debug_image_path}")
+                                        except Exception as save_err:
+                                            LOGGER.warning(f"Could not save debug image: {save_err}")
+                                        
+                                        # Analyze with Vision API (no camera init needed)
+                                        processor = VisionProcessor()
+                                        try:
+                                            LOGGER.info("🔍 Analyzing with OpenAI Vision API...")
+                                            solution = await processor.solve_problem(image_bytes=image_bytes)
+                                            
+                                            if solution:
+                                                LOGGER.info(f"✅ Solution: {solution[:100]}...")
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": solution
+                                                })
+                                                
+                                                # Speak the solution
+                                                async with httpx.AsyncClient(timeout=15.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": solution})
+                                            else:
+                                                error_msg = "Sorry, I couldn't see the problem clearly. Can you hold it steady?"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": error_msg
+                                                })
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": error_msg})
+                                        finally:
+                                            await processor.close()
+                                        
+                                        continue
+                                        
+                                    except Exception as vision_error:
+                                        LOGGER.error(f"Vision solve command failed: {vision_error}", exc_info=True)
+                                        error_msg = "Sorry, I had trouble analyzing the image."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": error_msg
+                                        })
+                                        try:
+                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                            pi_url = f"http://{pi_ip}:8000/speak"
+                                            async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                await tts_client.post(pi_url, json={"text": error_msg})
+                                        except:
+                                            pass
+                                
+                                elif any(pattern in transcript_lower for pattern in vision_read_patterns):
+                                    LOGGER.info(f"📖 Vision read command detected: '{transcript}'")
+                                    try:
+                                        # Import vision module
+                                        import sys
+                                        sys.path.insert(0, str(Path(__file__).parent.parent))
+                                        from vision import VisionProcessor
+                                        
+                                        # Inform user we're capturing
+                                        capture_msg = "Let me read that for you."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": capture_msg
+                                        })
+                                        
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        pi_url = f"http://{pi_ip}:8000/speak"
+                                        async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                            await tts_client.post(pi_url, json={"text": capture_msg})
+                                        
+                                        # Fetch image from robot's camera (OAK-D or USB on robot)
+                                        LOGGER.info(f"📸 Fetching image from robot camera: {pi_ip}")
+                                        shot_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        async with httpx.AsyncClient(timeout=15.0) as client:
+                                            shot_response = await client.get(shot_url)
+                                            
+                                            if shot_response.status_code != 200:
+                                                raise Exception(f"Failed to get image from robot: {shot_response.status_code}")
+                                            
+                                            image_bytes = shot_response.content
+                                            LOGGER.info(f"✅ Got image from robot ({len(image_bytes)} bytes)")
+                                        
+                                        # Save captured image for debugging
+                                        try:
+                                            import datetime
+                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            debug_image_path = f"vision_debug_read_{timestamp}.jpg"
+                                            with open(debug_image_path, "wb") as f:
+                                                f.write(image_bytes)
+                                            LOGGER.info(f"💾 Saved debug image: {debug_image_path}")
+                                        except Exception as save_err:
+                                            LOGGER.warning(f"Could not save debug image: {save_err}")
+                                        
+                                        # Analyze with Vision API (no camera init needed)
+                                        processor = VisionProcessor()
+                                        try:
+                                            LOGGER.info("🔍 Reading text with OpenAI Vision API...")
+                                            text = await processor.read_text(image_bytes=image_bytes)
+                                            
+                                            if text:
+                                                LOGGER.info(f"✅ Text read: {text[:100]}...")
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": text
+                                                })
+                                                
+                                                # Speak the text
+                                                async with httpx.AsyncClient(timeout=15.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": text})
+                                            else:
+                                                error_msg = "Sorry, I couldn't read any text. Can you hold it closer?"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": error_msg
+                                                })
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": error_msg})
+                                        finally:
+                                            await processor.close()
+                                        
+                                        continue
+                                        
+                                    except Exception as vision_error:
+                                        LOGGER.error(f"Vision read command failed: {vision_error}", exc_info=True)
+                                        error_msg = "Sorry, I had trouble reading the text."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": error_msg
+                                        })
+                                        try:
+                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                            pi_url = f"http://{pi_ip}:8000/speak"
+                                            async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                await tts_client.post(pi_url, json={"text": error_msg})
+                                        except:
+                                            pass
+                                
                                 # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
                                 if assistant:
@@ -1501,6 +1693,199 @@ async def vision_endpoint(request: VisionRequest) -> VisionResponse:
         return VisionResponse(response=response, movement=movement)
     except Exception as e:
         LOGGER.error(f"Vision error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision/capture-and-analyze", tags=["AI"])
+async def capture_and_analyze(
+    question: str = Form("What do you see? If there's a problem or question, solve it."),
+    save_image: bool = Form(False)
+):
+    """Capture image from camera and analyze with OpenAI Vision API.
+    
+    Similar to ChatGPT's camera mode - show a paper with problem and get answer.
+    
+    Args:
+        question: Question to ask about the image
+        save_image: Whether to save the captured image
+    
+    Returns:
+        {
+            "response": "AI analysis/answer",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    
+    Example use cases:
+        - Show paper with "2+2=?" → Get answer: "4"
+        - Show any text → Get it read/transcribed
+        - Show diagram → Get it explained
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture image
+            LOGGER.info("Capturing image from camera...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image from camera")
+            
+            # Analyze with Vision API
+            LOGGER.info(f"Analyzing with question: {question}")
+            response = await processor.analyze_image(
+                image_bytes=image_bytes,
+                question=question,
+                max_tokens=800
+            )
+            
+            if not response:
+                raise HTTPException(status_code=500, detail="Vision API returned no response")
+            
+            result = {
+                "response": response,
+                "success": True
+            }
+            
+            # Optionally include the image
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except ImportError as e:
+        LOGGER.error(f"Vision module import failed: {e}")
+        raise HTTPException(status_code=503, detail="Vision processor not available")
+    except Exception as e:
+        LOGGER.error(f"Vision capture/analyze error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision/solve-problem", tags=["AI"])
+async def solve_problem_from_camera(save_image: bool = Form(False)):
+    """Capture image and solve any problem shown (optimized for math/text problems).
+    
+    This is a convenience endpoint optimized for problem-solving.
+    Show a paper with a problem and get the solution.
+    
+    Args:
+        save_image: Whether to return the captured image
+    
+    Returns:
+        {
+            "solution": "Step-by-step solution",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    
+    Example:
+        - Show "2+2=?" → Get "The answer is 4"
+        - Show "5×3=?" → Get "5 multiplied by 3 equals 15"
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture image
+            LOGGER.info("Capturing image for problem solving...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image")
+            
+            # Solve problem
+            LOGGER.info("Solving problem...")
+            solution = await processor.solve_problem(image_bytes)
+            
+            if not solution:
+                raise HTTPException(status_code=500, detail="Could not solve problem")
+            
+            result = {
+                "solution": solution,
+                "success": True
+            }
+            
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Problem solving error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision/read-text", tags=["AI"])
+async def read_text_from_camera(save_image: bool = Form(False)):
+    """Capture image and read/extract any text (OCR).
+    
+    Args:
+        save_image: Whether to return the captured image
+    
+    Returns:
+        {
+            "text": "Extracted text",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture and read text
+            LOGGER.info("Capturing image for text reading...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image")
+            
+            LOGGER.info("Reading text...")
+            text = await processor.read_text(image_bytes)
+            
+            if not text:
+                raise HTTPException(status_code=500, detail="No text found or read failed")
+            
+            result = {
+                "text": text,
+                "success": True
+            }
+            
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Text reading error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

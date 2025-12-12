@@ -27,6 +27,7 @@ Pillow>=9.0.0
 # Audio processing
 openai-whisper>=20230314
 piper-tts>=1.2.0
+pydub>=0.25.1  # Audio format conversion (requires ffmpeg)
 
 # Spotify integration
 spotipy>=2.25.0

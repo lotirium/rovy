@@ -1,13 +1,11 @@
 """
 Speech Processing - Whisper STT and TTS
-Uses local Whisper for speech recognition and espeak/Piper for TTS.
+Uses local Whisper or OpenAI Whisper API for speech recognition and Piper for TTS.
 """
 import os
 import re
 import io
 import wave
-import tempfile
-import subprocess
 import logging
 from typing import Optional, Any
 
@@ -15,13 +13,21 @@ import numpy as np
 
 logger = logging.getLogger('Speech')
 
-# Try to import Whisper
+# Try to import local Whisper
 WHISPER_OK = False
 try:
     import whisper
     WHISPER_OK = True
 except ImportError:
-    logger.warning("Whisper not available. Install: pip install openai-whisper")
+    logger.warning("Local Whisper not available. Install: pip install openai-whisper")
+
+# Try to import OpenAI (for API-based Whisper)
+OPENAI_OK = False
+try:
+    from openai import OpenAI
+    OPENAI_OK = True
+except ImportError:
+    logger.warning("OpenAI API client not available. Install: pip install openai")
 
 # Try to import Piper
 PIPER_OK = False
@@ -29,38 +35,58 @@ try:
     from piper import PiperVoice
     PIPER_OK = True
 except ImportError:
-    pass  # Will use espeak fallback
+    pass  # Piper TTS optional
 
 
 class SpeechProcessor:
-    """Speech recognition and synthesis using local models."""
+    """Speech recognition and synthesis using local or API models."""
     
-    def __init__(self, whisper_model: str = "base", tts_engine: str = "espeak", piper_voices: dict = None):
+    def __init__(
+        self, 
+        whisper_model: str = "base", 
+        tts_engine: str = "piper", 
+        piper_voices: dict = None,
+        use_openai_whisper: bool = False,
+        openai_api_key: str = None
+    ):
         self.whisper_model = None
         self.piper_voices = {}  # Dictionary of language -> PiperVoice
         self.piper_voice_paths = piper_voices or {}  # Dictionary of language -> voice path
         self.tts_engine = tts_engine
+        self.use_openai_whisper = use_openai_whisper
+        self.openai_client = None
         
-        # Load Whisper
+        # Setup OpenAI Whisper API (always initialize for on-demand use like meetings)
+        if OPENAI_OK:
+            api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+            if api_key:
+                self.openai_client = OpenAI(api_key=api_key)
+                logger.info("✅ OpenAI Whisper API available")
+            else:
+                logger.warning("OpenAI API key not found - API transcription unavailable")
+                self.use_openai_whisper = False
+        
+        # Load local Whisper (always load for quick transcriptions)
         if WHISPER_OK:
             try:
-                logger.info(f"Loading Whisper ({whisper_model})...")
+                logger.info(f"Loading local Whisper ({whisper_model})...")
                 self.whisper_model = whisper.load_model(whisper_model)
-                logger.info("✅ Whisper ready")
+                logger.info("✅ Local Whisper ready (for voice commands)")
             except Exception as e:
-                logger.error(f"Whisper load failed: {e}")
+                logger.error(f"Local Whisper load failed: {e}")
         
         # Setup TTS
         if tts_engine == "piper" and PIPER_OK:
             self._init_piper_voices()
         else:
-            self._check_espeak()
+            self.tts_engine = "none"
+            logger.warning("TTS not available (Piper not installed)")
     
     def _init_piper_voices(self):
         """Initialize Piper TTS voices for multiple languages."""
         if not self.piper_voice_paths:
-            logger.info("No Piper voice paths configured, using espeak")
-            self._check_espeak()
+            logger.warning("No Piper voice paths configured")
+            self.tts_engine = "none"
             return
         
         # Try to load at least one voice (preferably English)
@@ -77,8 +103,8 @@ class SpeechProcessor:
         if loaded_count > 0:
             logger.info(f"✅ Piper ready with {loaded_count} language(s)")
         else:
-            logger.info("No Piper voices loaded, using espeak")
-            self._check_espeak()
+            logger.warning("No Piper voices loaded, TTS not available")
+            self.tts_engine = "none"
     
     def _load_piper_voice(self, language: str) -> Optional[Any]:
         """Lazy-load a Piper voice for a specific language."""
@@ -100,24 +126,85 @@ class SpeechProcessor:
         
         return None
     
-    def _check_espeak(self):
-        """Check if espeak is available."""
-        try:
-            result = subprocess.run(['espeak', '--version'], capture_output=True, timeout=2)
-            if result.returncode == 0:
-                self.tts_engine = "espeak"
-                logger.info("✅ espeak ready")
-        except:
-            logger.warning("espeak not available")
-            self.tts_engine = "none"
-    
-    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> Optional[str]:
-        """Transcribe audio to text using Whisper (English only)."""
+    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000, use_api: bool = False) -> Optional[str]:
+        """Transcribe audio to text using Whisper (local or API).
+        
+        Args:
+            audio_bytes: Raw audio data
+            sample_rate: Audio sample rate
+            use_api: Force use of OpenAI API for this transcription (overrides default)
+        """
+        # Use OpenAI Whisper API if explicitly requested or if it's the default
+        if (use_api or self.use_openai_whisper) and self.openai_client:
+            return self._transcribe_openai(audio_bytes, sample_rate)
+        
+        # Fall back to local Whisper
         if not self.whisper_model:
-            logger.error("Whisper not loaded")
+            logger.error("No Whisper transcription available (neither API nor local)")
             return None
         
+        return self._transcribe_local(audio_bytes, sample_rate)
+    
+    def _transcribe_openai(self, audio_bytes: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe using OpenAI Whisper API."""
         try:
+            # Validate buffer size - must be multiple of 2 for int16
+            if len(audio_bytes) % 2 != 0:
+                logger.warning(f"Buffer size {len(audio_bytes)} is not a multiple of 2, trimming last byte")
+                audio_bytes = audio_bytes[:-1]
+            
+            if len(audio_bytes) == 0:
+                logger.error("Empty audio buffer after validation")
+                return None
+            
+            # Convert PCM bytes to WAV format for OpenAI API
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav:
+                wav.setnchannels(1)  # Mono
+                wav.setsampwidth(2)  # 16-bit
+                wav.setframerate(sample_rate)
+                wav.writeframes(audio_bytes)
+            
+            wav_buffer.seek(0)
+            wav_buffer.name = "audio.wav"  # OpenAI API requires a filename
+            
+            # Call OpenAI Whisper API
+            logger.info("Transcribing with OpenAI Whisper API...")
+            response = self.openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=wav_buffer,
+                response_format="text"
+            )
+            
+            text = response.strip() if isinstance(response, str) else str(response).strip()
+            
+            if text:
+                logger.info(f"Transcribed (OpenAI): '{text}'")
+            else:
+                logger.warning("OpenAI Whisper returned empty text")
+            
+            return text if text else None
+            
+        except Exception as e:
+            logger.error(f"OpenAI Whisper API transcription failed: {e}")
+            # Try falling back to local Whisper if available
+            if self.whisper_model:
+                logger.info("Falling back to local Whisper...")
+                return self._transcribe_local(audio_bytes, sample_rate)
+            return None
+    
+    def _transcribe_local(self, audio_bytes: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe using local Whisper model."""
+        try:
+            # Validate buffer size - must be multiple of 2 for int16
+            if len(audio_bytes) % 2 != 0:
+                logger.warning(f"Buffer size {len(audio_bytes)} is not a multiple of 2, trimming last byte")
+                audio_bytes = audio_bytes[:-1]
+            
+            if len(audio_bytes) == 0:
+                logger.error("Empty audio buffer after validation")
+                return None
+            
             # Convert bytes to float array
             audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
@@ -179,7 +266,7 @@ class SpeechProcessor:
         text = self._preprocess(text)
         logger.info(f"Synthesizing ({language}): '{text[:50]}...'")
         
-        # Try Piper first if available
+        # Use Piper if available
         if self.tts_engine == "piper" and PIPER_OK:
             voice = self._load_piper_voice(language)
             if voice:
@@ -190,8 +277,8 @@ class SpeechProcessor:
                 if voice:
                     return self._synth_piper(text, voice)
         
-        # Fall back to espeak
-        return self._synth_espeak(text, language=language)
+        logger.warning("TTS not available - no Piper voices loaded")
+        return None
     
     def _synth_piper(self, text: str, voice: Any) -> Optional[bytes]:
         """Synthesize using Piper with the specified voice."""
@@ -217,44 +304,6 @@ class SpeechProcessor:
             
         except Exception as e:
             logger.error(f"Piper synthesis failed: {e}")
-            return None
-    
-    def _synth_espeak(self, text: str, speed: int = 150, language: str = "en") -> Optional[bytes]:
-        """
-        Synthesize using espeak with language support.
-        
-        Args:
-            text: Text to synthesize
-            speed: Speech speed
-            language: ISO language code (espeak supports 100+ languages)
-        """
-        try:
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                temp_path = f.name
-            
-            # Language code mapping for espeak
-            voice_map = {
-                'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 
-                'it': 'it', 'pt': 'pt', 'ru': 'ru', 'zh': 'zh',
-                'ja': 'ja', 'ko': 'ko', 'ar': 'ar', 'hi': 'hi',
-                'nl': 'nl', 'pl': 'pl', 'tr': 'tr',
-            }
-            espeak_voice = voice_map.get(language, 'en')
-            
-            subprocess.run(
-                ['espeak', '-v', espeak_voice, '-w', temp_path, '-s', str(speed), text],
-                capture_output=True,
-                timeout=30
-            )
-            
-            with open(temp_path, 'rb') as f:
-                audio = f.read()
-            
-            os.unlink(temp_path)
-            return audio
-            
-        except Exception as e:
-            logger.error(f"espeak synthesis failed: {e}")
             return None
     
     def _preprocess(self, text: str) -> str:

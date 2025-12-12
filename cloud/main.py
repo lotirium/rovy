@@ -659,7 +659,9 @@ class RovyCloudServer:
                 self.speech = SpeechProcessor(
                     whisper_model=config.WHISPER_MODEL,
                     tts_engine=config.TTS_ENGINE,
-                    piper_voices=config.PIPER_VOICES
+                    piper_voices=config.PIPER_VOICES,
+                    use_openai_whisper=config.USE_OPENAI_WHISPER,
+                    openai_api_key=config.OPENAI_API_KEY
                 )
                 logger.info("✅ Speech processor ready")
             except Exception as e:
