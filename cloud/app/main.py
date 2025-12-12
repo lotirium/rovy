@@ -1284,6 +1284,48 @@ async def voice_websocket(websocket: WebSocket):
                                     except Exception as music_error:
                                         LOGGER.error(f"Stop music command failed: {music_error}")
                                 
+                                # Photo commands - take picture (uses existing /shot endpoint)
+                                if ('take' in transcript_lower or 'capture' in transcript_lower) and ('picture' in transcript_lower or 'photo' in transcript_lower):
+                                    LOGGER.info(f"📸 Take picture command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        photo_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        # Inform user we're taking photo
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": "Say cheese! Taking your photo now."
+                                        })
+                                        
+                                        async with httpx.AsyncClient(timeout=10.0) as client:
+                                            photo_response = await client.get(photo_url)
+                                            if photo_response.status_code == 200:
+                                                response_text = "Got it! Your photo is ready. You can view it in the Photo Time tab."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                            else:
+                                                response_text = "Sorry, I couldn't capture the photo."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                continue
+                                    except Exception as photo_error:
+                                        LOGGER.error(f"Photo capture command failed: {photo_error}")
+                                        response_text = "Sorry, something went wrong with the camera."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": response_text
+                                        })
+                                        continue
+                                
                                 # Vision commands - solve problems, read text, etc.
                                 vision_solve_patterns = [
                                     'solve this', 'solve it', 'solve the problem', 'solve that',

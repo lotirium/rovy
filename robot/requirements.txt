@@ -13,6 +13,8 @@ pyserial>=3.5
 
 # Camera
 opencv-python>=4.5.0
+# Note: depthai (OakD camera) is installed separately via system package manager
+# For photo capture feature, ensure depthai is installed: pip install depthai
 
 # Audio (ReSpeaker)
 pyaudio>=0.2.11

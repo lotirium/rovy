@@ -2252,6 +2252,34 @@ async def control_navigation(command: NavigationCommand):
         raise HTTPException(status_code=400, detail=f"Unknown action: {command.action}")
 
 
+# ============================================================================
+# PHOTO TIME - Printing endpoint (capture uses existing /shot endpoint)
+# ============================================================================
+
+@app.post("/photo/print")
+async def print_photo(request: dict):
+    """Print a photo to Kodak printer via Bluetooth.
+    
+    Note: This endpoint is for future server-side printing.
+    Currently, printing is handled client-side via the mobile app's Bluetooth.
+    """
+    image_base64 = request.get("image", "")
+    
+    if not image_base64:
+        raise HTTPException(status_code=400, detail="No image provided")
+    
+    print("[Photo] Print request received")
+    print("[Photo] Note: Printing is currently handled by mobile app via Bluetooth")
+    
+    # In the future, we could add server-side Bluetooth printing here
+    # using PyBluez or similar library to connect to Kodak Mini 2
+    
+    return {
+        "status": "acknowledged",
+        "message": "Printing is handled by mobile app via Bluetooth"
+    }
+
+
 @app.post("/speak")
 async def speak_text(request: dict):
     """Speak text using robot's TTS (from cloud AI response) with language support."""
