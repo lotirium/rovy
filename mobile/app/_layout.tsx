@@ -5,6 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import {
   JetBrainsMono_400Regular,
@@ -66,20 +67,22 @@ export default function RootLayout() {
   }
 
   return (
-    <SafeAreaProvider>
-      <RobotProvider>
-        <ThemeProvider value={DarkTheme}>
-          <Stack>
-            <Stack.Screen name="connection" options={{ headerShown: false }} />
-            <Stack.Screen name="manual" options={{ headerShown: false }} />
-            <Stack.Screen name="agentic" options={{ headerShown: false }} />
-            <Stack.Screen name="wifi" options={{ headerShown: false }} />
-            <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-            <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-          </Stack>
-          <StatusBar style="light" />
-        </ThemeProvider>
-      </RobotProvider>
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <RobotProvider>
+          <ThemeProvider value={DarkTheme}>
+            <Stack>
+              <Stack.Screen name="connection" options={{ headerShown: false }} />
+              <Stack.Screen name="manual" options={{ headerShown: false }} />
+              <Stack.Screen name="agentic" options={{ headerShown: false }} />
+              <Stack.Screen name="wifi" options={{ headerShown: false }} />
+              <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+              <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+            </Stack>
+            <StatusBar style="light" />
+          </ThemeProvider>
+        </RobotProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }

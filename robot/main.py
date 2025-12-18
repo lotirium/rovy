@@ -56,6 +56,13 @@ except Exception as e:
     ROVER_OK = False
     print(f"WARNING: Rover not available: {e}")
 
+try:
+    from wake_word_detector import WakeWordDetector
+    WAKE_WORD_OK = True
+except Exception as e:
+    WAKE_WORD_OK = False
+    print(f"WARNING: Wake word detector not available: {e}")
+
 
 class RovyClient:
     """
@@ -71,6 +78,7 @@ class RovyClient:
         self.rover = None
         self.camera = None
         self.audio_stream = None
+        self.wake_word_detector = None
         
         # State
         self.is_listening = False
@@ -147,6 +155,31 @@ class RovyClient:
             return True
         except Exception as e:
             print(f"[Audio] Init failed: {e}")
+            return False
+    
+    def init_wake_word_detector(self):
+        """Initialize wake word detector with VAD + Whisper."""
+        if not WAKE_WORD_OK:
+            print("[Wake Word] Not available")
+            return False
+        
+        try:
+            print("[Wake Word] Loading Silero VAD + Whisper tiny...")
+            self.wake_word_detector = WakeWordDetector(
+                wake_words=config.WAKE_WORDS,
+                sample_rate=config.VAD_SAMPLE_RATE,
+                device_index=self.audio_device_index if hasattr(self, 'audio_device_index') else None,
+                vad_threshold=config.VAD_THRESHOLD,
+                whisper_model=config.WHISPER_MODEL,
+                whisper_device=config.WHISPER_DEVICE,
+                whisper_compute_type=config.WHISPER_COMPUTE_TYPE,
+                min_speech_duration=config.VAD_MIN_SPEECH_DURATION,
+                min_silence_duration=config.VAD_MIN_SILENCE_DURATION,
+            )
+            print(f"[Wake Word] Ready! Listening for: {config.WAKE_WORDS}")
+            return True
+        except Exception as e:
+            print(f"[Wake Word] Init failed: {e}")
             return False
     
     async def connect_server(self):
@@ -234,6 +267,15 @@ class RovyClient:
             elif msg_type == 'display':
                 await self.handle_display(msg)
             
+            elif msg_type == 'navigation':
+                await self.handle_navigation(msg)
+            
+            elif msg_type == 'dance':
+                await self.handle_dance(msg)
+            
+            elif msg_type == 'music':
+                await self.handle_music(msg)
+            
             elif msg_type == 'pong':
                 pass  # Heartbeat response
             
@@ -253,14 +295,27 @@ class RovyClient:
         
         print(f"[Speak] {text[:50]}...")
         
-        if audio_b64 and PLAYBACK_OK:
-            # Play pre-generated audio from server
+        if audio_b64:
+            # Play pre-generated audio from server using aplay with correct device
             try:
+                import subprocess
+                import tempfile
+                import os
+                
                 audio_bytes = base64.b64decode(audio_b64)
-                audio_io = io.BytesIO(audio_bytes)
-                data, samplerate = sf.read(audio_io)
-                sd.play(data, samplerate)
-                sd.wait()
+                
+                # Save to temp file and play with aplay on correct device
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    f.write(audio_bytes)
+                    temp_wav = f.name
+                
+                # Play using aplay with configured speaker device
+                subprocess.run(
+                    ['aplay', '-D', config.SPEAKER_DEVICE, temp_wav],
+                    capture_output=True,
+                    timeout=30
+                )
+                os.unlink(temp_wav)
                 return
             except Exception as e:
                 print(f"[Speak] Server audio failed: {e}, trying Piper...")
@@ -286,11 +341,13 @@ class RovyClient:
                 timeout=30
             )
             
-            if proc.returncode == 0 and PLAYBACK_OK and os.path.exists(wav_path):
-                # Play the generated audio
-                data, samplerate = sf.read(wav_path)
-                sd.play(data, samplerate)
-                sd.wait()
+            if proc.returncode == 0 and os.path.exists(wav_path):
+                # Play the generated audio using aplay with correct device
+                subprocess.run(
+                    ['aplay', '-D', config.SPEAKER_DEVICE, wav_path],
+                    capture_output=True,
+                    timeout=30
+                )
                 os.unlink(wav_path)
             else:
                 # Fallback to espeak
@@ -363,6 +420,223 @@ class RovyClient:
         lines = msg.get('lines', [])
         self.rover.display_lines(lines)
     
+    async def handle_navigation(self, msg):
+        """Handle navigation command."""
+        action = msg.get('action', 'status')
+        
+        print(f"[Navigation] {action}")
+        
+        # Import navigator dynamically when needed
+        if not hasattr(self, 'navigator'):
+            try:
+                import sys
+                import os
+                # Add oakd_navigation to path
+                nav_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'oakd_navigation')
+                if nav_path not in sys.path:
+                    sys.path.insert(0, nav_path)
+                
+                from rovy_integration import RovyNavigator
+                self.navigator = None  # Will be initialized on start
+                print("[Navigation] Module loaded")
+            except Exception as e:
+                print(f"[Navigation] Failed to import: {e}")
+                return
+        
+        # Handle different navigation actions
+        if action == 'start_explore':
+            duration = msg.get('duration', None)
+            
+            def start_nav():
+                try:
+                    if self.navigator is None:
+                        from rovy_integration import RovyNavigator
+                        # Pass existing rover instance to avoid serial port conflict
+                        self.navigator = RovyNavigator(rover_instance=self.rover)
+                        self.navigator.start()
+                    
+                    print(f"[Navigation] Starting exploration (duration={duration})")
+                    self.navigator.explore(duration=duration)
+                except Exception as e:
+                    print(f"[Navigation] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Run navigation in separate thread
+            threading.Thread(target=start_nav, daemon=True).start()
+        
+        elif action == 'stop':
+            if hasattr(self, 'navigator') and self.navigator:
+                def stop_nav():
+                    try:
+                        self.navigator.stop()
+                        self.navigator.cleanup()
+                        self.navigator = None
+                    except Exception as e:
+                        print(f"[Navigation] Stop error: {e}")
+                
+                threading.Thread(target=stop_nav, daemon=True).start()
+        
+        elif action == 'goto':
+            x = msg.get('x', 0)
+            y = msg.get('y', 0)
+            
+            def navigate_to():
+                try:
+                    if self.navigator is None:
+                        from rovy_integration import RovyNavigator
+                        # Pass existing rover instance to avoid serial port conflict
+                        self.navigator = RovyNavigator(rover_instance=self.rover)
+                        self.navigator.start()
+                    
+                    print(f"[Navigation] Navigating to ({x}, {y})")
+                    self.navigator.navigate_to(x, y)
+                except Exception as e:
+                    print(f"[Navigation] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            threading.Thread(target=navigate_to, daemon=True).start()
+    
+    async def handle_dance(self, msg):
+        """Handle dance command."""
+        if not self.rover:
+            print("[Dance] No rover instance available")
+            return
+        
+        style = msg.get('style', 'party')
+        duration = msg.get('duration', 10)
+        with_music = msg.get('with_music', False)
+        music_genre = msg.get('music_genre', 'dance')
+        
+        print(f"[Dance] 💃 Starting {style} dance for {duration}s!")
+        if with_music:
+            print(f"[Dance] 🎵 With {music_genre} music!")
+        
+        # Display on OLED
+        self.rover.display_lines([
+            "DANCE MODE" + (" 🎵" if with_music else ""),
+            f"Style: {style}",
+            f"Time: {duration}s",
+            "💃🕺💃"
+        ])
+        
+        # Run dance in separate thread
+        def do_dance():
+            try:
+                # Start music if requested
+                music_player = None
+                if with_music:
+                    try:
+                        from music_player import get_music_player
+                        music_player = get_music_player()
+                        
+                        if music_player and music_player.yt_music:
+                            print(f"[Dance] 🎵 Starting {music_genre} music...")
+                            music_player.play_random(music_genre)
+                            time.sleep(2)  # Let music start
+                        else:
+                            print("[Dance] ⚠️ Music player not available, dancing without music")
+                    except Exception as music_error:
+                        print(f"[Dance] ⚠️ Music error: {music_error}, dancing without music")
+                
+                # Perform dance
+                self.rover.dance(style=style, duration=duration)
+                
+                # Stop music after dance
+                if music_player and music_player.is_playing:
+                    print("[Dance] 🎵 Stopping music...")
+                    music_player.stop()
+                
+                # Reset display after dance
+                self.rover.display_lines([
+                    "ROVY",
+                    "Cloud Mode",
+                    "Ready",
+                    ""
+                ])
+            except Exception as e:
+                print(f"[Dance] Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        threading.Thread(target=do_dance, daemon=True).start()
+    
+    async def handle_music(self, msg):
+        """Handle music playback command."""
+        action = msg.get('action', 'play')
+        genre = msg.get('genre', 'dance')
+        
+        try:
+            from music_player import get_music_player
+            music_player = get_music_player()
+            
+            if not music_player or not music_player.yt_music:
+                print("[Music] ⚠️ YouTube Music not configured")
+                if self.rover:
+                    self.rover.display_lines([
+                        "Music Error",
+                        "YT Music",
+                        "Not Setup",
+                        ""
+                    ])
+                return
+            
+            if action == 'play':
+                print(f"[Music] 🎵 Playing {genre} music...")
+                
+                if self.rover:
+                    self.rover.display_lines([
+                        "MUSIC MODE",
+                        f"Genre: {genre}",
+                        "Loading...",
+                        "🎵"
+                    ])
+                
+                def play_music():
+                    success = music_player.play_random(genre)
+                    if success and self.rover:
+                        song = music_player.current_song
+                        if song:
+                            self.rover.display_lines([
+                                "NOW PLAYING",
+                                song['title'][:21],
+                                song['artist'][:21],
+                                "🎵"
+                            ])
+                    elif self.rover:
+                        self.rover.display_lines([
+                            "Music Error",
+                            "No songs found",
+                            f"Genre: {genre}",
+                            ""
+                        ])
+                
+                threading.Thread(target=play_music, daemon=True).start()
+            
+            elif action == 'stop':
+                print("[Music] ⏹️ Stopping music...")
+                music_player.stop()
+                
+                if self.rover:
+                    self.rover.display_lines([
+                        "MUSIC",
+                        "Stopped",
+                        "",
+                        ""
+                    ])
+            
+            elif action == 'status':
+                status = music_player.get_status()
+                print(f"[Music] Status: {status}")
+                
+        except ImportError:
+            print("[Music] ⚠️ music_player module not found")
+        except Exception as e:
+            print(f"[Music] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def capture_image(self) -> bytes:
         """Capture image from camera as JPEG bytes."""
         if not self.camera:
@@ -408,16 +682,60 @@ class RovyClient:
             print(f"[Audio] Record error: {e}")
             return None
     
+    async def wake_word_loop(self):
+        """Listen for wake word and send audio to cloud when detected."""
+        if not self.wake_word_detector:
+            print("[Wake Word] Detector not initialized")
+            return
+        
+        print("[Wake Word] 👂 Listening for wake words...")
+        
+        while self.running and self.ws:
+            try:
+                # Run wake word detection in thread to not block async loop
+                def listen():
+                    return self.wake_word_detector.listen_for_wake_word(timeout=5)
+                
+                # Listen for wake word (non-blocking with timeout)
+                detected = await asyncio.get_event_loop().run_in_executor(None, listen)
+                
+                if detected and self.ws:
+                    print("[Wake Word] ✅ Wake word detected! Recording query...")
+                    
+                    # Record full query
+                    def record():
+                        return self.wake_word_detector.record_query(config.QUERY_RECORD_DURATION)
+                    
+                    audio_bytes = await asyncio.get_event_loop().run_in_executor(None, record)
+                    
+                    if audio_bytes and self.ws:
+                        print(f"[Wake Word] 📤 Sending {len(audio_bytes)} bytes to cloud...")
+                        await self.send_message(
+                            "audio_data",
+                            audio_base64=base64.b64encode(audio_bytes).decode('utf-8'),
+                            sample_rate=config.VAD_SAMPLE_RATE,
+                            duration=config.QUERY_RECORD_DURATION
+                        )
+                        print("[Wake Word] ✅ Audio sent to cloud")
+                
+                # Small delay before next detection
+                await asyncio.sleep(0.1)
+                
+            except websockets.exceptions.ConnectionClosed:
+                print("[Wake Word] Connection lost")
+                break
+            except Exception as e:
+                print(f"[Wake Word] Error: {e}")
+                await asyncio.sleep(1)
+    
     async def stream_loop(self):
-        """Main loop for streaming audio/video to server."""
+        """Main loop for streaming video and sensor data to server."""
         print("[Stream] Starting...")
         
         image_interval = 1.0 / config.CAMERA_FPS
-        audio_interval = config.AUDIO_BUFFER_SECONDS
         sensor_interval = 5.0
         
         last_image_time = 0
-        last_audio_time = 0
         last_sensor_time = 0
         
         while self.running and self.ws:
@@ -436,18 +754,6 @@ class RovyClient:
                             height=config.CAMERA_HEIGHT
                         )
                     last_image_time = now
-                
-                # Send audio periodically
-                if AUDIO_OK and self.is_listening and (now - last_audio_time) >= audio_interval:
-                    audio_bytes = self.record_audio(audio_interval)
-                    if audio_bytes:
-                        await self.send_message(
-                            "audio_data",
-                            audio_base64=base64.b64encode(audio_bytes).decode('utf-8'),
-                            sample_rate=config.SAMPLE_RATE,
-                            duration=audio_interval
-                        )
-                    last_audio_time = now
                 
                 # Send sensor data periodically
                 if self.rover and (now - last_sensor_time) >= sensor_interval:
@@ -498,18 +804,28 @@ class RovyClient:
         self.init_camera()
         self.init_audio()
         
+        # Initialize wake word detector (only once)
+        if WAKE_WORD_OK:
+            self.init_wake_word_detector()
+        
         # Main loop with reconnection
         while self.running:
             if await self.connect_server():
                 self.is_listening = True
                 
-                # Run stream and receive loops
-                stream_task = asyncio.create_task(self.stream_loop())
-                receive_task = asyncio.create_task(self.receive_loop())
+                # Run stream, receive, and wake word loops
+                tasks = [
+                    asyncio.create_task(self.stream_loop()),
+                    asyncio.create_task(self.receive_loop()),
+                ]
                 
-                # Wait for either to finish (connection lost)
+                # Add wake word loop if available
+                if self.wake_word_detector:
+                    tasks.append(asyncio.create_task(self.wake_word_loop()))
+                
+                # Wait for any to finish (connection lost)
                 done, pending = await asyncio.wait(
-                    [stream_task, receive_task],
+                    tasks,
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 
@@ -537,6 +853,9 @@ class RovyClient:
         
         if self.camera:
             self.camera.release()
+        
+        if self.wake_word_detector:
+            self.wake_word_detector.cleanup()
         
         if hasattr(self, 'pyaudio') and self.pyaudio:
             self.pyaudio.terminate()

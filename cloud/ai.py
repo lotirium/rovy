@@ -1,27 +1,36 @@
 """
-Cloud AI Assistant - Using Qwen2-VL for Vision + Text
-Fast VLM running on PC with RTX 4080 SUPER.
+Cloud AI Assistant - OpenAI API Integration
+Uses OpenAI GPT-4 for high-quality responses with personality and flattery.
 """
 import os
 import re
-import gc
 import time
 import logging
+import asyncio
+import base64
 from typing import Optional, Dict, Any
 from datetime import datetime
+from functools import lru_cache
 
 logger = logging.getLogger('Assistant')
 
-# Try to import Qwen2-VL dependencies
-QWEN_VL_OK = False
+# Try to import OpenAI
+OPENAI_OK = False
 try:
-    import torch
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-    from qwen_vl_utils import process_vision_info
-    QWEN_VL_OK = True
+    from openai import OpenAI
+    OPENAI_OK = True
 except ImportError as e:
-    logger.warning(f"Qwen2-VL not available: {e}")
-    logger.warning("Install: pip install transformers accelerate qwen-vl-utils torch")
+    logger.warning(f"OpenAI not available: {e}")
+    logger.warning("Install: pip install openai")
+
+# Try to import tool executor
+TOOLS_OK = False
+try:
+    from tools import get_tool_executor
+    TOOLS_OK = True
+except ImportError as e:
+    logger.warning(f"Tools not available: {e}")
+    get_tool_executor = None
 
 try:
     from PIL import Image
@@ -38,206 +47,336 @@ except ImportError:
 
 
 class CloudAssistant:
-    """AI Assistant using Qwen2-VL for both vision and text."""
+    """AI Assistant using OpenAI API with personality and flattery."""
     
-    MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+    # Personality system prompt with flattery
+    SYSTEM_PROMPT = """You are Rovy, a charming and delightful AI assistant with a warm, friendly personality. 
+You have a natural ability to make people feel good about themselves through genuine compliments and positive reinforcement.
+
+Your personality traits:
+- Warm, friendly, and enthusiastic
+- Genuinely interested in helping and making people happy
+- Skillful at giving compliments that feel authentic and specific
+- Optimistic and encouraging
+- Conversational and engaging, not robotic
+
+When interacting:
+- Give genuine compliments when appropriate (e.g., "That's a great question!", "You're so thoughtful!", "I love your curiosity!")
+- Be encouraging and supportive
+- Show enthusiasm for helping
+- Keep responses concise (under 30 words for most queries, up to 50 for complex ones)
+- Be conversational and natural, not overly formal
+- When users ask about themselves or their actions, find something positive to acknowledge
+
+Remember: Your goal is to be helpful while making the user feel good about themselves. Be genuine, not excessive."""
+
+    # Response cache for common queries
+    _response_cache = {}
     
     def __init__(
         self,
-        model_id: str = None,
-        max_pixels: int = 1280 * 720,  # Limit image size for speed
-        lazy_load: bool = False
+        api_key: str = None,
+        model: str = "gpt-4o",  # Use GPT-4o for best quality
+        vision_model: str = "gpt-4o",  # GPT-4o supports vision
+        enable_tools: bool = True,
+        temperature: float = 0.7,  # Higher temperature for more personality
     ):
-        self.model_id = model_id or self.MODEL_ID
-        self.max_pixels = max_pixels
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.model = model
+        self.vision_model = vision_model
+        self.enable_tools = enable_tools
+        self.temperature = temperature
+        self.last_tool_result = None
         
-        self.model = None
-        self.processor = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        if not QWEN_VL_OK:
-            logger.error("Qwen2-VL dependencies not installed!")
+        if not OPENAI_OK:
+            logger.error("OpenAI dependencies not installed!")
+            self.client = None
             return
         
-        logger.info(f"Device: {self.device}")
-        logger.info(f"Model: {self.model_id}")
-        
-        if not lazy_load:
-            self._load_model()
-    
-    def _free_gpu(self):
-        """Free GPU memory."""
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    def _load_model(self):
-        """Load the Qwen2-VL model."""
-        if self.model is not None:
+        if not self.api_key:
+            logger.error("OPENAI_API_KEY not set! Set it in environment or pass to constructor.")
+            self.client = None
             return
         
-        logger.info("Loading Qwen2-VL model...")
-        start = time.time()
+        self.client = OpenAI(api_key=self.api_key)
+        logger.info(f"✅ OpenAI client initialized (model: {self.model})")
         
-        self._free_gpu()
+        # Initialize tool executor if enabled
+        self.tool_executor = None
+        if enable_tools and TOOLS_OK:
+            self.tool_executor = get_tool_executor(assistant=self)
+            logger.info("Tool calling enabled")
+    
+    def classify_intent(self, question: str) -> dict:
+        """Use AI to classify query intent."""
+        if not self.client:
+            return {"type": "conversational", "params": {}}
         
         try:
-            # Load model fully on GPU
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                self.model_id,
-                torch_dtype=torch.bfloat16,
-                device_map="cuda:0",
-                attn_implementation="eager",  # or "flash_attention_2" if installed
+            classification_prompt = f"""Query: {question}
+
+Is this asking about:
+1. VISION - what you see with camera
+2. WEATHER - weather/temperature/forecast  
+3. TIME - current time/date
+4. MATH - calculation/arithmetic
+5. MUSIC - play/pause/control music
+6. SEARCH - who is/what is/look up
+7. CHAT - general conversation
+
+Answer with just the word: VISION, WEATHER, TIME, MATH, MUSIC, SEARCH, or CHAT
+
+Answer:"""
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful classifier. Respond with only one word."},
+                    {"role": "user", "content": classification_prompt}
+                ],
+                max_tokens=10,
+                temperature=0.1,
             )
             
-            # Load processor
-            self.processor = AutoProcessor.from_pretrained(
-                self.model_id,
-                min_pixels=256 * 256,
-                max_pixels=self.max_pixels,
-            )
+            response_text = response.choices[0].message.content.strip().upper()
+            logger.info(f"AI classification: '{response_text}'")
             
-            logger.info(f"✅ Qwen2-VL loaded in {time.time() - start:.1f}s")
-            
-            # Log VRAM usage
-            if torch.cuda.is_available():
-                vram_used = torch.cuda.memory_allocated() / 1024**3
-                logger.info(f"VRAM used: {vram_used:.1f}GB")
+            # Parse the response
+            if "VISION" in response_text:
+                return {"type": "vision", "params": {}}
+            elif "WEATHER" in response_text:
+                location = self._extract_location_ai(question)
+                return {"type": "weather", "params": {"location": location}}
+            elif "TIME" in response_text:
+                return {"type": "time", "params": {}}
+            elif "MATH" in response_text:
+                expr = self._extract_math(question)
+                return {"type": "calculator", "params": {"expression": expr}}
+            elif "MUSIC" in response_text:
+                action = self._extract_music_action(question)
+                return {"type": "music", "params": {"action": action}}
+            elif "SEARCH" in response_text:
+                return {"type": "search", "params": {"query": question}}
+            else:
+                return {"type": "conversational", "params": {}}
                 
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            self.model = None
-            self.processor = None
+            logger.warning(f"AI classification failed: {e}")
+            return {"type": "conversational", "params": {}}
     
-    def ask(self, question: str, max_tokens: int = 150, temperature: float = 0.3) -> str:
-        """Ask a text-only question."""
-        if not self.model:
-            self._load_model()
-            if not self.model:
-                return "Model not available."
+    def _extract_location_ai(self, question: str) -> str:
+        """Extract location from weather question."""
+        words = question.split()
+        skip = {'what', 'is', 'the', 'weather', 'in', 'at', 'for', 'like', 'today', 'whats', 'how', 'hows', 'there', 'here', 'now'}
+        locations = [w.strip('?.,!') for w in words if w.lower() not in skip and len(w) > 2]
+        return locations[0] if locations else "Seoul"
+    
+    def _extract_math(self, question: str) -> str:
+        """Extract math expression from question."""
+        match = re.search(r'([\d\s\+\-\*\/\(\)\.]+)', question)
+        if match:
+            return match.group(1).strip()
+        return question
+    
+    def _extract_music_action(self, question: str) -> str:
+        """Extract music action from question."""
+        q = question.lower()
+        if 'pause' in q:
+            return 'pause'
+        elif 'stop' in q:
+            return 'stop'
+        elif 'next' in q or 'skip' in q:
+            return 'next'
+        elif 'previous' in q or 'back' in q:
+            return 'previous'
+        return 'play'
+    
+    def ask(self, question: str, max_tokens: int = None, temperature: float = None, disable_tools: bool = False) -> str:
+        """
+        Ask a text-only question using OpenAI API.
+        
+        Args:
+            question: The question to ask
+            max_tokens: Maximum tokens in response (default: auto-calculated)
+            temperature: Sampling temperature (default: uses instance temperature)
+            disable_tools: If True, skip tool detection (prevents recursion)
+        """
+        if not self.client:
+            return "OpenAI API not available. Please set OPENAI_API_KEY environment variable."
+        
+        # Check cache for common queries
+        cache_key = question.lower().strip()
+        if cache_key in self._response_cache:
+            logger.info(f"Cache hit: {question}")
+            return self._response_cache[cache_key]
         
         logger.info(f"Query: {question}")
         start = time.time()
+        question_len = len(question.split())
+        
+        # Use tool detection if enabled
+        tool_result = None
+        self.last_tool_result = None
+        if self.enable_tools and self.tool_executor and not disable_tools:
+            tool_request = self.tool_executor.detect_tool_use(question)
+            if tool_request:
+                logger.info(f"Tool detected: {tool_request['tool']}")
+                # Execute tool
+                loop = self._get_event_loop()
+                tool_result = loop.run_until_complete(
+                    self.tool_executor.execute(tool_request['tool'], tool_request['params'])
+                )
+                
+                # Store tool result for language extraction
+                self.last_tool_result = tool_result
+                
+                # If tool executed successfully, return result DIRECTLY
+                if tool_result and tool_result.get("success"):
+                    result_text = tool_result['result']
+                    logger.info(f"✅ Tool SUCCESS - Returning directly: {result_text}")
+                    return result_text
+                elif tool_result:
+                    logger.warning(f"⚠️ Tool FAILED: {tool_result.get('result', 'No result')}")
+        
+        # Dynamic max_tokens based on query complexity
+        if max_tokens is None:
+            if question_len <= 5:
+                max_tokens = 50  # Short answers for short questions
+            elif question_len <= 15:
+                max_tokens = 100
+            else:
+                max_tokens = 150
+        
+        # Add time context if needed
+        time_ctx = ""
+        if any(p in question.lower() for p in ['time', 'date', 'today', 'day']):
+            time_ctx = f"Current time: {datetime.now().strftime('%I:%M %p, %A %B %d, %Y')}. "
+        
+        # Add tool result context if available but failed
+        tool_ctx = ""
+        if tool_result and not tool_result.get("success"):
+            tool_ctx = f"(Note: Tried to use external tool but it failed: {tool_result.get('result', 'Unknown error')}). "
+        
+        # Build user message with context
+        user_message = f"{time_ctx}{tool_ctx}{question}"
         
         try:
-            # Add time context if needed
-            time_ctx = ""
-            if any(p in question.lower() for p in ['time', 'date', 'today', 'day']):
-                time_ctx = f"Current: {datetime.now().strftime('%I:%M %p, %A %B %d, %Y')}. "
-            
-            # Qwen2-VL works better with instruction in user message
-            system_instruction = "You are Jarvis, a friendly robot assistant. Always refer to yourself as Jarvis. Be concise (under 50 words)."
-            prompt = f"{system_instruction}\n{time_ctx}{question}"
-            messages = [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}]
-                }
-            ]
-            
-            # Prepare input
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            # Call OpenAI API with personality system prompt
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature if temperature is not None else self.temperature,
             )
-            inputs = self.processor(
-                text=[text],
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
             
-            # Generate
-            with torch.no_grad():
-                output_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    min_new_tokens=3,  # Prevent cutting off too early
-                    temperature=temperature,
-                    do_sample=temperature > 0,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                )
-            
-            # Decode response
-            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
-            answer = self.processor.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
-            
+            answer = response.choices[0].message.content.strip()
             answer = self._clean(answer)
-            logger.info(f"Response in {time.time() - start:.1f}s")
+            elapsed = time.time() - start
+            
+            # Cache common greetings and simple queries
+            if question_len <= 3 and len(self._response_cache) < 50:
+                self._response_cache[cache_key] = answer
+            
+            logger.info(f"Response in {elapsed*1000:.0f}ms")
             return answer
             
         except Exception as e:
             logger.error(f"Query failed: {e}")
-            return f"Error: {e}"
+            return f"Sorry, I encountered an error. {str(e)}"
     
-    def ask_with_vision(self, question: str, image, max_tokens: int = 200) -> str:
-        """Ask a question about an image."""
-        if not self.model:
-            self._load_model()
-            if not self.model:
-                return "Model not available."
+    def ask_with_vision(self, question: str, image, max_tokens: int = None) -> str:
+        """Ask a question about an image using OpenAI Vision API."""
+        if not self.client:
+            return "OpenAI API not available. Please set OPENAI_API_KEY environment variable."
         
         logger.info(f"Vision query: {question}")
         start = time.time()
         
         try:
-            # Convert to PIL Image
-            pil_img = self._to_pil(image)
-            if not pil_img:
+            # Dynamic max_tokens for vision queries
+            if max_tokens is None:
+                question_len = len(question.split())
+                max_tokens = min(100 + question_len * 5, 200)
+            
+            # Convert to base64 image
+            image_base64 = self._image_to_base64(image)
+            if not image_base64:
                 return "Could not process image."
             
-            # Resize if too large (for speed)
-            pil_img = self._resize_image(pil_img)
+            # Vision-specific system prompt - respond as if seeing directly, not describing an image
+            vision_system_prompt = self.SYSTEM_PROMPT + "\n\nIMPORTANT: When describing what you see, respond as if you are seeing it directly through your camera. Use phrases like 'I see...' or 'I can see...' instead of 'In the image I see...' or 'The image shows...'. Act as if you're looking at the scene directly, not at a photograph."
             
+            # Build messages with vision
             messages = [
+                {
+                    "role": "system",
+                    "content": vision_system_prompt
+                },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": pil_img},
-                        {"type": "text", "text": question}
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": question
+                        }
                     ]
                 }
             ]
             
-            # Prepare input
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            # Call OpenAI Vision API
+            response = self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
             )
-            image_inputs, video_inputs = process_vision_info(messages)
             
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Generate
-            with torch.no_grad():
-                output_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=0.3,
-                    do_sample=True,
-                )
-            
-            # Decode response
-            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
-            answer = self.processor.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
-            
+            answer = response.choices[0].message.content.strip()
             answer = self._clean(answer)
-            logger.info(f"Vision response in {time.time() - start:.1f}s")
+            elapsed = time.time() - start
+            logger.info(f"Vision response in {elapsed*1000:.0f}ms")
             return answer if answer else "I couldn't understand what I'm seeing."
             
         except Exception as e:
             logger.error(f"Vision query failed: {e}")
-            return f"Error: {e}"
+            return f"Sorry, I had trouble analyzing the image. {str(e)}"
     
-    def _resize_image(self, img: Image.Image, max_size: int = 1280) -> Image.Image:
-        """Resize image for faster processing."""
+    def _image_to_base64(self, image) -> Optional[str]:
+        """Convert image to base64 string for OpenAI API."""
+        if not PIL_OK:
+            return None
+        
+        try:
+            # Convert to PIL Image
+            pil_img = self._to_pil(image)
+            if not pil_img:
+                return None
+            
+            # Resize if too large (OpenAI has size limits)
+            pil_img = self._resize_image(pil_img, max_size=1024)
+            
+            # Convert to base64
+            import io
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format='JPEG', quality=85)
+            image_bytes = buffer.getvalue()
+            return base64.b64encode(image_bytes).decode('utf-8')
+            
+        except Exception as e:
+            logger.error(f"Image conversion failed: {e}")
+            return None
+    
+    def _resize_image(self, img: Image.Image, max_size: int = 1024) -> Image.Image:
+        """Resize image if too large."""
         w, h = img.size
         if max(w, h) > max_size:
             scale = max_size / max(w, h)
@@ -275,8 +414,59 @@ class CloudAssistant:
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
     
+    def _get_event_loop(self):
+        """Get or create event loop."""
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+    
+    def get_response_language(self) -> str:
+        """
+        Get the target language from last tool result if it was a translation.
+        Returns language code or 'en' if not a translation.
+        """
+        if self.last_tool_result and self.last_tool_result.get("success"):
+            data = self.last_tool_result.get("data", {})
+            if data and "target_language" in data:
+                # Extract ISO code from display language like "Chinese (中文)"
+                target_lang = data["target_language"]
+                # Map back to ISO codes (match display names from tools.py)
+                lang_map = {
+                    "Chinese": "zh",
+                    "中文": "zh",
+                    "Spanish": "es",
+                    "Español": "es",
+                    "French": "fr",
+                    "Français": "fr",
+                    "German": "de",
+                    "Deutsch": "de",
+                    "Italian": "it",
+                    "Italiano": "it",
+                    "Portuguese": "pt",
+                    "Português": "pt",
+                    "Russian": "ru",
+                    "Русский": "ru",
+                    "Hindi": "hi",
+                    "हिन्दी": "hi",
+                    "English": "en",
+                    "Farsi": "fa",
+                    "فارسی": "fa",
+                    "Persian": "fa",
+                    "Nepali": "ne",
+                    "नेपाली": "ne",
+                    "Vietnamese": "vi",
+                    "Tiếng Việt": "vi",
+                }
+                for lang_name, code in lang_map.items():
+                    if lang_name in target_lang:
+                        return code
+        return "en"
+    
     def extract_movement(self, response: str, query: str) -> Optional[Dict[str, Any]]:
-        """Extract movement commands from text."""
+        """Extract movement commands from text (English only)."""
         text = f"{query} {response}".lower()
         
         patterns = {

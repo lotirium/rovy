@@ -164,17 +164,30 @@ export const RobotProvider = ({ children }: React.PropsWithChildren) => {
         return Object.keys(network).length ? network : undefined;
       })();
 
+      // Get battery from multiple possible fields (API returns battery_percent)
+      const batteryValue = telemetry?.battery_percent ?? telemetry?.battery ?? health?.battery;
+      console.log("Battery debug:", {
+        telemetryBatteryPercent: telemetry?.battery_percent,
+        telemetryBattery: telemetry?.battery,
+        healthBattery: health?.battery,
+        finalBattery: batteryValue,
+        telemetryExists: telemetry !== null,
+        healthExists: health !== null,
+      });
+
       const combined: RobotStatus = {
         health,
         telemetry: telemetry ?? undefined,
         network: combinedNetwork,
-        battery: telemetry?.battery ?? health?.battery,
+        battery: batteryValue,
         cpuLoad: telemetry?.cpuLoad,
         temperatureC: telemetry?.temperatureC,
         humidity: telemetry?.humidity,
         uptimeSeconds: telemetry?.uptimeSeconds ?? health?.uptimeSeconds,
         mode:
           mode?.mode ?? mode?.current ?? mode?.status ?? combinedNetwork?.mode,
+        gesture: telemetry?.gesture,
+        gesture_confidence: telemetry?.gesture_confidence,
       };
 
       setStatus(combined);

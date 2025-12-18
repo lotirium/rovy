@@ -1,6 +1,16 @@
 import { Image } from 'expo-image';
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Dimensions, Pressable, StyleSheet, View } from 'react-native';
+import Animated, { 
+  useSharedValue, 
+  useAnimatedStyle, 
+  withTiming, 
+  withRepeat,
+  withSequence,
+  Easing,
+  runOnJS,
+  interpolate,
+} from 'react-native-reanimated';
 
 import { ThemedText } from '@/components/themed-text';
 
@@ -11,6 +21,7 @@ interface CameraVideoProps {
      isStreaming: boolean;
      error: string | null;
      onToggleStream: () => void;
+     detectedGesture?: 'like' | 'heart' | 'none';
 }
 
 export function CameraVideo({
@@ -20,20 +31,51 @@ export function CameraVideo({
      isStreaming,
      error,
      onToggleStream,
+     detectedGesture = 'none',
 }: CameraVideoProps) {
+     const [hearts, setHearts] = useState<Array<{ id: number; startX: number }>>([]);
+     const heartIdRef = useRef(0);
+
+     // Create hearts when heart gesture is detected
+     useEffect(() => {
+          if (detectedGesture === 'heart') {
+               // Create 3 hearts at random X positions
+               const newHearts = Array.from({ length: 3 }, () => {
+                    heartIdRef.current += 1;
+                    return {
+                         id: heartIdRef.current,
+                         startX: Math.random() * Dimensions.get('window').width,
+                    };
+               });
+               setHearts((prev) => [...prev, ...newHearts]);
+          }
+     }, [detectedGesture]);
+
      return (
           <View style={styles.cameraFrame}>
                <View style={styles.streamArea}>
                     {wsUrl ? (
                          <>
                               {currentFrame ? (
-                                   <Image
-                                        source={{ uri: currentFrame }}
-                                        style={styles.camera}
-                                        contentFit="contain"
-                                        cachePolicy="none"
-                                        transition={null}
-                                   />
+                                   <>
+                                        <Image
+                                             source={{ uri: currentFrame }}
+                                             style={[styles.camera, styles.mirrored]}
+                                             contentFit="contain"
+                                             cachePolicy="none"
+                                             transition={null}
+                                        />
+                                        {/* Animated hearts overlay */}
+                                        {hearts.map((heart) => (
+                                             <AnimatedHeart
+                                                  key={heart.id}
+                                                  startX={heart.startX}
+                                                  onComplete={() => {
+                                                       setHearts((prev) => prev.filter((h) => h.id !== heart.id));
+                                                  }}
+                                             />
+                                        ))}
+                                   </>
                               ) : (
                                    <View style={styles.placeholderContainer}>
                                         {isConnecting ? (
@@ -100,6 +142,9 @@ const styles = StyleSheet.create({
      camera: {
           width: '100%',
           height: '100%',
+     },
+     mirrored: {
+          transform: [{ scaleX: -1 }], // Mirror/flip horizontally
      },
      placeholderContainer: {
           flex: 1,
@@ -225,4 +270,66 @@ const styles = StyleSheet.create({
           color: '#04110B',
           fontWeight: '700',
      },
+     heartContainer: {
+          position: 'absolute',
+          zIndex: 1000,
+     },
+     heartText: {
+          fontSize: 32,
+     },
 });
+
+// Animated heart component that floats up and fades out
+function AnimatedHeart({ startX, onComplete }: { startX: number; onComplete: () => void }) {
+     const translateY = useSharedValue(0);
+     const opacity = useSharedValue(1);
+     const scale = useSharedValue(0.5);
+
+     useEffect(() => {
+          // Animate heart floating up, scaling, and fading out
+          translateY.value = withTiming(-Dimensions.get('window').height, {
+               duration: 3000,
+               easing: Easing.out(Easing.cubic),
+          });
+          opacity.value = withSequence(
+               withTiming(1, { duration: 500 }),
+               withTiming(0, { duration: 2500 })
+          );
+          scale.value = withSequence(
+               withTiming(1, { duration: 300, easing: Easing.out(Easing.back(2)) }),
+               withTiming(1.2, { duration: 2700, easing: Easing.in(Easing.ease) })
+          );
+
+          // Call onComplete after animation
+          const timer = setTimeout(() => {
+               runOnJS(onComplete)();
+          }, 3000);
+
+          return () => clearTimeout(timer);
+     }, []);
+
+     const animatedStyle = useAnimatedStyle(() => ({
+          transform: [
+               { translateY: translateY.value },
+               { translateX: -16 }, // Center the heart icon (half of font size)
+               { scale: scale.value },
+          ],
+          opacity: opacity.value,
+     }));
+
+     return (
+          <Animated.View
+               style={[
+                    styles.heartContainer,
+                    {
+                         left: startX,
+                         top: Dimensions.get('window').height - 100,
+                    },
+                    animatedStyle,
+               ]}
+               pointerEvents="none"
+          >
+               <ThemedText style={styles.heartText}>❤️</ThemedText>
+          </Animated.View>
+     );
+}

@@ -14,7 +14,12 @@
       "icon": "./assets/ios.icon",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Jarvis Controller uses your microphone to communicate with your Jarvis",
-        "NSLocationWhenInUseUsageDescription": "Jarvis Controller needs location access to scan nearby Wi-Fi networks during setup"
+        "NSCameraUsageDescription": "Jarvis Controller uses your camera to detect hand gestures for interactive robot reactions.",
+        "UISupportedInterfaceOrientations": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ]
       }
     },
     "android": {
@@ -39,6 +44,12 @@
         "expo-av",
         {
           "microphonePermission": "Allow Jarvis Controller to access your microphone."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Jarvis Controller to access your camera for gesture detection."
         }
       ],
       [

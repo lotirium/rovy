@@ -128,10 +128,44 @@ class Rover:
         """
         if self.base:
             try:
-                data = self.base.feedback_data()
-                if data and 'T' in data:
+                # Read multiple messages to try to find a T:1001 telemetry message
+                max_attempts = 10
+                for attempt in range(max_attempts):
+                    data = self.base.feedback_data()
+                    
+                    if data and isinstance(data, dict):
+                        msg_type = data.get('T')
+                        
+                        # T:1001 contains full telemetry with voltage
+                        if msg_type == 1001 and 'v' in data:
+                            voltage_centivolts = data.get('v', 0.0)
+                            # Voltage is sent in centivolts (hundredths of a volt)
+                            # Convert to volts: 1215 centivolts = 12.15V
+                            voltage = voltage_centivolts / 100.0
+                            print(f"[Rover] Got T:1001 telemetry with voltage: {voltage}V ({voltage_centivolts} centivolts)")
+                            
+                            return {
+                                'voltage': voltage,
+                                'temperature': data.get('temp', 0.0),
+                                'roll': data.get('r', 0.0),
+                                'pitch': data.get('p', 0.0),
+                                'yaw': data.get('y', 0.0),
+                                'cpu': 0,
+                                'ai_state': 'idle',
+                            }
+                        
+                        print(f"[Rover] Attempt {attempt+1}: Got T:{msg_type}, data keys: {list(data.keys())}, data: {data}")
+                    
+                    time.sleep(0.05)  # Wait a bit before trying again
+                
+                # If we didn't get T:1001, use the last data we got
+                if self.base.base_data and isinstance(self.base.base_data, dict):
+                    data = self.base.base_data
+                    voltage_centivolts = data.get('v', 0.0)
+                    voltage = voltage_centivolts / 100.0 if voltage_centivolts else 0.0
+                    print(f"[Rover] Using cached data T:{data.get('T')} after {max_attempts} attempts, voltage: {voltage}V")
                     return {
-                        'voltage': data.get('v', 0.0),
+                        'voltage': voltage,
                         'temperature': data.get('temp', 0.0),
                         'roll': data.get('r', 0.0),
                         'pitch': data.get('p', 0.0),
@@ -139,6 +173,7 @@ class Rover:
                         'cpu': 0,
                         'ai_state': 'idle',
                     }
+                    
             except Exception as e:
                 print(f"[Rover] get_status error: {e}")
         

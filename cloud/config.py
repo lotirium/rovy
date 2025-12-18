@@ -18,30 +18,58 @@ PC_SERVER_IP = os.getenv("ROVY_PC_IP", "100.121.110.125")
 ROBOT_IP = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
 
 # =============================================================================
-# AI Model Configuration (Local Models via llama.cpp)
+# AI Model Configuration (OpenAI API)
 # =============================================================================
 
-# Text model (Gemma, Llama, Mistral)
-TEXT_MODEL_PATH = os.getenv("ROVY_TEXT_MODEL", None)  # Auto-detect if None
-
-# Vision model (LLaVA, Phi-3-Vision)
-VISION_MODEL_PATH = os.getenv("ROVY_VISION_MODEL", None)
-VISION_MMPROJ_PATH = os.getenv("ROVY_VISION_MMPROJ", None)
-
-# Model settings
-N_GPU_LAYERS = int(os.getenv("ROVY_GPU_LAYERS", "-1"))  # -1 = all on GPU
-N_CTX = int(os.getenv("ROVY_CTX", "2048"))
+# OpenAI API Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # Required: Set your OpenAI API key
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # Model for text queries
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")  # Model for vision queries
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))  # Higher = more creative/personality
 
 # =============================================================================
 # Speech Configuration
 # =============================================================================
 
 # Speech-to-text (Whisper)
-WHISPER_MODEL = os.getenv("ROVY_WHISPER_MODEL", "base")  # tiny, base, small, medium, large
+# Use OpenAI Whisper API by default (requires API key and internet)
+# Set to True to always use API, False to always use local
+# Note: Meetings will always use API for better accuracy regardless of this setting
+USE_OPENAI_WHISPER = os.getenv("ROVY_USE_OPENAI_WHISPER", "false").lower() in ("true", "1", "yes")
+
+# Local Whisper model (only used if USE_OPENAI_WHISPER is False or API fails)
+# Model size affects accuracy: tiny < base < small < medium < large
+# For multilingual accuracy, use "small" or "medium"
+WHISPER_MODEL = os.getenv("ROVY_WHISPER_MODEL", "small")  # tiny, base, small, medium, large
+
+# Language detection settings
+WHISPER_LANGUAGE = os.getenv("ROVY_WHISPER_LANGUAGE", None)  # None = auto-detect, or specify like "en", "es", etc.
+WHISPER_TASK = os.getenv("ROVY_WHISPER_TASK", "transcribe")  # "transcribe" or "translate" (to English)
 
 # Text-to-speech
 TTS_ENGINE = os.getenv("ROVY_TTS_ENGINE", "piper")  # piper, espeak
-PIPER_VOICE_PATH = os.getenv("ROVY_PIPER_VOICE", None)
+
+# Piper voice paths for different languages
+# Each language can have its own voice model
+# Download voices from: https://github.com/rhasspy/piper/blob/master/VOICES.md
+PIPER_VOICES = {
+    "en": os.path.expanduser("~/rovy_client/models/piper/en_US-hfc_male-medium.onnx"),
+    "es": os.path.expanduser("~/rovy_client/models/piper/es_ES-davefx-medium.onnx"),
+    "fr": os.path.expanduser("~/rovy_client/models/piper/fr_FR-siwis-medium.onnx"),
+    "de": os.path.expanduser("~/rovy_client/models/piper/de_DE-thorsten-medium.onnx"),
+    "it": os.path.expanduser("~/rovy_client/models/piper/it_IT-riccardo-x_low.onnx"),
+    "pt": os.path.expanduser("~/rovy_client/models/piper/pt_BR-faber-medium.onnx"),
+    "ru": os.path.expanduser("~/rovy_client/models/piper/ru_RU-dmitri-medium.onnx"),
+    "zh": os.path.expanduser("~/rovy_client/models/piper/zh_CN-huayan-medium.onnx"),
+    "vi": os.path.expanduser("~/rovy_client/models/piper/vi_VN-vais1000-medium.onnx"),
+    "hi": os.path.expanduser("~/rovy_client/models/piper/hi_IN-pratham-medium.onnx"),
+    "ne": os.path.expanduser("~/rovy_client/models/piper/ne_NP-chitwan-medium.onnx"),
+    "fa": os.path.expanduser("~/rovy_client/models/piper/fa_IR-amir-medium.onnx"),
+    # Korean (ko) is not available in Piper TTS
+}
+
+# Legacy single voice path (for backward compatibility)
+PIPER_VOICE_PATH = os.getenv("ROVY_PIPER_VOICE", PIPER_VOICES.get("en"))
 
 # =============================================================================
 # Assistant Configuration
@@ -81,6 +109,16 @@ CHUNK_SIZE = 1024
 
 RECONNECT_DELAY = 5
 MAX_RECONNECT_ATTEMPTS = 0  # 0 = infinite
+
+# =============================================================================
+# Spotify Configuration
+# =============================================================================
+
+SPOTIFY_ENABLED = os.getenv("SPOTIFY_ENABLED", "true").lower() == "true"
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "93138e86ecf24daea4b07df74c7cb8e9")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "f8f131ad542a4cf2a021aae8bdbc5763")
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+SPOTIFY_DEVICE_NAME = os.getenv("SPOTIFY_DEVICE_NAME", "ROVY")  # Raspotify device name
 
 # =============================================================================
 # Logging

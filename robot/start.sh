@@ -9,13 +9,15 @@ echo "================================"
 echo "  ROVY ROBOT STARTUP"
 echo "================================"
 
-# Activate virtual environment
-VENV_PATH="/home/rovy/rovy_client/venv"
+# Activate virtual environment (robot-specific)
+VENV_PATH="/home/rovy/rovy_client/robot/venv"
 if [ -d "$VENV_PATH" ]; then
     source "$VENV_PATH/bin/activate"
     echo "✓ Virtual environment activated"
 else
     echo "WARNING: Virtual environment not found at $VENV_PATH"
+    echo "Create it with: python3 -m venv /home/rovy/rovy_client/robot/venv"
+    echo "                pip install -r /home/rovy/rovy_client/robot/requirements.txt"
 fi
 
 # Check Python
@@ -52,8 +54,13 @@ IP=$(hostname -I | awk '{print $1}')
 echo "✓ IP Address: $IP"
 echo ""
 
-# Step 2: Start main API
-echo "[2/2] Starting main API server..."
+# Step 2: Start robot server with API
+echo "[2/2] Starting robot server with API..."
 echo ""
-cd ../cloud
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Stay in robot directory and run robot server using venv's python
+if [ -f "$VENV_PATH/bin/python" ]; then
+    "$VENV_PATH/bin/python" main_api.py
+else
+    # Fallback to system python if venv not found
+    python3 main_api.py
+fi

@@ -85,6 +85,16 @@ class OpenCVCameraSource(CameraSource):
 
     async def _ensure_capture(self) -> "cv2.VideoCapture":
         async with self._lock:
+            # Check if existing capture is still working
+            if self._capture is not None:
+                if not self._capture.isOpened():
+                    # Capture is in bad state, close and reinitialize
+                    try:
+                        self._capture.release()
+                    except:
+                        pass
+                    self._capture = None
+            
             if self._capture is None:
                 capture = cv2.VideoCapture(self._device)
                 if not capture.isOpened():
@@ -107,10 +117,14 @@ class OpenCVCameraSource(CameraSource):
 
         capture = self._capture or cv2.VideoCapture(self._device)
         if not capture.isOpened():
+            # If capture is closed, force reinitialization on next call
+            self._capture = None
             raise CameraError(f"Unable to open camera device {self._device}")
 
         ok, frame = capture.read()
         if not ok or frame is None:
+            # Frame read failed - mark capture as bad so it gets reinitialized
+            self._capture = None
             raise CameraError("Failed to capture frame from camera")
 
         params = [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality]
@@ -173,6 +187,15 @@ class DepthAICameraSource(CameraSource):
 
     def _start_pipeline(self) -> None:
         assert dai is not None  # For type checkers
+
+        # Log available devices
+        try:
+            available = dai.Device.getAllAvailableDevices()
+            LOGGER.info(f"📷 DepthAI: Found {len(available)} device(s)")
+            for dev in available:
+                LOGGER.info(f"  - Device: {dev.getMxId()}")
+        except Exception as e:
+            LOGGER.warning(f"Could not list DepthAI devices: {e}")
 
         # Reclaim any leaked device handles before bringing up a new pipeline.
         # Some DepthAI SDK builds keep devices alive after failures which causes
@@ -594,18 +617,12 @@ class CameraService:
                 LOGGER.warning("Camera source %s failed: %s", source.__class__.__name__, exc)
                 errors.append(str(exc))
 
+                # DON'T permanently disable primary camera - it might recover
+                # Only log the error and try fallback for this frame
                 if source is self._primary and self._fallback is not None:
                     LOGGER.info(
-                        "Disabling primary camera source after failure; switching to fallback"
+                        "Primary camera failed, trying fallback (will retry primary on next frame)"
                     )
-                    try:
-                        await source.close()
-                    except Exception:  # pragma: no cover - defensive cleanup
-                        LOGGER.debug(
-                            "Ignored error while closing failed primary camera source",
-                            exc_info=True,
-                        )
-                    self._primary = None
 
                 continue
 

@@ -52,7 +52,7 @@ def initialize_argparser() -> tuple[argparse.ArgumentParser, argparse.Namespace]
     """Match the argument parser using environment defaults."""
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--device", default=os.getenv("CAMERA_DEVICE", "0"))
+    parser.add_argument("--device", default=os.getenv("CAMERA_DEVICE", "1"))
     parser.add_argument("--fps-limit", default=os.getenv("CAMERA_FPS_LIMIT"))
 
     # We do not expose command line parsing in the API runtime. Instead we
@@ -62,10 +62,12 @@ def initialize_argparser() -> tuple[argparse.ArgumentParser, argparse.Namespace]
 
 
 _, _parsed_args = initialize_argparser()
+LOGGER.info(f"📷 Parsed camera device from config: '{_parsed_args.device}' (type: {type(_parsed_args.device)})")
 _ARGS = _StreamArgs(
     device=int(_parsed_args.device) if _parsed_args.device.isdigit() else _parsed_args.device,
     fps_limit=float(_parsed_args.fps_limit) if _parsed_args.fps_limit else None,
 )
+LOGGER.info(f"📷 Final camera device setting: {_ARGS.device} (type: {type(_ARGS.device)})")
 
 
 def _require_opencv() -> None:
@@ -119,6 +121,7 @@ def _ensure_runtime() -> _RuntimeState:
         time.sleep(0.5)
 
         device = _ARGS.device if _ARGS.device is not None else 0
+        LOGGER.info(f"🎥 Attempting to open camera device: {device} (type: {type(device)})")
         capture: Optional["cv2.VideoCapture"] = None
 
         attempts = 3

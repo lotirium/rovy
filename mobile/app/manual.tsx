@@ -75,8 +75,18 @@ export default function ManualScreen() {
           lockToLandscape();
 
           return () => {
-               // Unlock when leaving this screen
-               ScreenOrientation.unlockAsync().catch(() => {});
+               // Force back to portrait when leaving this screen
+               const resetToPortrait = async () => {
+                    try {
+                         await ScreenOrientation.lockAsync(
+                              ScreenOrientation.OrientationLock.PORTRAIT_UP
+                         );
+                         console.log('Orientation reset to portrait');
+                    } catch (err) {
+                         console.warn('Failed to reset orientation:', err);
+                    }
+               };
+               resetToPortrait();
           };
      }, []);
 
@@ -227,9 +237,9 @@ export default function ManualScreen() {
                const normalizedX = joystickX.value / JOYSTICK_MAX_DISTANCE;
                const normalizedY = -joystickY.value / JOYSTICK_MAX_DISTANCE; // Invert Y
 
-               // Tank drive calculation
-               const leftSpeed = (normalizedY + normalizedX) * max_speed;
-               const rightSpeed = (normalizedY - normalizedX) * max_speed;
+               // Tank drive calculation (negated for reversed motors)
+               const leftSpeed = -(normalizedY + normalizedX) * max_speed;
+               const rightSpeed = -(normalizedY - normalizedX) * max_speed;
 
                runOnJS(sendMovement)(leftSpeed, rightSpeed);
           })

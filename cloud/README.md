@@ -9,8 +9,51 @@ A FastAPI service that exposes discovery, telemetry, camera, and control endpoin
 - Status telemetry endpoint with sample sensor readings.
 - Control endpoints for motion, stop, and camera head positioning.
 - Connectivity endpoints for querying and initiating Wi-Fi connections.
+- **🆕 AI Assistant with External Tools** - Weather, music, calculations, web search, and more!
+
+## 🚀 New: AI Assistant Tools
+
+The AI assistant now supports external API calls and tools! Ask about weather, control music, perform calculations, and more.
+
+**Quick Start:**
+```bash
+python test_tools.py  # Test all available tools
+```
+
+**Available Tools (All FREE, No API Keys Needed!):**
+- ☀️ Weather (Open-Meteo API) - Works immediately!
+- 🕐 Time & Date - Works immediately!
+- 🧮 Calculator - Works immediately!
+- 🎵 Music Control - Optional (playerctl on Linux)
+- 🔍 Web Search (DuckDuckGo) - Works immediately!
+- ⏰ Reminders - Works immediately!
+
+**Example Usage:**
+Just ask naturally:
+- "What's the weather in Tokyo?"
+- "What time is it?"
+- "Calculate 25 + 17"
+- "Who is Albert Einstein?"
+
+**Key Features:**
+- ✅ Automatic tool detection
+- ✅ Zero code changes needed
+- ✅ Vision model separate (dual model preserved)
+- ✅ Fast response (tools return directly)
+- ✅ No API keys required
+- ✅ Graceful fallback to LLM
 
 ## Getting Started
+
+### Hardware Setup (OAK-D Camera)
+
+If you're using an OAK-D camera, you need to set up udev rules to allow non-root access to the device:
+
+```bash
+sudo ./scripts/setup-oakd-udev.sh
+```
+
+This only needs to be done once per system. After running this script, you may need to unplug and replug the OAK-D device.
 
 ### Installation
 

@@ -1,12 +1,23 @@
 import { Image } from 'expo-image';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
-import { Audio, Recording } from 'expo-av';
+import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { useIsFocused } from '@react-navigation/native';
+import Animated, { 
+  FadeInDown, 
+  FadeIn,
+  useSharedValue,
+  useAnimatedStyle,
+  withRepeat,
+  withSequence,
+  withTiming
+} from 'react-native-reanimated';
 
 import { CameraVideo } from '@/components/camera-video';
+import { RobotEyes } from '@/components/robot-eyes-svg';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { IconSymbol } from '@/components/ui/icon-symbol';
@@ -51,7 +62,8 @@ const buildWebSocketUrl = (baseUrl: string | undefined, path: string) => {
 
 export default function AgenticVoiceScreen() {
   const router = useRouter();
-  const { baseUrl } = useRobot();
+  const { baseUrl, status } = useRobot();
+  const isFocused = useIsFocused();
 
   const cameraWsUrl = useMemo(() => buildWebSocketUrl(baseUrl, '/camera/ws'), [baseUrl]);
   // Audio goes to PC cloud server, not Pi
@@ -59,7 +71,8 @@ export default function AgenticVoiceScreen() {
 
   const cameraSocket = useRef<WebSocket | null>(null);
   const audioSocket = useRef<WebSocket | null>(null);
-  const recordingRef = useRef<Recording | null>(null);
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -71,6 +84,98 @@ export default function AgenticVoiceScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
   const [voiceLog, setVoiceLog] = useState<VoiceLogEntry[]>([]);
+  const [detectedGesture, setDetectedGesture] = useState<'like' | 'heart' | 'none'>('none');
+  const lastProcessedGestureRef = useRef<'like' | 'heart' | 'none'>('none');
+  const gestureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  
+  // Gesture detection will come from robot via WebSocket or status updates
+
+  // Animation for recording pulse
+  const recordingPulse = useSharedValue(1);
+
+  // Determine robot emotion based on voice control state and gestures
+  const getEmotion = () => {
+    // Gesture-based emotions take priority
+    if (detectedGesture === 'heart') return 'love'; // Heart gesture → heart eyes
+    if (detectedGesture === 'like') return 'happy'; // Like gesture → happy
+    
+    // Fall back to state-based emotions
+    if (isRecording) return 'curious'; // Active listening
+    if (!isAudioConnected && !isCameraStreaming) return 'neutral'; // Not connected
+    if (isAudioConnected && isCameraStreaming) return 'happy'; // Fully connected
+    return 'thinking'; // Partially connected
+  };
+
+  // Handle gesture detection from robot (sent via status updates)
+  // Gestures stay active for 5 seconds after detection
+  const handleGestureDetected = useCallback((gesture: 'like' | 'heart' | 'none') => {
+    // Only update if gesture actually changed
+    if (lastProcessedGestureRef.current === gesture) {
+      return; // No change, skip update
+    }
+    
+    // Clear existing timeout when gesture changes
+    if (gestureTimeoutRef.current) {
+      clearTimeout(gestureTimeoutRef.current);
+      gestureTimeoutRef.current = null;
+    }
+    
+    // If a gesture (heart/like) is detected, set it and keep it for 5 seconds
+    if (gesture !== 'none') {
+      // Update ref and state
+      lastProcessedGestureRef.current = gesture;
+      setDetectedGesture(gesture);
+      console.log(`[Gesture] Changed to: ${gesture}`);
+      
+      // Set timeout to reset after 5 seconds
+      gestureTimeoutRef.current = setTimeout(() => {
+        // Only reset if gesture is still the same (hasn't changed)
+        if (lastProcessedGestureRef.current === gesture) {
+          setDetectedGesture('none');
+          lastProcessedGestureRef.current = 'none';
+          gestureTimeoutRef.current = null;
+          console.log('[Gesture] Reset to: none (after 5 seconds)');
+        }
+      }, 5000); // 5 seconds
+    } else {
+      // When 'none' is detected, only update if no gesture is currently active
+      // This prevents 'none' from interrupting an active gesture timer
+      if (lastProcessedGestureRef.current === 'none') {
+        return; // Already 'none', no need to update
+      }
+      // If a gesture is active, the timeout will handle the reset
+      // Don't immediately change to 'none' - let the timer expire
+    }
+  }, []); // No dependencies - uses refs which don't change
+
+  const isOnline = Boolean(status?.network?.ip);
+  
+  // Listen for gesture updates from robot status (robot detects gestures from OAK-D camera)
+  useEffect(() => {
+    const gesture = status?.telemetry?.gesture ?? status?.gesture;
+    if (gesture && gesture !== detectedGesture) {
+      handleGestureDetected(gesture as 'like' | 'heart' | 'none');
+    }
+  }, [status?.telemetry?.gesture, status?.gesture, detectedGesture, handleGestureDetected]);
+
+  useEffect(() => {
+    if (isRecording) {
+      recordingPulse.value = withRepeat(
+        withSequence(
+          withTiming(1.1, { duration: 500 }),
+          withTiming(1, { duration: 500 })
+        ),
+        -1,
+        false
+      );
+    } else {
+      recordingPulse.value = withTiming(1, { duration: 200 });
+    }
+  }, [isRecording]);
+
+  const recordingPulseStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: recordingPulse.value }],
+  }));
 
   const appendLog = useCallback((entry: Omit<VoiceLogEntry, 'id' | 'timestamp'>) => {
     setVoiceLog((prev) => {
@@ -93,6 +198,23 @@ export default function AgenticVoiceScreen() {
       return;
     }
 
+    // Don't connect if already connected or connecting
+    if (cameraSocket.current?.readyState === WebSocket.OPEN) {
+      setIsCameraStreaming(true);
+      setIsCameraConnecting(false);
+      return;
+    }
+
+    if (cameraSocket.current?.readyState === WebSocket.CONNECTING) {
+      return; // Already connecting
+    }
+
+    // Close existing connection if any
+    if (cameraSocket.current) {
+      cameraSocket.current.close();
+      cameraSocket.current = null;
+    }
+
     setIsCameraConnecting(true);
     setCameraError(null);
 
@@ -103,6 +225,11 @@ export default function AgenticVoiceScreen() {
       setIsCameraConnecting(false);
       setIsCameraStreaming(true);
       setCameraError(null);
+      // Clear any pending reconnect timeout
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
     };
 
     ws.onmessage = (event) => {
@@ -116,6 +243,18 @@ export default function AgenticVoiceScreen() {
 
         if (data.frame) {
           setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
+        }
+
+        // Extract gesture data from camera stream (real-time updates)
+        // Only update when gesture actually changes to prevent animation flicker
+        if (data.gesture !== undefined) {
+          const gesture = data.gesture as 'like' | 'heart' | 'none';
+          const confidence = data.gesture_confidence ?? 0;
+          // Only process if confidence is above threshold
+          if (gesture === 'none' || confidence > 0.5) {
+            // handleGestureDetected will check if gesture changed internally
+            handleGestureDetected(gesture);
+          }
         }
       } catch (error) {
         console.warn('Camera stream parse error', error);
@@ -131,10 +270,30 @@ export default function AgenticVoiceScreen() {
     ws.onclose = () => {
       setIsCameraStreaming(false);
       setIsCameraConnecting(false);
+      
+      // Auto-reconnect if screen is still focused and we have a URL
+      if (isFocused && cameraWsUrl && cameraSocket.current === ws) {
+        // Clear any existing timeout
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+        }
+        // Reconnect after a short delay
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (isFocused && cameraWsUrl) {
+            connectCamera();
+          }
+        }, 1000);
+      }
     };
-  }, [cameraWsUrl]);
+  }, [cameraWsUrl, isFocused, handleGestureDetected]);
 
   const disconnectCamera = useCallback(() => {
+    // Clear any pending reconnect
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
     if (cameraSocket.current) {
       cameraSocket.current.close();
       cameraSocket.current = null;
@@ -152,13 +311,32 @@ export default function AgenticVoiceScreen() {
     }
   }, [connectCamera, disconnectCamera, isCameraConnecting, isCameraStreaming]);
 
+  // Connect camera when screen is focused
   useEffect(() => {
-    if (cameraWsUrl && !isCameraStreaming && !isCameraConnecting) {
-      connectCamera();
+    if (isFocused && cameraWsUrl) {
+      // Check if we need to reconnect
+      const socket = cameraSocket.current;
+      if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+        // Connection is closed, reconnect
+        if (!isCameraStreaming && !isCameraConnecting) {
+          connectCamera();
+        }
+      } else if (socket.readyState === WebSocket.OPEN) {
+        // Connection is open, just update state
+        setIsCameraStreaming(true);
+        setIsCameraConnecting(false);
+      }
+      // If CONNECTING, just wait
     }
-  }, [cameraWsUrl, connectCamera, isCameraStreaming, isCameraConnecting]);
+  }, [isFocused, cameraWsUrl, connectCamera, isCameraStreaming, isCameraConnecting]);
 
-  useEffect(() => () => disconnectCamera(), [disconnectCamera]);
+  // Only disconnect on actual component unmount (not just blur)
+  useEffect(() => {
+    return () => {
+      // Cleanup on unmount
+      disconnectCamera();
+    };
+  }, [disconnectCamera]);
 
   const connectAudioSocket = useCallback(() => {
     if (!audioWsUrl) {
@@ -465,117 +643,159 @@ export default function AgenticVoiceScreen() {
     }
   }, [appendLog, isAudioConnecting, isAudioConnected, isRecording]);
 
+  // Cleanup gesture timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (gestureTimeoutRef.current) {
+        clearTimeout(gestureTimeoutRef.current);
+        gestureTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
   return (
     <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
       <ThemedView style={styles.container}>
-        <View style={styles.headerRow}>
+        <Animated.View 
+          entering={FadeIn.duration(400)}
+          style={styles.headerRow}
+        >
           <Pressable style={styles.backButton} onPress={() => router.back()}>
             <IconSymbol name="chevron.left" size={16} color="#E5E7EB" />
           </Pressable>
-          <ThemedText type="title">Agentic control</ThemedText>
-        </View>
+          <ThemedText type="title">Voice Control</ThemedText>
+        </Animated.View>
 
-        <View style={styles.statusRow}>
-          <View style={styles.statusPill}>
-            <View style={[styles.statusDot, isCameraStreaming ? styles.statusOn : styles.statusOff]} />
-            <ThemedText style={styles.statusText}>
-              Camera {isCameraStreaming ? 'streaming' : isCameraConnecting ? 'connecting' : 'idle'}
-            </ThemedText>
-          </View>
-          <View style={styles.statusPill}>
-            <View style={[styles.statusDot, isAudioConnected ? styles.statusOn : styles.statusOff]} />
-            <ThemedText style={styles.statusText}>
-              Voice {isAudioConnected ? 'linked' : isAudioConnecting ? 'connecting' : 'disconnected'}
-            </ThemedText>
-          </View>
-        </View>
+        {/* Full Width Robot Eyes with Reduced Height */}
+        <Animated.View entering={FadeIn.delay(50).duration(600)} style={styles.fullWidthEyesContainer}>
+          <RobotEyes emotion={getEmotion()} isOnline={isOnline} />
+        </Animated.View>
 
-        <CameraVideo
-          wsUrl={cameraWsUrl}
-          currentFrame={currentFrame}
-          isConnecting={isCameraConnecting}
-          isStreaming={isCameraStreaming}
-          error={cameraError}
-          onToggleStream={handleToggleCamera}
-        />
-
-        <ThemedView style={styles.card}>
-          <View style={styles.cardHeader}>
-            <ThemedText type="subtitle">Push-to-talk</ThemedText>
-            <Pressable onPress={isAudioConnected ? disconnectAudioSocket : connectAudioSocket}>
-              <ThemedText type="link">{isAudioConnected ? 'Reconnect' : 'Retry link'}</ThemedText>
-            </Pressable>
-          </View>
-          <Pressable
-            style={[
-              styles.talkButton,
-              isRecording && styles.talkButtonActive,
-              !isAudioConnected && styles.talkButtonDisabled,
-            ]}
-            onPressIn={startRecording}
-            onPressOut={stopRecording}
-            disabled={!isAudioConnected}
+        {/* Status Row and Camera - No Gap */}
+        <View style={styles.statusAndCameraContainer}>
+          <Animated.View 
+            entering={FadeInDown.delay(100).duration(400)}
+            style={styles.statusRow}
           >
-            {isRecording ? (
-              <ActivityIndicator color="#04110B" />
-            ) : (
-              <IconSymbol name="mic.fill" size={18} color="#04110B" />
-            )}
-            <ThemedText style={styles.talkButtonText}>
-              {isRecording ? 'Recording...' : !isAudioConnected ? 'Waiting for connection...' : 'Hold to talk'}
-            </ThemedText>
-          </Pressable>
-          {recordingError ? (
-            <ThemedText style={styles.errorText}>{recordingError}</ThemedText>
-          ) : null}
-          {audioError ? (
-            <ThemedText style={styles.errorText}>{audioError}</ThemedText>
-          ) : null}
-        </ThemedView>
+            <View style={styles.statusPill}>
+              <View style={[styles.statusDot, isCameraStreaming ? styles.statusOn : styles.statusOff]} />
+              <ThemedText style={styles.statusText}>
+                Camera {isCameraStreaming ? 'streaming' : isCameraConnecting ? 'connecting' : 'idle'}
+              </ThemedText>
+            </View>
+            <View style={styles.statusPill}>
+              <View style={[styles.statusDot, isAudioConnected ? styles.statusOn : styles.statusOff]} />
+              <ThemedText style={styles.statusText}>
+                Voice {isAudioConnected ? 'linked' : isAudioConnecting ? 'connecting' : 'disconnected'}
+              </ThemedText>
+            </View>
+          </Animated.View>
 
-        <ThemedView style={styles.logCard}>
-          <View style={styles.cardHeader}>
-            <ThemedText type="subtitle">Conversation log</ThemedText>
+          <CameraVideo
+            wsUrl={cameraWsUrl}
+            currentFrame={currentFrame}
+            isConnecting={isCameraConnecting}
+            isStreaming={isCameraStreaming}
+            error={cameraError}
+            onToggleStream={handleToggleCamera}
+            detectedGesture={detectedGesture}
+          />
+        </View>
+
+        <Animated.View entering={FadeInDown.delay(200).duration(400)} style={{ flex: 1 }}>
+          <ThemedView style={styles.logCard}>
             <View style={styles.logLegend}>
               <View style={[styles.legendDot, styles.legendRobot]} />
-              <ThemedText style={styles.legendText}>Robot</ThemedText>
+              <ThemedText style={styles.legendText}>AI</ThemedText>
               <View style={[styles.legendDot, styles.legendYou]} />
               <ThemedText style={styles.legendText}>You</ThemedText>
             </View>
-          </View>
-          <ScrollView style={styles.logScroll} showsVerticalScrollIndicator={false}>
-            {voiceLog.length === 0 ? (
-              <View style={styles.emptyLog}>
-                <Image
-                  source={require('@/assets/images/rovy.png')}
-                  style={styles.emptyImage}
-                  contentFit="contain"
-                />
-                <ThemedText style={styles.emptyText}>
-                  Hold the microphone to start a conversation with your robot.
-                </ThemedText>
-              </View>
-            ) : (
-              voiceLog.map((entry) => (
-                <View
-                  key={entry.id}
-                  style={[
-                    styles.logItem,
-                    entry.tone === 'client' ? styles.logItemClient : styles.logItemRobot,
-                  ]}
-                >
-                  <View style={styles.logItemHeader}>
-                    <ThemedText style={styles.logLabel}>{entry.label}</ThemedText>
-                    <ThemedText style={styles.logTime}>
-                      {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                    </ThemedText>
-                  </View>
-                  <ThemedText style={styles.logMessage}>{entry.message}</ThemedText>
+            <ScrollView style={styles.logScroll} showsVerticalScrollIndicator={false}>
+              {voiceLog.length === 0 ? (
+                <View style={styles.emptyLog}>
+                  <Image
+                    source={require('@/assets/images/rovy.png')}
+                    style={styles.emptyImage}
+                    contentFit="contain"
+                  />
+                  <ThemedText style={styles.emptyTitle}>Ready to chat</ThemedText>
+                  <ThemedText style={styles.emptyText}>
+                    Hold the microphone button to start talking with JARVIS
+                  </ThemedText>
                 </View>
-              ))
-            )}
-          </ScrollView>
-        </ThemedView>
+              ) : (
+                voiceLog.map((entry, index) => (
+                  <Animated.View
+                    key={entry.id}
+                    entering={FadeInDown.delay(index * 30).duration(300)}
+                  >
+                    <View
+                      style={[
+                        styles.logItem,
+                        entry.tone === 'client' ? styles.logItemClient : styles.logItemRobot,
+                      ]}
+                    >
+                      <View style={styles.logItemHeader}>
+                        <ThemedText style={styles.logLabel}>{entry.label}</ThemedText>
+                        <ThemedText style={styles.logTime}>
+                          {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        </ThemedText>
+                      </View>
+                      <ThemedText style={styles.logMessage}>{entry.message}</ThemedText>
+                    </View>
+                  </Animated.View>
+                ))
+              )}
+            </ScrollView>
+          </ThemedView>
+        </Animated.View>
+
+        <Animated.View entering={FadeInDown.delay(300).duration(400)}>
+          <ThemedView style={styles.card}>
+            <View style={styles.cardHeader}>
+              <ThemedText type="subtitle">Push-to-talk</ThemedText>
+              <Pressable onPress={isAudioConnected ? disconnectAudioSocket : connectAudioSocket}>
+                <ThemedText type="link">{isAudioConnected ? 'Reconnect' : 'Retry link'}</ThemedText>
+              </Pressable>
+            </View>
+            <Animated.View style={isRecording ? recordingPulseStyle : undefined}>
+              <Pressable
+                style={[
+                  styles.talkButton,
+                  isRecording && styles.talkButtonActive,
+                  !isAudioConnected && styles.talkButtonDisabled,
+                ]}
+                onPressIn={startRecording}
+                onPressOut={stopRecording}
+                disabled={!isAudioConnected}
+              >
+                {isRecording ? (
+                  <>
+                    <View style={styles.recordingIndicator}>
+                      <View style={styles.recordingDot} />
+                    </View>
+                    <ThemedText style={styles.talkButtonText}>Listening...</ThemedText>
+                  </>
+                ) : (
+                  <>
+                    <IconSymbol name="mic.fill" size={18} color="#04110B" />
+                    <ThemedText style={styles.talkButtonText}>
+                      {!isAudioConnected ? 'Waiting for connection...' : 'Hold to talk'}
+                    </ThemedText>
+                  </>
+                )}
+              </Pressable>
+            </Animated.View>
+            {recordingError ? (
+              <ThemedText style={styles.errorText}>{recordingError}</ThemedText>
+            ) : null}
+            {audioError ? (
+              <ThemedText style={styles.errorText}>{audioError}</ThemedText>
+            ) : null}
+          </ThemedView>
+        </Animated.View>
+
+        {/* Gesture detection runs on OAK-D camera stream frames via useEffect */}
       </ThemedView>
     </SafeAreaView>
   );
@@ -606,10 +826,22 @@ const styles = StyleSheet.create({
     borderColor: '#202020',
     backgroundColor: '#1C1C1C',
   },
+  fullWidthEyesContainer: {
+    width: '100%',
+    height: 100,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 8,
+    overflow: 'hidden',
+  },
+  statusAndCameraContainer: {
+    gap: 0,
+  },
   statusRow: {
     flexDirection: 'row',
     gap: 10,
     alignItems: 'center',
+    marginBottom: 0,
   },
   statusPill: {
     flexDirection: 'row',
@@ -640,10 +872,15 @@ const styles = StyleSheet.create({
   card: {
     padding: 16,
     gap: 12,
-    borderRadius: 0,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#202020',
-    backgroundColor: '#1C1C1C',
+    borderColor: 'rgba(37, 37, 37, 0.6)',
+    backgroundColor: 'rgba(26, 26, 26, 0.7)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 2,
   },
   cardHeader: {
     flexDirection: 'row',
@@ -659,19 +896,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
-    paddingVertical: 16,
-    borderRadius: 12,
+    paddingVertical: 18,
+    borderRadius: 14,
     backgroundColor: '#1DD1A1',
+    shadowColor: '#1DD1A1',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 4,
   },
   talkButtonActive: {
-    backgroundColor: '#0DAA80',
+    backgroundColor: '#EF4444',
+    shadowColor: '#EF4444',
   },
   talkButtonDisabled: {
-    opacity: 0.5,
+    opacity: 0.4,
   },
   talkButtonText: {
     color: '#04110B',
-    fontWeight: '700',
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    fontSize: 15,
+  },
+  recordingIndicator: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(4, 17, 11, 0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recordingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#04110B',
   },
   errorText: {
     color: '#F87171',
@@ -680,11 +938,17 @@ const styles = StyleSheet.create({
   logCard: {
     flex: 1,
     borderWidth: 1,
-    borderColor: '#202020',
-    backgroundColor: '#0F1512',
-    borderRadius: 0,
+    borderColor: 'rgba(37, 37, 37, 0.6)',
+    backgroundColor: 'rgba(15, 21, 18, 0.8)',
+    borderRadius: 12,
     padding: 16,
-    gap: 12,
+    paddingTop: 12,
+    gap: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 2,
   },
   logScroll: {
     flex: 1,
@@ -693,31 +957,45 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 12,
-    paddingVertical: 40,
-  },
-  emptyText: {
-    color: '#9CA3AF',
-    textAlign: 'center',
+    paddingVertical: 48,
   },
   emptyImage: {
     width: 120,
     height: 80,
+    marginBottom: 8,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontFamily: 'JetBrainsMono_600SemiBold',
+    color: '#E5E7EB',
+    marginBottom: 4,
+  },
+  emptyText: {
+    color: '#9CA3AF',
+    textAlign: 'center',
+    lineHeight: 20,
+    paddingHorizontal: 20,
   },
   logItem: {
-    padding: 12,
-    borderRadius: 10,
-    gap: 6,
-    marginBottom: 10,
+    padding: 14,
+    borderRadius: 12,
+    gap: 8,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 1,
   },
   logItemRobot: {
-    backgroundColor: '#111827',
+    backgroundColor: 'rgba(17, 24, 39, 0.8)',
     borderWidth: 1,
-    borderColor: '#1F2937',
+    borderColor: 'rgba(31, 41, 55, 0.6)',
   },
   logItemClient: {
-    backgroundColor: '#11261E',
+    backgroundColor: 'rgba(17, 38, 30, 0.8)',
     borderWidth: 1,
-    borderColor: '#1DD1A1',
+    borderColor: 'rgba(29, 209, 161, 0.4)',
   },
   logItemHeader: {
     flexDirection: 'row',
@@ -739,7 +1017,9 @@ const styles = StyleSheet.create({
   logLegend: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'flex-end',
     gap: 8,
+    marginBottom: 8,
   },
   legendDot: {
     width: 10,

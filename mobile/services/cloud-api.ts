@@ -9,9 +9,11 @@
  */
 
 import axios, { AxiosInstance } from "axios";
+import { CLOUD_API_BASE_URL } from "@/constants/env";
 
 // Default Cloud PC IP (Tailscale) - FastAPI runs on port 8000
-export const DEFAULT_CLOUD_URL = "http://100.121.110.125:8000";
+// Falls back to environment variable if set, otherwise uses hardcoded IP
+export const DEFAULT_CLOUD_URL = CLOUD_API_BASE_URL || "http://100.121.110.125:8000";
 
 export interface ChatRequest {
   message: string;
@@ -50,8 +52,32 @@ export interface STTResponse {
 
 export interface CloudHealth {
   ok: boolean;
-  assistant_loaded: boolean;
-  speech_loaded: boolean;
+  assistant_loaded?: boolean;
+  speech_loaded?: boolean;
+  meeting_service_available?: boolean;
+  // Robot fields (when cloud runs on robot)
+  name?: string;
+  serial?: string;
+  claimed?: boolean;
+  mode?: string;
+  version?: string;
+  battery?: number;
+}
+
+export interface MeetingSummary {
+  id: string;
+  title: string;
+  type: 'meeting' | 'lecture' | 'conversation' | 'note';
+  content: string;
+  transcript?: string;
+  date: string; // ISO timestamp
+  duration?: number;
+  audio_filename?: string;
+}
+
+export interface MeetingSummaryListResponse {
+  summaries: MeetingSummary[];
+  count: number;
 }
 
 export interface CloudApiOptions {
@@ -160,6 +186,54 @@ export class CloudAPI {
   public getVoiceWebSocketUrl(): string {
     const wsBase = this.baseUrl.replace(/^http/, "ws");
     return `${wsBase}/voice`;
+  }
+
+  /**
+   * Get all meeting summaries
+   */
+  public async getMeetings(): Promise<MeetingSummaryListResponse> {
+    const response = await this.axiosInstance.get<MeetingSummaryListResponse>("/meetings");
+    return response.data;
+  }
+
+  /**
+   * Get a specific meeting by ID
+   */
+  public async getMeeting(meetingId: string): Promise<MeetingSummary> {
+    const response = await this.axiosInstance.get<MeetingSummary>(`/meetings/${meetingId}`);
+    return response.data;
+  }
+
+  /**
+   * Upload meeting audio for transcription and summarization
+   */
+  public async uploadMeeting(
+    audioBlob: Blob,
+    title?: string,
+    meetingType: 'meeting' | 'lecture' | 'conversation' | 'note' = 'meeting'
+  ): Promise<{ success: boolean; meeting_id: string; message: string }> {
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "meeting.wav");
+    if (title) {
+      formData.append("title", title);
+    }
+    formData.append("meeting_type", meetingType);
+
+    const response = await this.axiosInstance.post("/meetings/upload", formData, {
+      headers: {
+        "Content-Type": "multipart/form-data",
+      },
+      timeout: 120000, // 2 minutes for transcription/summarization
+    });
+    return response.data;
+  }
+
+  /**
+   * Delete a meeting by ID
+   */
+  public async deleteMeeting(meetingId: string): Promise<{ status: string; message: string }> {
+    const response = await this.axiosInstance.delete(`/meetings/${meetingId}`);
+    return response.data;
   }
 }
 

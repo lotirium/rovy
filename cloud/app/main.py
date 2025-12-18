@@ -8,6 +8,7 @@ import hmac
 import importlib
 import logging
 import os
+import re
 import secrets
 import subprocess
 import socket
@@ -20,6 +21,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 LOGGER = logging.getLogger("uvicorn.error").getChild(__name__)
 
+# Global lock to prevent USB camera contention between OAK-D and webcam
+_USB_CAMERA_LOCK = asyncio.Lock()
+
 # Ensure project root is in Python path for imports when running as service
 # This MUST happen before any app.* imports
 _project_root = Path(__file__).parent.parent.parent
@@ -29,6 +33,7 @@ if str(_project_root) not in sys.path:
 from ble import WifiManager
 
 import anyio
+import httpx
 from fastapi import FastAPI, HTTPException, Header, Query, Request, Response, WebSocket, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -101,6 +106,12 @@ from .camera import (
     OpenCVCameraSource,
     PlaceholderCameraSource,
 )
+
+# Import cv2 for USB camera testing (optional dependency)
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 from .oak_stream import get_snapshot as oak_snapshot
 from .oak_stream import get_video_response as oak_video_response
 from .oak_stream import shutdown as oak_shutdown
@@ -116,6 +127,24 @@ except ImportError as exc:
     FACE_RECOGNITION_AVAILABLE = False
     FaceRecognitionService = None
     FaceRecognitionError = None
+
+# Gesture detection service
+try:
+    from .gesture_detection import detect_gesture_from_image
+    GESTURE_DETECTION_AVAILABLE = True
+except ImportError as exc:
+    LOGGER.warning("Gesture detection service not available: %s", exc)
+    GESTURE_DETECTION_AVAILABLE = False
+    detect_gesture_from_image = None
+
+# Meeting service
+try:
+    from .meeting_service import MeetingService
+    MEETING_SERVICE_AVAILABLE = True
+except ImportError as exc:
+    LOGGER.warning("Meeting service not available: %s", exc)
+    MEETING_SERVICE_AVAILABLE = False
+    MeetingService = None
 from .models import (
     AddFaceRequest,
     AddFaceResponse,
@@ -131,6 +160,11 @@ from .models import (
     HealthResponse,
     KnownFacesResponse,
     LightCommand,
+    MeetingSummary,
+    MeetingSummaryListResponse,
+    MeetingType,
+    MeetingUploadResponse,
+    MeetingRecordingStatus,
     Mode,
     ModeResponse,
     MoveCommand,
@@ -379,87 +413,231 @@ _WEBCAM_DEVICE = os.getenv("CAMERA_WEBCAM_DEVICE")
 def _iter_webcam_candidates() -> list[int | str]:
     """Return preferred webcam device identifiers.
 
-    The order favours explicit configuration, then any OAK-D UVC interfaces,
-    and finally generic `/dev/video*` indices so we still try something when no
-    metadata is available.
+    The order favours explicit configuration, then any USB cameras,
+    and finally generic `/dev/video*` indices. OAK-D devices are explicitly
+    skipped since they're reserved for AI vision via the persistent pipeline.
     """
 
     candidates: list[int | str] = []
+
+    # Log all available video devices for debugging
+    by_id_dir = Path("/dev/v4l/by-id")
+    if by_id_dir.is_dir():
+        all_devices = list(by_id_dir.iterdir())
+        LOGGER.info(f"📹 Found {len(all_devices)} video device(s) in /dev/v4l/by-id/")
+        for entry in all_devices:
+            device_type = "OAK-D" if any(x in entry.name.lower() for x in ["oak", "depthai", "luxonis"]) else "USB"
+            LOGGER.info(f"   - {device_type}: {entry.name}")
 
     if _WEBCAM_DEVICE is not None:
         try:
             candidates.append(int(_WEBCAM_DEVICE))
         except ValueError:
             candidates.append(_WEBCAM_DEVICE)
+        LOGGER.info(f"Using explicit camera device from env: {_WEBCAM_DEVICE}")
 
-    by_id_dir = Path("/dev/v4l/by-id")
+    # Prefer stable /dev/v4l/by-id/ paths over numeric indices
+    # Use the by-id path directly (not resolved) so it stays stable even if device re-enumerates
     if by_id_dir.is_dir():
         for entry in sorted(by_id_dir.iterdir()):
             name = entry.name.lower()
-            if "oak" not in name and "depthai" not in name and "luxonis" not in name:
+            # Skip OAK-D devices (reserved for AI vision via persistent pipeline)
+            if "oak" in name or "depthai" in name or "luxonis" in name:
+                LOGGER.debug(f"Skipping OAK-D device for streaming: {entry.name}")
                 continue
-            try:
-                resolved = entry.resolve(strict=True)
-            except OSError:
-                continue
-            candidates.append(str(resolved))
+            # Use any USB camera with video-index0 (main video stream)
+            if "usb" in name and "video-index0" in name:
+                try:
+                    # Use the stable by-id path directly, not the resolved /dev/videoX path
+                    # This way if the device re-enumerates, the path still works
+                    stable_path = str(entry)
+                    candidates.append(stable_path)
+                    LOGGER.info(f"Added USB camera candidate: {entry.name}")
+                except OSError:
+                    continue
 
     # Fall back to common numeric indices if nothing more specific was found.
-    # These entries are appended after any explicit or detected OAK-D devices
-    # so that laptops with built-in webcams still prefer the external device
-    # when one is present.
+    # These entries are appended after any explicit USB camera devices
+    # so that external USB webcams are preferred over built-in cameras.
     generic_indices = range(0, 4)
     for index in generic_indices:
         if index not in candidates:
             candidates.append(index)
 
+    LOGGER.info(f"USB camera candidates (in priority order): {candidates}")
     return candidates
 
 
+def check_cameras_for_microphone() -> list[dict[str, Any]]:
+    """Check all connected cameras to see if they have microphone capabilities.
+    
+    Returns a list of dictionaries with camera info and microphone status.
+    Each dict contains:
+    - device: device path or index
+    - name: device name
+    - has_microphone: boolean indicating if microphone is present
+    - device_path: resolved /dev/videoX path if available
+    """
+    cameras_with_mic = []
+    
+    # Get all video devices
+    video_devices = []
+    
+    # Check /dev/v4l/by-id/ for stable device paths
+    by_id_dir = Path("/dev/v4l/by-id")
+    if by_id_dir.is_dir():
+        for entry in sorted(by_id_dir.iterdir()):
+            try:
+                resolved_path = entry.resolve()
+                if resolved_path.exists() and str(resolved_path).startswith("/dev/video"):
+                    video_devices.append({
+                        "device": str(entry),
+                        "name": entry.name,
+                        "resolved_path": str(resolved_path)
+                    })
+            except (OSError, RuntimeError):
+                continue
+    
+    # Also check /dev/video* directly for any devices not in by-id
+    for video_path in Path("/dev").glob("video*"):
+        if video_path.is_char_device():
+            device_num = video_path.name.replace("video", "")
+            try:
+                int(device_num)  # Make sure it's a number
+                # Check if we already have this device
+                if not any(v.get("resolved_path") == str(video_path) for v in video_devices):
+                    video_devices.append({
+                        "device": str(video_path),
+                        "name": f"video{device_num}",
+                        "resolved_path": str(video_path)
+                    })
+            except ValueError:
+                continue
+    
+    # Check each device for microphone capabilities
+    for device_info in video_devices:
+        device_path = device_info["resolved_path"]
+        has_mic = False
+        
+        try:
+            # Use v4l2-ctl to query device capabilities
+            # Check if device has audio input (V4L2_CAP_AUDIO indicates audio support)
+            result = subprocess.run(
+                ["v4l2-ctl", "--device", device_path, "--info"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                # Check for audio-related capabilities
+                # V4L2 devices with microphones typically show audio input capabilities
+                if "audio" in output or "mic" in output:
+                    has_mic = True
+                else:
+                    # Also check device capabilities directly
+                    caps_result = subprocess.run(
+                        ["v4l2-ctl", "--device", device_path, "--all"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if caps_result.returncode == 0:
+                        caps_output = caps_result.stdout.lower()
+                        # Look for audio input indicators
+                        if any(keyword in caps_output for keyword in ["audio", "mic", "input", "capture"]):
+                            # More specific check - look for audio device type
+                            if "audio" in caps_output:
+                                has_mic = True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            LOGGER.debug(f"Could not check microphone for {device_path}: {e}")
+            continue
+        
+        # Also check if there's a corresponding ALSA device (some USB cameras expose audio via ALSA)
+        try:
+            # Check for ALSA devices that might correspond to this camera
+            alsa_result = subprocess.run(
+                ["arecord", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if alsa_result.returncode == 0:
+                # Some USB cameras show up in ALSA as USB audio devices
+                # This is a heuristic - if we find USB audio devices, some cameras might have mics
+                if "usb" in alsa_result.stdout.lower():
+                    # This is not definitive, but worth noting
+                    pass
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        cameras_with_mic.append({
+            "device": device_info["device"],
+            "name": device_info["name"],
+            "has_microphone": has_mic,
+            "device_path": device_path
+        })
+    
+    return cameras_with_mic
+
+
 def _create_camera_service() -> CameraService:
+    """Create camera service for mobile app streaming using USB camera."""
     primary_source = None
 
-    if _FORCE_WEBCAM:
-        LOGGER.info(
-            "DepthAI camera explicitly disabled via CAMERA_FORCE_WEBCAM; attempting USB webcam sources instead",
-        )
-    elif DepthAICameraSource.is_available():
-        try:
-            primary_source = DepthAICameraSource()
-            LOGGER.info("Using DepthAI camera source for streaming")
-        except CameraError as exc:
-            LOGGER.warning("DepthAI camera source unavailable: %s", exc)
+    # Use USB camera for streaming (OAK-D is reserved for AI vision via /shot endpoint)
+    if OpenCVCameraSource.is_available():
+        LOGGER.info("🎥 Initializing USB camera for streaming (separate from OAK-D)...")
+        
+        for candidate in _iter_webcam_candidates():
+            try:
+                LOGGER.info(
+                    "Attempting webcam device %s for primary stream source",
+                    candidate,
+                )
+                # Test if device is accessible before committing
+                test_cap = cv2.VideoCapture(candidate)
+                if not test_cap.isOpened():
+                    LOGGER.warning("Device %s not accessible, skipping", candidate)
+                    test_cap.release()
+                    continue
+                test_cap.release()
+                
+                # Now create the actual source
+                primary_source = OpenCVCameraSource(device=candidate)
+                LOGGER.info("✅ Using OpenCV camera source for streaming: %s", candidate)
+                break
+            except CameraError as exc:
+                LOGGER.warning(
+                    "OpenCV camera source unavailable on %s: %s",
+                    candidate,
+                    exc,
+                )
+                primary_source = None
+                continue
+            except Exception as exc:
+                LOGGER.warning(
+                    "Unexpected error with device %s: %s",
+                    candidate,
+                    exc,
+                )
+                primary_source = None
+                continue
+        else:
+            LOGGER.warning("⚠️  Unable to open any USB webcam device for streaming")
     else:
         LOGGER.warning(
-            "DepthAI package not installed; skipping OAK-D camera stream. Install the 'depthai' package to enable it."
+            "OpenCV package not installed; skipping USB camera stream. Install the 'opencv-python' package to enable it."
         )
 
-    if primary_source is None:
-        if OpenCVCameraSource.is_available():
-            for candidate in _iter_webcam_candidates():
-                try:
-                    LOGGER.info(
-                        "Attempting webcam device %s for primary stream source",
-                        candidate,
-                    )
-                    primary_source = OpenCVCameraSource(device=candidate)
-                except CameraError as exc:
-                    LOGGER.warning(
-                        "OpenCV camera source unavailable on %s: %s",
-                        candidate,
-                        exc,
-                    )
-                    primary_source = None
-                    continue
-                else:
-                    LOGGER.info("Using OpenCV camera source for streaming")
-                    break
-            else:
-                LOGGER.warning("Unable to open any webcam device for streaming")
-        else:
-            LOGGER.warning(
-                "OpenCV package not installed; skipping USB camera stream. Install the 'opencv-python' package to enable it."
-            )
+    # Do NOT use OAK-D for streaming - it's reserved for AI vision via /shot endpoint
+    # if primary_source is None and DepthAICameraSource.is_available():
+    #     try:
+    #         primary_source = DepthAICameraSource()
+    #         LOGGER.info("Using DepthAI camera source for streaming (USB camera unavailable)")
+    #     except CameraError as exc:
+    #         LOGGER.warning("DepthAI camera source unavailable: %s", exc)
 
     fallback_source = None
     if _PLACEHOLDER_JPEG:
@@ -473,6 +651,33 @@ def _create_camera_service() -> CameraService:
 
 
 app.state.camera_service = _create_camera_service()
+
+
+async def _get_webcam_frame_safe() -> bytes:
+    """Get frame from webcam with USB lock to prevent interference with OAK-D."""
+    async with _USB_CAMERA_LOCK:
+        return await app.state.camera_service.get_frame()
+
+
+# Give USB camera time to fully initialize before starting OAK-D
+# This prevents USB bandwidth conflicts during initialization
+import time as time_module
+time_module.sleep(0.5)
+
+# Initialize OAK-D availability check (but don't start pipeline yet to save USB bandwidth)
+# We'll start the pipeline on-demand when /shot is called
+if DepthAICameraSource.is_available():
+    app.state.oakd_available = True
+    app.state.oakd_device = None
+    app.state.oakd_queue = None
+    app.state.oakd_last_used = 0  # Timestamp of last use
+    LOGGER.info("✅ OAK-D camera available (will start on-demand to minimize USB interference)")
+else:
+    LOGGER.warning("⚠️  DepthAI not available - /shot endpoint will not work")
+    LOGGER.info("   USB camera will still work for streaming")
+    app.state.oakd_available = False
+    app.state.oakd_device = None
+    app.state.oakd_queue = None
 
 # Initialize face recognition service
 if FACE_RECOGNITION_AVAILABLE:
@@ -489,6 +694,9 @@ if FACE_RECOGNITION_AVAILABLE:
         app.state.face_recognition = None
 else:
     app.state.face_recognition = None
+
+# Meeting service will be initialized after helper functions are defined
+app.state.meeting_service = None
 
 
 def _find_serial_device() -> tuple[Optional[str], list[str]]:
@@ -568,8 +776,12 @@ async def root() -> dict[str, object]:
 @app.get("/video")
 async def video_stream() -> StreamingResponse:
     """Expose the main MJPEG stream at the top level for convenience."""
-
-    return oak_video_response()
+    # Use camera service (USB webcam) instead of oak_stream to free up OAK-D for /shot endpoint
+    async def stream_generator() -> AsyncIterator[bytes]:
+        async for chunk in _camera_stream(app.state.camera_service, None):
+            yield chunk
+    
+    return StreamingResponse(stream_generator(), media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY}")
 
 
 @app.websocket("/camera/ws")
@@ -579,38 +791,50 @@ async def camera_websocket(websocket: WebSocket):
     LOGGER.info("WebSocket client connected")
     
     try:
-        state = oak_ensure_runtime()
-        capture = state.capture
+        # Use the existing camera service instead of oak_stream
+        camera_service = app.state.camera_service
+        if not camera_service:
+            await websocket.send_text(json.dumps({"error": "Camera not available"}))
+            await websocket.close()
+            return
+            
+        LOGGER.info("Using main camera service for WebSocket stream")
         
         while True:
-            ret, frame = capture.read()
-            if not ret or frame is None:
-                LOGGER.debug("Failed to read frame from camera; closing WebSocket")
-                await websocket.send_text(json.dumps({"error": "Failed to read frame"}))
-                break
-                
-            # Encode frame to JPEG
-            payload = oak_frame_to_jpeg(frame)
-            if payload:
-                # Send as JSON with base64 frame
-                b64_frame = base64.b64encode(payload).decode('utf-8')
-                await websocket.send_text(json.dumps({"frame": b64_frame}))  # Send as JSON
+            try:
+                # Get frame from the camera service (with USB lock protection)
+                frame_bytes = await _get_webcam_frame_safe()
+                if frame_bytes:
+                    # Send as JSON with base64 frame
+                    b64_frame = base64.b64encode(frame_bytes).decode('utf-8')
+                    await websocket.send_text(json.dumps({"frame": b64_frame}))
+                else:
+                    LOGGER.debug("No frame available from camera")
+                    await asyncio.sleep(0.1)
+                    continue
+                    
+            except RuntimeError as e:
+                # WebSocket closed by client
+                if "close message has been sent" in str(e).lower():
+                    LOGGER.info("WebSocket closed by client")
+                    break
+                raise
+            except Exception as frame_error:
+                LOGGER.warning(f"Frame capture error: {frame_error}")
+                await asyncio.sleep(0.1)
+                continue
             
             # Control frame rate (e.g., 10 FPS)
             await asyncio.sleep(0.1)
             
     except Exception as exc:
         LOGGER.error("WebSocket error: %s", exc, exc_info=True)
-        try:
-            await websocket.send_text(json.dumps({"error": str(exc)}))
-            await websocket.close()
-        except Exception:
-            pass
     finally:
         try:
             await websocket.close()
         except Exception:
             pass
+        LOGGER.info("WebSocket disconnected")
 
 
 @app.websocket("/json")
@@ -709,11 +933,41 @@ def _get_speech():
     if _speech is None:
         try:
             from speech import SpeechProcessor
-            _speech = SpeechProcessor()
+            import sys
+            from pathlib import Path
+            # Import config
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            import config
+            _speech = SpeechProcessor(
+                whisper_model=config.WHISPER_MODEL,
+                tts_engine=config.TTS_ENGINE,
+                piper_voices=config.PIPER_VOICES,
+                use_openai_whisper=config.USE_OPENAI_WHISPER,
+                openai_api_key=config.OPENAI_API_KEY
+            )
             LOGGER.info("SpeechProcessor loaded for voice endpoint")
         except Exception as e:
             LOGGER.error(f"Failed to load SpeechProcessor: {e}")
     return _speech
+
+
+# Initialize meeting service (must be after helper functions are defined)
+if MEETING_SERVICE_AVAILABLE:
+    try:
+        # Get speech processor and assistant for transcription and summarization
+        speech_processor = _get_speech()
+        assistant = _get_assistant()
+        
+        app.state.meeting_service = MeetingService(
+            speech_processor=speech_processor,
+            assistant=assistant
+        )
+        LOGGER.info("Meeting service initialized successfully")
+    except Exception as exc:
+        LOGGER.error("Failed to initialize meeting service: %s", exc, exc_info=True)
+        app.state.meeting_service = None
+else:
+    app.state.meeting_service = None
 
 
 @app.websocket("/voice")
@@ -763,46 +1017,592 @@ async def voice_websocket(websocket: WebSocket):
                     
                     sample_rate = data.get("sampleRate", 16000)
                     
-                    # Transcribe audio
+                    # Transcribe audio (English only)
                     speech = _get_speech()
                     if speech:
                         try:
                             audio_bytes = base64.b64decode(full_audio_b64)
+                            audio_duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes per sample (16-bit)
+                            LOGGER.info(f"🎤 Transcribing {len(audio_bytes)} bytes ({audio_duration:.2f}s) at {sample_rate}Hz")
+                            
                             transcript = await anyio.to_thread.run_sync(
                                 speech.transcribe, audio_bytes, sample_rate
                             )
                             
                             if transcript:
+                                LOGGER.info(f"✅ Transcription successful: '{transcript}'")
                                 await websocket.send_json({
                                     "type": "transcript",
                                     "text": transcript
                                 })
                                 
-                                # Get AI response
+                                # Check for navigation commands first
+                                transcript_lower = transcript.lower().strip()
+                                
+                                # Start navigation commands
+                                if ('start' in transcript_lower or 'begin' in transcript_lower) and \
+                                   ('auto' in transcript_lower or 'autonomous' in transcript_lower) and \
+                                   'navigation' in transcript_lower:
+                                    LOGGER.info(f"🤖 Auto navigation command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "start_explore", "duration": None}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Starting autonomous navigation. I will explore and avoid obstacles."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Navigation command failed: {nav_error}")
+                                
+                                # Start explore commands
+                                if ('start' in transcript_lower or 'begin' in transcript_lower) and 'explor' in transcript_lower:
+                                    LOGGER.info(f"🤖 Explore command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "start_explore", "duration": None}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Starting exploration mode."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Exploration command failed: {nav_error}")
+                                
+                                # Stop navigation commands
+                                if ('stop' in transcript_lower or 'end' in transcript_lower) and \
+                                   ('navigation' in transcript_lower or 'explor' in transcript_lower):
+                                    LOGGER.info(f"🛑 Stop navigation command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        nav_url = f"http://{pi_ip}:8000/navigation"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            nav_response = await client.post(
+                                                nav_url,
+                                                json={"action": "stop"}
+                                            )
+                                            if nav_response.status_code == 200:
+                                                response_text = "Stopping navigation."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as nav_error:
+                                        LOGGER.error(f"Stop navigation command failed: {nav_error}")
+                                
+                                # Dance commands
+                                if 'dance' in transcript_lower or 'bust a move' in transcript_lower or 'show me your moves' in transcript_lower:
+                                    LOGGER.info(f"💃 Dance command detected: '{transcript}'")
+                                    try:
+                                        # Extract dance style
+                                        style = 'party'
+                                        if 'wiggle' in transcript_lower:
+                                            style = 'wiggle'
+                                        elif 'spin' in transcript_lower:
+                                            style = 'spin'
+                                        
+                                        # Extract music genre (default: dance)
+                                        music_genre = 'dance'
+                                        if 'classical' in transcript_lower:
+                                            music_genre = 'classical'
+                                        elif 'jazz' in transcript_lower:
+                                            music_genre = 'jazz'
+                                        elif 'rock' in transcript_lower:
+                                            music_genre = 'rock'
+                                        elif 'electronic' in transcript_lower or 'edm' in transcript_lower:
+                                            music_genre = 'electronic'
+                                        
+                                        # Use the music endpoint to start music, then dance endpoint
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        
+                                        # Start music first using the working music endpoint (same as AI tool uses)
+                                        music_url = f"http://{pi_ip}:8000/music/play"
+                                        async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout for music search
+                                            music_response = await client.post(
+                                                music_url,
+                                                json={"query": music_genre}  # Old endpoint format
+                                            )
+                                            if music_response.status_code == 200:
+                                                LOGGER.info(f"🎵 Started {music_genre} music on robot")
+                                                # Wait for music to buffer and start playing before dancing
+                                                await anyio.sleep(2.0)
+                                            else:
+                                                LOGGER.warning(f"Music start failed: {music_response.status_code}, dancing without music")
+                                        
+                                        # Now send dance command (without music flag since music is already playing)
+                                        # Use very long duration (1 hour) - will be stopped by "stop dancing" command
+                                        dance_url = f"http://{pi_ip}:8000/dance"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            dance_response = await client.post(
+                                                dance_url,
+                                                json={
+                                                    "style": style, 
+                                                    "duration": 3600,  # 1 hour - continues until "stop dancing" command
+                                                    "with_music": False,  # Music already started separately
+                                                    "music_genre": music_genre
+                                                }
+                                            )
+                                            if dance_response.status_code == 200:
+                                                response_text = f"Let me show you my {style} dance moves with {music_genre} music!"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Skip TTS for dance to avoid audio conflict with music
+                                                LOGGER.info("Skipping TTS for dance command to allow music to play")
+                                                
+                                                continue
+                                            else:
+                                                LOGGER.warning(f"Dance request failed: {dance_response.status_code}")
+                                    except Exception as dance_error:
+                                        LOGGER.error(f"Dance command failed: {dance_error}")
+                                
+                                # Stop dancing command
+                                if ('stop' in transcript_lower or 'end' in transcript_lower) and 'danc' in transcript_lower:
+                                    LOGGER.info(f"🛑 Stop dancing command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        
+                                        # Stop dance
+                                        dance_stop_url = f"http://{pi_ip}:8000/dance/stop"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            dance_stop_response = await client.post(dance_stop_url, json={})
+                                            if dance_stop_response.status_code == 200:
+                                                LOGGER.info("✅ Dance stopped")
+                                            else:
+                                                LOGGER.warning(f"Dance stop failed: {dance_stop_response.status_code}")
+                                        
+                                        # Stop music
+                                        music_url = f"http://{pi_ip}:8000/music/stop"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            music_response = await client.post(music_url, json={})
+                                            if music_response.status_code == 200:
+                                                LOGGER.info("✅ Music stopped")
+                                            else:
+                                                LOGGER.warning(f"Music stop failed: {music_response.status_code}")
+                                        
+                                        response_text = "Stopping dance and music."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": response_text
+                                        })
+                                        continue
+                                    except Exception as stop_error:
+                                        LOGGER.error(f"Stop dancing command failed: {stop_error}")
+                                
+                                # Music commands
+                                if 'play music' in transcript_lower or 'play some music' in transcript_lower:
+                                    LOGGER.info(f"🎵 Music command detected: '{transcript}'")
+                                    try:
+                                        # Extract genre
+                                        genre = 'fun'
+                                        if 'classical' in transcript_lower:
+                                            genre = 'classical'
+                                        elif 'jazz' in transcript_lower:
+                                            genre = 'jazz'
+                                        elif 'rock' in transcript_lower:
+                                            genre = 'rock'
+                                        elif 'pop' in transcript_lower:
+                                            genre = 'pop'
+                                        elif 'dance' in transcript_lower or 'party' in transcript_lower:
+                                            genre = 'dance'
+                                        elif 'chill' in transcript_lower or 'relax' in transcript_lower:
+                                            genre = 'chill'
+                                        elif 'electronic' in transcript_lower or 'edm' in transcript_lower:
+                                            genre = 'electronic'
+                                        
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        music_url = f"http://{pi_ip}:8000/music/play"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            music_response = await client.post(
+                                                music_url,
+                                                json={"query": genre}  # Old endpoint format
+                                            )
+                                            if music_response.status_code == 200:
+                                                response_text = f"Playing {genre} music for you!"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as music_error:
+                                        LOGGER.error(f"Music command failed: {music_error}")
+                                
+                                # Stop music commands
+                                if ('stop' in transcript_lower or 'pause' in transcript_lower) and 'music' in transcript_lower:
+                                    LOGGER.info(f"⏹️ Stop music command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        music_url = f"http://{pi_ip}:8000/music/stop"
+                                        async with httpx.AsyncClient(timeout=5.0) as client:
+                                            music_response = await client.post(
+                                                music_url,
+                                                json={}  # Old endpoint format (no body needed)
+                                            )
+                                            if music_response.status_code == 200:
+                                                response_text = "Stopping music."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                    except Exception as music_error:
+                                        LOGGER.error(f"Stop music command failed: {music_error}")
+                                
+                                # Photo commands - take picture (uses existing /shot endpoint)
+                                if ('take' in transcript_lower or 'capture' in transcript_lower) and ('picture' in transcript_lower or 'photo' in transcript_lower):
+                                    LOGGER.info(f"📸 Take picture command detected: '{transcript}'")
+                                    try:
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        photo_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        # Inform user we're taking photo
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": "Say cheese! Taking your photo now."
+                                        })
+                                        
+                                        async with httpx.AsyncClient(timeout=10.0) as client:
+                                            photo_response = await client.get(photo_url)
+                                            if photo_response.status_code == 200:
+                                                response_text = "Got it! Your photo is ready. You can view it in the Photo Time tab."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                # Send TTS
+                                                pi_url = f"http://{pi_ip}:8000/speak"
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": response_text})
+                                                continue
+                                            else:
+                                                response_text = "Sorry, I couldn't capture the photo."
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": response_text
+                                                })
+                                                continue
+                                    except Exception as photo_error:
+                                        LOGGER.error(f"Photo capture command failed: {photo_error}")
+                                        response_text = "Sorry, something went wrong with the camera."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": response_text
+                                        })
+                                        continue
+                                
+                                # Vision commands - solve problems, read text, etc.
+                                vision_solve_patterns = [
+                                    'solve this', 'solve it', 'solve the problem', 'solve that',
+                                    'what is the answer', 'help me solve'
+                                ]
+                                vision_read_patterns = [
+                                    'read this', 'read it', 'read the text', 'read that',
+                                    'what does it say', 'what does this say'
+                                ]
+                                
+                                if any(pattern in transcript_lower for pattern in vision_solve_patterns):
+                                    LOGGER.info(f"🔍 Vision solve command detected: '{transcript}'")
+                                    try:
+                                        # Import vision module
+                                        import sys
+                                        sys.path.insert(0, str(Path(__file__).parent.parent))
+                                        from vision import VisionProcessor
+                                        
+                                        # Inform user we're capturing
+                                        capture_msg = "Let me take a look and solve that for you."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": capture_msg
+                                        })
+                                        
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        pi_url = f"http://{pi_ip}:8000/speak"
+                                        async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                            await tts_client.post(pi_url, json={"text": capture_msg})
+                                        
+                                        # Fetch image from robot's camera (OAK-D or USB on robot)
+                                        LOGGER.info(f"📸 Fetching image from robot camera: {pi_ip}")
+                                        shot_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        async with httpx.AsyncClient(timeout=15.0) as client:
+                                            shot_response = await client.get(shot_url)
+                                            
+                                            if shot_response.status_code != 200:
+                                                raise Exception(f"Failed to get image from robot: {shot_response.status_code}")
+                                            
+                                            image_bytes = shot_response.content
+                                            LOGGER.info(f"✅ Got image from robot ({len(image_bytes)} bytes)")
+                                        
+                                        # Save captured image for debugging
+                                        try:
+                                            import datetime
+                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            debug_image_path = f"vision_debug_solve_{timestamp}.jpg"
+                                            with open(debug_image_path, "wb") as f:
+                                                f.write(image_bytes)
+                                            LOGGER.info(f"💾 Saved debug image: {debug_image_path}")
+                                        except Exception as save_err:
+                                            LOGGER.warning(f"Could not save debug image: {save_err}")
+                                        
+                                        # Analyze with Vision API (no camera init needed)
+                                        processor = VisionProcessor()
+                                        try:
+                                            LOGGER.info("🔍 Analyzing with OpenAI Vision API...")
+                                            solution = await processor.solve_problem(image_bytes=image_bytes)
+                                            
+                                            if solution:
+                                                LOGGER.info(f"✅ Solution: {solution[:100]}...")
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": solution
+                                                })
+                                                
+                                                # Speak the solution
+                                                async with httpx.AsyncClient(timeout=15.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": solution})
+                                            else:
+                                                error_msg = "Sorry, I couldn't see the problem clearly. Can you hold it steady?"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": error_msg
+                                                })
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": error_msg})
+                                        finally:
+                                            await processor.close()
+                                        
+                                        continue
+                                        
+                                    except Exception as vision_error:
+                                        LOGGER.error(f"Vision solve command failed: {vision_error}", exc_info=True)
+                                        error_msg = "Sorry, I had trouble analyzing the image."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": error_msg
+                                        })
+                                        try:
+                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                            pi_url = f"http://{pi_ip}:8000/speak"
+                                            async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                await tts_client.post(pi_url, json={"text": error_msg})
+                                        except:
+                                            pass
+                                
+                                elif any(pattern in transcript_lower for pattern in vision_read_patterns):
+                                    LOGGER.info(f"📖 Vision read command detected: '{transcript}'")
+                                    try:
+                                        # Import vision module
+                                        import sys
+                                        sys.path.insert(0, str(Path(__file__).parent.parent))
+                                        from vision import VisionProcessor
+                                        
+                                        # Inform user we're capturing
+                                        capture_msg = "Let me read that for you."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": capture_msg
+                                        })
+                                        
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        pi_url = f"http://{pi_ip}:8000/speak"
+                                        async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                            await tts_client.post(pi_url, json={"text": capture_msg})
+                                        
+                                        # Fetch image from robot's camera (OAK-D or USB on robot)
+                                        LOGGER.info(f"📸 Fetching image from robot camera: {pi_ip}")
+                                        shot_url = f"http://{pi_ip}:8000/shot"
+                                        
+                                        async with httpx.AsyncClient(timeout=15.0) as client:
+                                            shot_response = await client.get(shot_url)
+                                            
+                                            if shot_response.status_code != 200:
+                                                raise Exception(f"Failed to get image from robot: {shot_response.status_code}")
+                                            
+                                            image_bytes = shot_response.content
+                                            LOGGER.info(f"✅ Got image from robot ({len(image_bytes)} bytes)")
+                                        
+                                        # Save captured image for debugging
+                                        try:
+                                            import datetime
+                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            debug_image_path = f"vision_debug_read_{timestamp}.jpg"
+                                            with open(debug_image_path, "wb") as f:
+                                                f.write(image_bytes)
+                                            LOGGER.info(f"💾 Saved debug image: {debug_image_path}")
+                                        except Exception as save_err:
+                                            LOGGER.warning(f"Could not save debug image: {save_err}")
+                                        
+                                        # Analyze with Vision API (no camera init needed)
+                                        processor = VisionProcessor()
+                                        try:
+                                            LOGGER.info("🔍 Reading text with OpenAI Vision API...")
+                                            text = await processor.read_text(image_bytes=image_bytes)
+                                            
+                                            if text:
+                                                LOGGER.info(f"✅ Text read: {text[:100]}...")
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": text
+                                                })
+                                                
+                                                # Speak the text
+                                                async with httpx.AsyncClient(timeout=15.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": text})
+                                            else:
+                                                error_msg = "Sorry, I couldn't read any text. Can you hold it closer?"
+                                                await websocket.send_json({
+                                                    "type": "response",
+                                                    "text": error_msg
+                                                })
+                                                async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                    await tts_client.post(pi_url, json={"text": error_msg})
+                                        finally:
+                                            await processor.close()
+                                        
+                                        continue
+                                        
+                                    except Exception as vision_error:
+                                        LOGGER.error(f"Vision read command failed: {vision_error}", exc_info=True)
+                                        error_msg = "Sorry, I had trouble reading the text."
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "text": error_msg
+                                        })
+                                        try:
+                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                            pi_url = f"http://{pi_ip}:8000/speak"
+                                            async with httpx.AsyncClient(timeout=10.0) as tts_client:
+                                                await tts_client.post(pi_url, json={"text": error_msg})
+                                        except:
+                                            pass
+                                
+                                # Get AI response (with vision if asking about camera/image)
                                 assistant = _get_assistant()
                                 if assistant:
-                                    response = await anyio.to_thread.run_sync(
-                                        assistant.ask, transcript
-                                    )
+                                    # Use keyword matching to determine if vision is needed
+                                    transcript_lower = transcript.lower()
+                                    
+                                    # Vision keywords - only trigger for explicit visual queries
+                                    vision_patterns = [
+                                        r'\bwhat\s+(?:do\s+you\s+)?see\b',
+                                        r'\bwhat\s+(?:can\s+you\s+)?see\b',
+                                        r'\bcan\s+you\s+see\b',
+                                        r'\blook\s+at\b',
+                                        r'\bdescribe\s+what\b',
+                                        r'\bshow\s+me\b'
+                                    ]
+                                    
+                                    use_vision = any(re.search(pattern, transcript_lower) for pattern in vision_patterns)
+                                    
+                                    if use_vision:
+                                        LOGGER.info("Vision query detected via keywords")
+                                    
+                                    if use_vision:
+                                        # Fetch latest frame from Pi camera
+                                        try:
+                                            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                            frame_url = f"http://{pi_ip}:8000/shot"
+                                            LOGGER.info(f"📷 Fetching frame from Pi: {frame_url}")
+                                            
+                                            async with httpx.AsyncClient(timeout=15.0) as client:
+                                                frame_response = await client.get(frame_url)
+                                                if frame_response.status_code == 200:
+                                                    image_bytes = frame_response.content
+                                                    response = await anyio.to_thread.run_sync(
+                                                        assistant.ask_with_vision, transcript, image_bytes
+                                                    )
+                                                else:
+                                                    LOGGER.warning(f"Failed to get frame: {frame_response.status_code}")
+                                                    response = await anyio.to_thread.run_sync(
+                                                        assistant.ask, transcript
+                                                    )
+                                        except Exception as frame_error:
+                                            LOGGER.error(f"Error fetching frame: {frame_error}", exc_info=True)
+                                            response = await anyio.to_thread.run_sync(
+                                                assistant.ask, transcript
+                                            )
+                                    else:
+                                        response = await anyio.to_thread.run_sync(
+                                            assistant.ask, transcript
+                                        )
+                                    
+                                    LOGGER.info(f"🤖 AI Response: {response}")
+                                    
                                     await websocket.send_json({
                                         "type": "response",
                                         "text": response
                                     })
                                     
-                                    # Also send to robot for TTS playback
+                                    # Send TTS command to Pi speakers via HTTP with language support
                                     try:
-                                        import sys
-                                        sys.path.insert(0, str(Path(__file__).parent.parent))
-                                        from main import broadcast_to_robot
-                                        await broadcast_to_robot(response)
-                                    except Exception as e:
-                                        LOGGER.warning(f"Could not broadcast to robot: {e}")
+                                        # Get target language from translation tool if used
+                                        response_language = "en"
+                                        if hasattr(assistant, 'get_response_language'):
+                                            response_language = assistant.get_response_language()
+                                        
+                                        # Get Pi IP from environment or use default
+                                        pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+                                        pi_url = f"http://{pi_ip}:8000/speak"
+                                        
+                                        if response_language != "en":
+                                            LOGGER.info(f"🔊 Sending TTS to Pi at {pi_url} (language: {response_language})...")
+                                        else:
+                                            LOGGER.info(f"🔊 Sending TTS to Pi at {pi_url}...")
+                                        
+                                        async with httpx.AsyncClient(timeout=10.0) as client:
+                                            pi_response = await client.post(
+                                                pi_url, 
+                                                json={"text": response, "language": response_language}
+                                            )
+                                            if pi_response.status_code == 200:
+                                                LOGGER.info("✅ TTS played on Pi speakers")
+                                            else:
+                                                LOGGER.warning(f"Pi TTS returned status {pi_response.status_code}")
+                                    except Exception as tts_error:
+                                        LOGGER.error(f"Failed to send TTS to Pi: {tts_error}")
                                 else:
                                     await websocket.send_json({
                                         "type": "response",
                                         "text": "AI assistant not available"
                                     })
                             else:
+                                LOGGER.warning(f"⚠️ Transcription returned empty result (audio: {len(audio_bytes)} bytes, {audio_duration:.2f}s)")
                                 await websocket.send_json({
                                     "type": "status",
                                     "message": "Could not transcribe audio"
@@ -938,9 +1738,202 @@ async def vision_endpoint(request: VisionRequest) -> VisionResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/vision/capture-and-analyze", tags=["AI"])
+async def capture_and_analyze(
+    question: str = Form("What do you see? If there's a problem or question, solve it."),
+    save_image: bool = Form(False)
+):
+    """Capture image from camera and analyze with OpenAI Vision API.
+    
+    Similar to ChatGPT's camera mode - show a paper with problem and get answer.
+    
+    Args:
+        question: Question to ask about the image
+        save_image: Whether to save the captured image
+    
+    Returns:
+        {
+            "response": "AI analysis/answer",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    
+    Example use cases:
+        - Show paper with "2+2=?" → Get answer: "4"
+        - Show any text → Get it read/transcribed
+        - Show diagram → Get it explained
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture image
+            LOGGER.info("Capturing image from camera...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image from camera")
+            
+            # Analyze with Vision API
+            LOGGER.info(f"Analyzing with question: {question}")
+            response = await processor.analyze_image(
+                image_bytes=image_bytes,
+                question=question,
+                max_tokens=800
+            )
+            
+            if not response:
+                raise HTTPException(status_code=500, detail="Vision API returned no response")
+            
+            result = {
+                "response": response,
+                "success": True
+            }
+            
+            # Optionally include the image
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except ImportError as e:
+        LOGGER.error(f"Vision module import failed: {e}")
+        raise HTTPException(status_code=503, detail="Vision processor not available")
+    except Exception as e:
+        LOGGER.error(f"Vision capture/analyze error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision/solve-problem", tags=["AI"])
+async def solve_problem_from_camera(save_image: bool = Form(False)):
+    """Capture image and solve any problem shown (optimized for math/text problems).
+    
+    This is a convenience endpoint optimized for problem-solving.
+    Show a paper with a problem and get the solution.
+    
+    Args:
+        save_image: Whether to return the captured image
+    
+    Returns:
+        {
+            "solution": "Step-by-step solution",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    
+    Example:
+        - Show "2+2=?" → Get "The answer is 4"
+        - Show "5×3=?" → Get "5 multiplied by 3 equals 15"
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture image
+            LOGGER.info("Capturing image for problem solving...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image")
+            
+            # Solve problem
+            LOGGER.info("Solving problem...")
+            solution = await processor.solve_problem(image_bytes)
+            
+            if not solution:
+                raise HTTPException(status_code=500, detail="Could not solve problem")
+            
+            result = {
+                "solution": solution,
+                "success": True
+            }
+            
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Problem solving error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision/read-text", tags=["AI"])
+async def read_text_from_camera(save_image: bool = Form(False)):
+    """Capture image and read/extract any text (OCR).
+    
+    Args:
+        save_image: Whether to return the captured image
+    
+    Returns:
+        {
+            "text": "Extracted text",
+            "success": true,
+            "image_base64": "..." (if save_image=true)
+        }
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from vision import VisionProcessor
+        
+        processor = VisionProcessor()
+        
+        try:
+            # Capture and read text
+            LOGGER.info("Capturing image for text reading...")
+            image_bytes = await processor.capture_image()
+            
+            if not image_bytes:
+                raise HTTPException(status_code=500, detail="Failed to capture image")
+            
+            LOGGER.info("Reading text...")
+            text = await processor.read_text(image_bytes)
+            
+            if not text:
+                raise HTTPException(status_code=500, detail="No text found or read failed")
+            
+            result = {
+                "text": text,
+                "success": True
+            }
+            
+            if save_image:
+                result["image_base64"] = base64.b64encode(image_bytes).decode('utf-8')
+            
+            return result
+            
+        finally:
+            await processor.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"Text reading error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/stt", tags=["AI"])
 async def speech_to_text(audio: UploadFile = File(...)):
-    """Convert speech to text using Whisper."""
+    """Convert speech to text using Whisper (English only)."""
     speech = _get_speech()
     if not speech:
         raise HTTPException(status_code=503, detail="Speech processor not available")
@@ -950,7 +1943,14 @@ async def speech_to_text(audio: UploadFile = File(...)):
         transcript = await anyio.to_thread.run_sync(
             speech.transcribe, audio_bytes, 16000
         )
-        return {"text": transcript, "success": bool(transcript)}
+        
+        if transcript:
+            return {
+                "text": transcript,
+                "success": True
+            }
+        else:
+            return {"text": None, "success": False}
     except Exception as e:
         LOGGER.error(f"STT error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -958,17 +1958,25 @@ async def speech_to_text(audio: UploadFile = File(...)):
 
 @app.post("/tts", tags=["AI"])
 async def text_to_speech(request: dict):
-    """Convert text to speech."""
+    """
+    Convert text to speech with language support.
+    
+    Request body:
+        text: Text to synthesize (required)
+        language: ISO language code (optional, default: 'en')
+    """
     speech = _get_speech()
     if not speech:
         raise HTTPException(status_code=503, detail="Speech processor not available")
     
     text = request.get("text", "")
+    language = request.get("language", "en")
+    
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
     
     try:
-        audio_bytes = await anyio.to_thread.run_sync(speech.synthesize, text)
+        audio_bytes = await anyio.to_thread.run_sync(speech.synthesize, text, language)
         if audio_bytes:
             return Response(content=audio_bytes, media_type="audio/wav")
         else:
@@ -980,8 +1988,29 @@ async def text_to_speech(request: dict):
 
 # Piper TTS for local speech on Pi
 _piper_voice = None
+_tts_lock = asyncio.Lock()  # Prevent concurrent audio playback
 PIPER_MODEL_PATH = "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx"
-AUDIO_DEVICE = "plughw:3,0"  # USB speaker
+
+def _get_audio_device():
+    """Auto-detect USB audio device."""
+    try:
+        result = subprocess.run(['aplay', '-l'], capture_output=True, text=True, timeout=2)
+        for line in result.stdout.split('\n'):
+            if 'UACDemo' in line or 'USB Audio' in line:
+                # Extract card number from line like "card 3: UACDemoV10..."
+                parts = line.split(':')
+                if len(parts) >= 1 and 'card' in parts[0]:
+                    card_num = parts[0].split('card')[1].strip()
+                    device = f"plughw:{card_num},0"
+                    LOGGER.info(f"🔊 Auto-detected USB audio device: {device}")
+                    return device
+    except Exception as e:
+        LOGGER.warning(f"Failed to auto-detect audio device: {e}")
+    
+    # Fallback to default
+    return "plughw:2,0"
+
+AUDIO_DEVICE = _get_audio_device()
 
 
 def _get_piper_voice():
@@ -1003,7 +2032,7 @@ def _get_piper_voice():
 
 
 def _speak_with_piper(text: str) -> bool:
-    """Synthesize and play speech through speakers."""
+    """Synthesize and play speech through speakers with dynamic device detection."""
     import wave
     import subprocess
     import tempfile
@@ -1013,12 +2042,28 @@ def _speak_with_piper(text: str) -> bool:
         return False
     
     try:
+        # Clean text for TTS (remove special characters that might break Piper)
+        clean_text = text.strip()
+        # Remove markdown formatting, asterisks, etc
+        clean_text = clean_text.replace('*', '').replace('#', '').replace('_', '')
+        # Remove parentheses and brackets
+        clean_text = clean_text.replace('(', '').replace(')', '').replace('[', '').replace(']', '')
+        
+        LOGGER.debug(f"TTS cleaned text (first 100 chars): {clean_text[:100]}")
+        
         # Synthesize audio
         audio_bytes = b''
         sample_rate = 22050
-        for chunk in voice.synthesize(text):
+        for chunk in voice.synthesize(clean_text):
             audio_bytes += chunk.audio_int16_bytes
             sample_rate = chunk.sample_rate
+        
+        # Verify audio was generated
+        if not audio_bytes or len(audio_bytes) < 100:
+            LOGGER.error(f"Piper generated insufficient audio: {len(audio_bytes)} bytes")
+            return False
+        
+        LOGGER.info(f"Generated {len(audio_bytes)} bytes of audio at {sample_rate}Hz")
         
         # Save to temp WAV file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -1029,16 +2074,56 @@ def _speak_with_piper(text: str) -> bool:
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio_bytes)
         
-        # Play through speaker
-        subprocess.run(
-            ['aplay', '-D', AUDIO_DEVICE, wav_path],
-            stderr=subprocess.DEVNULL,
-            timeout=30
-        )
+        # Dynamically detect audio device and try multiple fallback options
+        audio_devices = []
         
-        # Cleanup
+        # Try to detect USB audio device dynamically
+        try:
+            result = subprocess.run(['aplay', '-l'], capture_output=True, text=True, timeout=2)
+            for line in result.stdout.split('\n'):
+                if 'UACDemo' in line or 'USB Audio' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 1 and 'card' in parts[0]:
+                        card_num = parts[0].split('card')[1].strip()
+                        audio_devices.append(f"plughw:{card_num},0")
+        except Exception as e:
+            LOGGER.debug(f"Failed to detect audio device: {e}")
+        
+        # Add fallback devices
+        audio_devices.extend([
+            "plughw:3,0",  # Common USB audio card
+            "plughw:2,0",
+            "default",     # System default
+            "plughw:0,0",  # Built-in audio
+        ])
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        audio_devices = [x for x in audio_devices if not (x in seen or seen.add(x))]
+        
+        # Try each device until one works
+        for device in audio_devices:
+            try:
+                result = subprocess.run(
+                    ['aplay', '-D', device, wav_path],
+                    capture_output=True,
+                    timeout=30
+                )
+                
+                if result.returncode == 0:
+                    LOGGER.info(f"✅ Audio played successfully on {device}")
+                    os.unlink(wav_path)
+                    return True
+                else:
+                    LOGGER.debug(f"Device {device} failed: {result.stderr.decode()}")
+            except Exception as e:
+                LOGGER.debug(f"Device {device} error: {e}")
+                continue
+        
+        # All devices failed
+        LOGGER.error(f"All audio devices failed. Tried: {audio_devices}")
         os.unlink(wav_path)
-        return True
+        return False
         
     except Exception as e:
         LOGGER.error(f"Piper speak error: {e}")
@@ -1050,6 +2135,7 @@ async def speak_text(request: dict):
     """Speak text through the robot's speakers using Piper TTS.
     
     This endpoint is for the Pi to speak responses from the cloud AI.
+    Uses a lock to prevent concurrent audio playback (ALSA limitation).
     """
     text = request.get("text", "")
     if not text:
@@ -1057,7 +2143,9 @@ async def speak_text(request: dict):
     
     LOGGER.info(f"Speaking: {text[:50]}...")
     
-    success = await anyio.to_thread.run_sync(_speak_with_piper, text)
+    # Use lock to prevent concurrent audio playback
+    async with _tts_lock:
+        success = await anyio.to_thread.run_sync(_speak_with_piper, text)
     
     if success:
         return {"status": "ok", "message": "Speech played"}
@@ -1065,12 +2153,408 @@ async def speak_text(request: dict):
         raise HTTPException(status_code=503, detail="TTS not available")
 
 
+@app.post("/dance", tags=["Control"])
+async def trigger_dance(request: dict):
+    """Trigger a dance routine on the robot.
+    
+    Request body:
+        style: Dance style - 'party', 'wiggle', or 'spin' (optional, default: 'party')
+        duration: Duration in seconds (optional, default: 10)
+        with_music: Play music during dance (optional, default: False)
+        music_genre: Music genre if with_music is True (optional, default: 'dance')
+    
+    Can be called from:
+    - Mobile app directly
+    - Cloud server via voice commands
+    """
+    style = request.get("style", "party")
+    duration = request.get("duration", 10)
+    with_music = request.get("with_music", False)
+    music_genre = request.get("music_genre", "dance")
+    
+    # Validate style
+    valid_styles = ['party', 'wiggle', 'spin']
+    if style not in valid_styles:
+        raise HTTPException(status_code=400, detail=f"Invalid style. Must be one of: {valid_styles}")
+    
+    # Validate duration
+    if not isinstance(duration, (int, float)) or duration <= 0 or duration > 60:
+        raise HTTPException(status_code=400, detail="Duration must be between 0 and 60 seconds")
+    
+    LOGGER.info(f"💃 Dance triggered: {style} for {duration}s" + (f" with {music_genre} music" if with_music else ""))
+    
+    # Get the rover controller instance
+    base_controller = _get_base_controller()
+    
+    if not base_controller:
+        raise HTTPException(status_code=503, detail="Rover controller not available")
+    
+    if not hasattr(base_controller, "dance"):
+        raise HTTPException(status_code=501, detail="Dance function not supported by this rover")
+    
+    try:
+        # If music requested, try to play it locally
+        music_player = None
+        if with_music:
+            try:
+                from robot.music_player import get_music_player
+                music_player = get_music_player()
+                if music_player and music_player.yt_music:
+                    LOGGER.info(f"🎵 Starting {music_genre} music")
+                    await anyio.to_thread.run_sync(music_player.play_random, music_genre)
+                    await anyio.sleep(2)  # Let music start
+                else:
+                    LOGGER.info("YouTube Music not configured, dancing without music")
+            except ImportError as import_error:
+                LOGGER.info(f"Music player module not available: {import_error}, dancing without music")
+            except Exception as music_error:
+                LOGGER.warning(f"Music failed, dancing without: {music_error}")
+        
+        # Run dance in background thread to not block the response
+        await anyio.to_thread.run_sync(base_controller.dance, style, duration)
+        
+        # Stop music after dance if it was started
+        if with_music and music_player and music_player.is_playing:
+            try:
+                music_player.stop()
+                LOGGER.info("🎵 Music stopped after dance")
+            except Exception as stop_error:
+                LOGGER.warning(f"Failed to stop music: {stop_error}")
+        
+        return {
+            "status": "ok",
+            "message": f"Dancing {style} style for {duration} seconds" + (" with music" if with_music else ""),
+            "style": style,
+            "duration": duration,
+            "with_music": with_music,
+            "music_genre": music_genre if with_music else None
+        }
+    except Exception as exc:
+        LOGGER.error(f"Dance execution failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Dance failed: {str(exc)}")
+
+
+@app.post("/music", tags=["Control"])
+async def control_music(request: dict):
+    """Control music playback on the robot.
+    
+    Request body:
+        action: 'play' or 'stop' (required)
+        genre: Music genre for 'play' action (optional, default: 'dance')
+                Options: 'dance', 'party', 'classical', 'jazz', 'rock', 'pop', 'chill', 'electronic', 'fun'
+    
+    Returns:
+        Status and currently playing song info (if applicable)
+    """
+    action = request.get("action", "play")
+    genre = request.get("genre", "dance")
+    
+    # Validate action
+    if action not in ['play', 'stop', 'status']:
+        raise HTTPException(status_code=400, detail="Action must be 'play', 'stop', or 'status'")
+    
+    # Validate genre
+    valid_genres = ['dance', 'party', 'classical', 'jazz', 'rock', 'pop', 'chill', 'electronic', 'fun']
+    if action == 'play' and genre not in valid_genres:
+        raise HTTPException(status_code=400, detail=f"Invalid genre. Must be one of: {valid_genres}")
+    
+    try:
+        # Try to play music on cloud server (where YouTube Music is authenticated)
+        from robot.music_player import get_music_player
+        music_player = get_music_player()
+        
+        if not music_player or not music_player.yt_music:
+            # If cloud doesn't have YouTube Music, forward to robot
+            LOGGER.info("Cloud music not available, forwarding to robot")
+            import httpx
+            pi_ip = os.getenv("ROVY_ROBOT_IP", "100.72.107.106")
+            music_url = f"http://{pi_ip}:8000/music"
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                music_response = await client.post(
+                    music_url,
+                    json={"action": action, "genre": genre}
+                )
+                
+                if music_response.status_code == 200:
+                    result = music_response.json()
+                    if action == 'play':
+                        LOGGER.info(f"🎵 Playing {genre} music via robot")
+                    elif action == 'stop':
+                        LOGGER.info("⏹️ Stopping music via robot")
+                    return result
+                else:
+                    error_detail = music_response.text
+                    raise HTTPException(
+                        status_code=music_response.status_code,
+                        detail=f"Music control failed: {error_detail}"
+                    )
+        
+        # Play music on cloud server
+        if action == 'play':
+            LOGGER.info(f"🎵 Playing {genre} music on cloud server")
+            success = await anyio.to_thread.run_sync(music_player.play_random, genre)
+            
+            if success:
+                return {
+                    "status": "ok",
+                    "action": "playing",
+                    "genre": genre,
+                    "current_song": music_player.current_song,
+                    "location": "cloud"
+                }
+            else:
+                raise HTTPException(status_code=404, detail=f"No {genre} songs found")
+        
+        elif action == 'stop':
+            LOGGER.info("⏹️ Stopping music on cloud server")
+            music_player.stop()
+            return {
+                "status": "ok",
+                "action": "stopped",
+                "location": "cloud"
+            }
+        
+        elif action == 'status':
+            status = music_player.get_status()
+            return {
+                "status": "ok",
+                "is_playing": status['is_playing'],
+                "current_song": status['current_song'],
+                "location": "cloud"
+            }
+    
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Music player module not available")
+    except httpx.RequestError as exc:
+        LOGGER.error(f"Failed to connect to robot: {exc}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Cannot connect to robot")
+    except Exception as exc:
+        LOGGER.error(f"Music control failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Music control failed: {str(exc)}")
+
+
+@app.post("/gesture/detect", tags=["AI"])
+async def detect_gesture(file: UploadFile = File(...)):
+    """Detect hand gesture from image (like, heart, etc.)"""
+    if not GESTURE_DETECTION_AVAILABLE or not detect_gesture_from_image:
+        raise HTTPException(status_code=503, detail="Gesture detection not available")
+    
+    try:
+        # Read image bytes
+        image_bytes = await file.read()
+        if len(image_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty image file")
+        
+        # Detect gesture
+        gesture, confidence = await anyio.to_thread.run_sync(
+            detect_gesture_from_image, image_bytes
+        )
+        
+        return {
+            "gesture": gesture,
+            "confidence": float(confidence),
+            "status": "ok"
+        }
+    except Exception as e:
+        LOGGER.error(f"Gesture detection error: {e}")
+        raise HTTPException(status_code=500, detail=f"Gesture detection failed: {str(e)}")
+
+
+def _start_oakd_pipeline():
+    """Start OAK-D pipeline on-demand."""
+    import depthai as dai
+    import time
+    
+    # Close existing device if any
+    if app.state.oakd_device is not None:
+        try:
+            app.state.oakd_device.close()
+            time.sleep(0.5)  # Wait for device to be fully released
+        except:
+            pass
+        app.state.oakd_device = None
+        app.state.oakd_queue = None
+    
+    # Force release any stale devices
+    DepthAICameraSource.force_release_devices()
+    time.sleep(0.8)  # Increased wait time to ensure device is fully released and ready
+    
+    # Create pipeline - use MJPEG encoding for less USB bandwidth
+    pipeline = dai.Pipeline()
+    
+    cam_rgb = pipeline.create(dai.node.ColorCamera)
+    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+    cam_rgb.setInterleaved(False)
+    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    cam_rgb.setIspScale(1, 3)  # Downscale to 640x360
+    cam_rgb.setFps(10)  # Low FPS to minimize USB bandwidth
+    
+    xout_rgb = pipeline.create(dai.node.XLinkOut)
+    xout_rgb.setStreamName("preview")
+    xout_rgb.setMetadataOnly(False)
+    cam_rgb.preview.link(xout_rgb.input)
+    
+    # Try to create device with retry logic in case device is not fully ready
+    max_retries = 3
+    for retry in range(max_retries):
+        try:
+            app.state.oakd_device = dai.Device(pipeline)
+            app.state.oakd_queue = app.state.oakd_device.getOutputQueue(name="preview", maxSize=1, blocking=False)
+            app.state.oakd_last_used = time.time()
+            LOGGER.info("✅ OAK-D pipeline started on-demand")
+            return
+        except Exception as e:
+            if retry < max_retries - 1:
+                LOGGER.warning(f"Failed to start OAK-D pipeline (attempt {retry + 1}/{max_retries}): {e}")
+                time.sleep(0.5)  # Wait before retry
+                # Force release again before retry
+                DepthAICameraSource.force_release_devices()
+                time.sleep(0.3)
+            else:
+                LOGGER.error(f"Failed to start OAK-D pipeline after {max_retries} attempts: {e}")
+                raise
+
+
+def _stop_oakd_pipeline():
+    """Stop OAK-D pipeline to free USB bandwidth."""
+    if app.state.oakd_device is not None:
+        try:
+            app.state.oakd_device.close()
+            LOGGER.info("🛑 OAK-D pipeline stopped (freeing USB bandwidth)")
+        except:
+            pass
+        app.state.oakd_device = None
+        app.state.oakd_queue = None
+        # Wait a bit to ensure device is fully released before next use
+        import time
+        time.sleep(0.5)
+
+
+def _ensure_oakd_pipeline():
+    """Ensure OAK-D pipeline is running, start if needed."""
+    import time
+    
+    # Check if pipeline exists and is healthy
+    if app.state.oakd_queue is not None and app.state.oakd_device is not None:
+        try:
+            # Pipeline already running - just update timestamp
+            app.state.oakd_last_used = time.time()
+            return
+        except:
+            # Device might be in bad state, reset it
+            LOGGER.warning("OAK-D device appears to be in bad state, reinitializing...")
+            app.state.oakd_device = None
+            app.state.oakd_queue = None
+    
+    # Start pipeline on-demand
+    LOGGER.info("📷 Starting OAK-D pipeline on-demand...")
+    _start_oakd_pipeline()
+
+
+async def _capture_oakd_snapshot() -> bytes:
+    """Capture a single snapshot from OAK-D camera (on-demand) with auto-recovery."""
+    import cv2
+    import time as time_module
+    
+    if not app.state.oakd_available:
+        raise CameraError("OAK-D camera not available")
+    
+    # Start/stop pipeline WITHOUT holding lock to avoid freezing webcam
+    # Only hold lock for brief periods during actual frame capture
+    def get_frame_sync():
+        # Start pipeline without lock (this takes several seconds)
+        LOGGER.debug("📷 Starting OAK-D (webcam continues in background)...")
+        _ensure_oakd_pipeline()
+        
+        if app.state.oakd_queue is None:
+            raise CameraError("Failed to start OAK-D pipeline")
+        
+        # Wait for pipeline to produce first frames (without holding lock)
+        LOGGER.debug("⏳ Waiting for OAK-D to warm up (webcam continues)...")
+        time_module.sleep(0.8)
+        
+        # Try to get the latest frame
+        max_attempts = 15
+        frame_data = None
+        
+        for attempt in range(max_attempts):
+            try:
+                # Use tryGet() which is non-blocking
+                frame_data = app.state.oakd_queue.tryGet()
+                if frame_data is not None:
+                    # Convert to OpenCV frame
+                    frame = frame_data.getCvFrame()
+                    if frame is None or frame.size == 0:
+                        LOGGER.warning(f"Empty frame from OAK-D (attempt {attempt+1}/{max_attempts})")
+                        frame_data = None
+                        time_module.sleep(0.05)
+                        continue
+                    
+                    # Encode to JPEG
+                    success, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if not success:
+                        raise CameraError("Failed to encode frame as JPEG")
+                    
+                    LOGGER.info(f"✅ Captured OAK-D snapshot ({len(encoded.tobytes())} bytes) on attempt {attempt+1}")
+                    
+                    # Stop pipeline after successful capture to free USB bandwidth for webcam
+                    LOGGER.debug("🛑 Stopping OAK-D (webcam resumes full bandwidth)...")
+                    _stop_oakd_pipeline()
+                    
+                    return encoded.tobytes()
+                else:
+                    # No frame available yet, wait a short time
+                    LOGGER.debug(f"No frame available from OAK-D queue (attempt {attempt+1}/{max_attempts})")
+                    time_module.sleep(0.1)
+                    
+            except Exception as e:
+                error_msg = str(e)
+                # Check if it's an X_LINK error - pipeline might be corrupted
+                if "X_LINK_ERROR" in error_msg or "Communication exception" in error_msg or "XLinkError" in error_msg:
+                    LOGGER.warning(f"OAK-D pipeline corrupted: {error_msg}")
+                    try:
+                        _start_oakd_pipeline()
+                        # Give new pipeline time to start producing frames
+                        time_module.sleep(1.0)
+                        # Retry with new pipeline
+                        continue
+                    except Exception as reinit_error:
+                        raise CameraError(f"Failed to restart OAK-D: {reinit_error}")
+                
+                # For other errors, log and retry
+                LOGGER.warning(f"Error getting OAK-D frame (attempt {attempt+1}/{max_attempts}): {error_msg}")
+                if attempt == max_attempts - 1:
+                    # Stop pipeline before raising error
+                    _stop_oakd_pipeline()
+                    raise CameraError(f"Failed to get frame from OAK-D after {max_attempts} attempts: {error_msg}")
+                
+                time_module.sleep(0.05)
+        
+        # Stop pipeline before raising error
+        _stop_oakd_pipeline()
+        raise CameraError(f"No frame available from OAK-D after {max_attempts} attempts. Device not producing frames.")
+    
+    # Run without USB lock - let both cameras operate simultaneously
+    # They share USB bandwidth but don't block each other
+    return await anyio.to_thread.run_sync(get_frame_sync)
+
+
+
 @app.get("/shot")
 async def single_frame() -> Response:
-    """Serve a single JPEG frame without the additional camera namespace."""
-
-    frame = oak_snapshot()
-    return Response(content=frame, media_type="image/jpeg")
+    """Serve a single JPEG frame from OAK-D camera for AI vision."""
+    try:
+        # Capture frame using temporary OAK-D instance
+        frame = await _capture_oakd_snapshot()
+        return Response(content=frame, media_type="image/jpeg")
+    except CameraError as e:
+        LOGGER.error(f"Failed to get OAK-D frame: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        LOGGER.error(f"Unexpected error getting OAK-D frame: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 async def _camera_stream(service: CameraService, frames: int | None) -> AsyncIterator[bytes]:
@@ -1096,6 +2580,26 @@ async def shutdown_camera() -> None:
 
 @app.get("/health", response_model=HealthResponse, tags=["Discovery"])
 async def get_health() -> HealthResponse:
+    # Try to get battery information
+    battery_percent = None
+    base_controller = _get_base_controller()
+    
+    if base_controller and hasattr(base_controller, "get_status"):
+        try:
+            rover_status = await anyio.to_thread.run_sync(base_controller.get_status)
+            battery_percent = _voltage_to_percentage(rover_status.get("voltage"))
+        except Exception as exc:
+            LOGGER.debug("Failed to get battery for health check: %s", exc)
+    
+    # Check cloud service availability
+    assistant_available = _get_assistant() is not None
+    speech_available = _get_speech() is not None
+    meeting_service_available = (
+        MEETING_SERVICE_AVAILABLE and 
+        hasattr(app.state, 'meeting_service') and 
+        app.state.meeting_service is not None
+    )
+    
     return HealthResponse(
         ok=True,
         name=ROBOT_NAME,
@@ -1103,6 +2607,10 @@ async def get_health() -> HealthResponse:
         claimed=STATE["claimed"],
         mode=Mode.ACCESS_POINT,
         version=APP_VERSION,
+        battery=battery_percent,
+        assistant_loaded=assistant_available,
+        speech_loaded=speech_available,
+        meeting_service_available=meeting_service_available,
     )
 
 
@@ -1114,7 +2622,7 @@ async def get_network_info() -> NetworkInfoResponse:
 @app.get("/camera/snapshot", tags=["Camera"])
 async def get_camera_snapshot() -> Response:
     try:
-        frame = await app.state.camera_service.get_frame()
+        frame = await _get_webcam_frame_safe()
     except CameraError as exc:
         raise HTTPException(status_code=503, detail="Snapshot unavailable") from exc
 
@@ -1124,23 +2632,7 @@ async def get_camera_snapshot() -> Response:
 
 @app.get("/camera/stream", tags=["Camera"])
 async def get_camera_stream(frames: int | None = Query(default=None, ge=1)) -> StreamingResponse:
-    try:
-        response = oak_video_response()
-    except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        LOGGER.info(
-            "DepthAI MJPEG stream unavailable; falling back to camera service",
-            extra={"reason": exc.detail},
-        )
-    else:
-        if frames is not None:
-            LOGGER.info(
-                "Ignoring frame limit request; DepthAI MJPEG stream is continuous",
-                extra={"frames": frames},
-            )
-        return response
-
+    # Always use camera service (USB webcam) to keep OAK-D free for /shot endpoint
     async def stream_generator() -> AsyncIterator[bytes]:
         LOGGER.info("Starting camera stream", extra={"frames": frames})
         frame_count = 0
@@ -1178,9 +2670,11 @@ def _voltage_to_percentage(voltage: float | None) -> int:
     if voltage is None:
         return 0
 
-    # Heuristic mapping for a 3S LiPo pack commonly used on the rover.
+    # Voltage range for the rover's 3S LiPo pack with conservative charging
+    # Full charge: 12.25V (4.08V per cell) - safer for battery longevity
+    # Empty: 9.0V (3.0V per cell) - safe discharge limit
     empty_voltage = 9.0
-    full_voltage = 12.6
+    full_voltage = 12.25
 
     percent = (voltage - empty_voltage) / (full_voltage - empty_voltage)
     percent = max(0.0, min(1.0, percent))
@@ -1463,8 +2957,8 @@ async def recognize_faces() -> FaceRecognitionResponse:
         )
     
     try:
-        # Get frame from camera
-        frame_bytes = await app.state.camera_service.get_frame()
+        # Get frame from camera (with USB lock protection)
+        frame_bytes = await _get_webcam_frame_safe()
         
         # Decode JPEG to numpy array
         import cv2
@@ -1612,8 +3106,8 @@ async def face_recognition_stream() -> StreamingResponse:
         
         try:
             while True:
-                # Get frame from camera
-                frame_bytes = await app.state.camera_service.get_frame()
+                # Get frame from camera (with USB lock protection)
+                frame_bytes = await _get_webcam_frame_safe()
                 
                 # Decode JPEG
                 nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -1657,3 +3151,179 @@ async def face_recognition_stream() -> StreamingResponse:
         stream_generator(),
         media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY}",
     )
+
+
+# ==================== Meeting Summarization Endpoints ====================
+
+@app.post("/meetings/upload", response_model=MeetingUploadResponse, tags=["Meetings"])
+async def upload_meeting_audio(
+    audio: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    meeting_type: str = Form("meeting"),
+) -> MeetingUploadResponse:
+    """
+    Upload an audio file for meeting transcription and summarization.
+    
+    Args:
+        audio: Audio file (WAV, MP3, etc.)
+        title: Optional meeting title
+        meeting_type: Type of meeting (meeting, lecture, conversation, note)
+    
+    Returns:
+        MeetingUploadResponse with meeting ID and status
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        # Read audio data
+        audio_bytes = await audio.read()
+        
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+        
+        # Process audio (transcribe and summarize)
+        result = await app.state.meeting_service.process_audio(
+            audio_bytes=audio_bytes,
+            filename=audio.filename or "recording.wav",
+            title=title,
+            meeting_type=meeting_type
+        )
+        
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("message", "Failed to process audio")
+            )
+        
+        return MeetingUploadResponse(
+            success=True,
+            meeting_id=result["meeting_id"],
+            message="Meeting processed successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Meeting upload failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process meeting: {exc}"
+        ) from exc
+
+
+@app.get("/meetings", response_model=MeetingSummaryListResponse, tags=["Meetings"])
+async def get_all_meetings() -> MeetingSummaryListResponse:
+    """
+    Get all meeting summaries.
+    
+    Returns:
+        MeetingSummaryListResponse with list of all meetings
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        meetings = app.state.meeting_service.get_all_meetings()
+        
+        # Convert to response model
+        meeting_summaries = [
+            MeetingSummary(**meeting) for meeting in meetings
+        ]
+        
+        return MeetingSummaryListResponse(
+            summaries=meeting_summaries,
+            count=len(meeting_summaries)
+        )
+        
+    except Exception as exc:
+        LOGGER.error("Failed to get meetings: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve meetings: {exc}"
+        ) from exc
+
+
+@app.get("/meetings/{meeting_id}", response_model=MeetingSummary, tags=["Meetings"])
+async def get_meeting(meeting_id: str) -> MeetingSummary:
+    """
+    Get a specific meeting by ID.
+    
+    Args:
+        meeting_id: Meeting UUID
+    
+    Returns:
+        MeetingSummary with full meeting details
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        meeting = app.state.meeting_service.get_meeting(meeting_id)
+        
+        if not meeting:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found"
+            )
+        
+        return MeetingSummary(**meeting)
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Failed to get meeting: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve meeting: {exc}"
+        ) from exc
+
+
+@app.delete("/meetings/{meeting_id}", tags=["Meetings"])
+async def delete_meeting(meeting_id: str) -> dict[str, str]:
+    """
+    Delete a meeting by ID.
+    
+    Args:
+        meeting_id: Meeting UUID
+    
+    Returns:
+        Status message
+    """
+    if not MEETING_SERVICE_AVAILABLE or app.state.meeting_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting service not available"
+        )
+    
+    try:
+        success = app.state.meeting_service.delete_meeting(meeting_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found"
+            )
+        
+        return {
+            "status": "success",
+            "message": f"Meeting {meeting_id} deleted"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.error("Failed to delete meeting: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete meeting: {exc}"
+        ) from exc

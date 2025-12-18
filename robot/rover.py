@@ -117,6 +117,94 @@ class Rover:
         
         self.gimbal_ctrl(0, 0, 0, 0)
     
+    def dance(self, style='party', duration=10):
+        """
+        Perform a dance routine!
+        
+        Args:
+            style: 'party' (energetic spinning), 'wiggle' (side-to-side), 'spin' (360 spins)
+            duration: How long to dance in seconds
+        """
+        print(f"[Rover] 💃 Starting {style} dance for {duration}s!")
+        
+        start_time = time.time()
+        
+        if style == 'party':
+            # Party dance - spin, move, lights!
+            while time.time() - start_time < duration:
+                # Flash lights
+                self.lights_ctrl(255, 0)
+                
+                # Spin right
+                self._send_direct(0.5, -0.5)
+                time.sleep(0.3)
+                
+                self.lights_ctrl(0, 255)
+                
+                # Spin left
+                self._send_direct(-0.5, 0.5)
+                time.sleep(0.3)
+                
+                # Head shake
+                self.gimbal_ctrl(-20, 10, 0, 0)
+                time.sleep(0.2)
+                self.gimbal_ctrl(20, -10, 0, 0)
+                time.sleep(0.2)
+                
+                # Forward wiggle
+                self._send_direct(0.3, 0.4)
+                time.sleep(0.2)
+                self._send_direct(0.4, 0.3)
+                time.sleep(0.2)
+        
+        elif style == 'wiggle':
+            # Wiggle dance - side to side with head movements
+            while time.time() - start_time < duration:
+                # Wiggle left
+                self._send_direct(-0.3, 0.3)
+                self.gimbal_ctrl(-30, 0, 0, 0)
+                self.lights_ctrl(255, 0)
+                time.sleep(0.4)
+                
+                # Wiggle right
+                self._send_direct(0.3, -0.3)
+                self.gimbal_ctrl(30, 0, 0, 0)
+                self.lights_ctrl(0, 255)
+                time.sleep(0.4)
+                
+                # Center and nod
+                self.gimbal_ctrl(0, 20, 0, 0)
+                time.sleep(0.2)
+                self.gimbal_ctrl(0, -20, 0, 0)
+                time.sleep(0.2)
+        
+        elif style == 'spin':
+            # Spin dance - continuous 360 spins with lights
+            while time.time() - start_time < duration:
+                # Alternating light patterns
+                self.lights_ctrl(255, 255)
+                
+                # Full spin
+                self._send_direct(0.6, -0.6)
+                time.sleep(1.0)
+                
+                self.lights_ctrl(0, 0)
+                time.sleep(0.1)
+                
+                # Opposite spin
+                self._send_direct(-0.6, 0.6)
+                time.sleep(1.0)
+                
+                # Head movement during spin
+                self.gimbal_ctrl(0, 30, 0, 0)
+                time.sleep(0.2)
+        
+        # End dance - stop and reset
+        self.stop()
+        self.gimbal_ctrl(0, 0, 0, 0)
+        self.lights_ctrl(0, 0)
+        print("[Rover] 💃 Dance complete!")
+    
     def lights_ctrl(self, front, back):
         """Control LED lights (0-255)."""
         data = {"T": 132, "IO4": front, "IO5": back}
