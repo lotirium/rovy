@@ -1,8 +1,8 @@
 /**
  * Cloud AI API - Connects to PC server for AI processing
- * 
+ *
  * This is separate from robot-api.ts which connects to the Pi.
- * 
+ *
  * Architecture:
  *   Phone App → Pi (robot-api.ts): Camera, rover control, lights, WiFi
  *   Phone App → PC (cloud-api.ts): Chat, vision, STT, TTS
@@ -153,11 +153,15 @@ export class CloudAPI {
     const formData = new FormData();
     formData.append("audio", audioBlob, "audio.wav");
 
-    const response = await this.axiosInstance.post<STTResponse>("/stt", formData, {
-      headers: {
-        "Content-Type": "multipart/form-data",
-      },
-    });
+    const response = await this.axiosInstance.post<STTResponse>(
+      "/stt",
+      formData,
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      }
+    );
     return response.data;
   }
 
@@ -166,9 +170,13 @@ export class CloudAPI {
    * @returns Audio data as ArrayBuffer (WAV format)
    */
   public async textToSpeech(text: string): Promise<ArrayBuffer> {
-    const response = await this.axiosInstance.post("/tts", { text }, {
-      responseType: "arraybuffer",
-    });
+    const response = await this.axiosInstance.post(
+      "/tts",
+      { text },
+      {
+        responseType: "arraybuffer",
+      }
+    );
     return response.data;
   }
 

@@ -10,11 +10,9 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.jarvis.controller",
-      "icon": "./assets/images/icons/ios-light.png",
-      "requireFullScreen": false,
+      "bundleIdentifier": "com.rovy.jarvis",
+      "icon": "./assets/ios.icon",
       "infoPlist": {
-        "NSBluetoothAlwaysUsageDescription": "Jarvis Controller uses Bluetooth to securely provision and connect to your Jarvis.",
         "NSMicrophoneUsageDescription": "Jarvis Controller uses your microphone to communicate with your Jarvis",
         "NSCameraUsageDescription": "Jarvis Controller uses your camera to detect hand gestures for interactive robot reactions.",
         "UISupportedInterfaceOrientations": [
@@ -32,15 +30,9 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "permissions": [
-        "android.permission.BLUETOOTH_SCAN",
-        "android.permission.BLUETOOTH_CONNECT",
-        "android.permission.BLUETOOTH",
-        "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.ACCESS_FINE_LOCATION"
-      ],
+      "permissions": ["android.permission.ACCESS_FINE_LOCATION"],
       "minSdkVersion": 23,
-      "package": "com.jarvis.controller"
+      "package": "com.rovy.jarvis"
     },
     "web": {
       "output": "static",
@@ -48,7 +40,6 @@
     },
     "plugins": [
       "expo-router",
-      "expo-screen-orientation",
       [
         "expo-av",
         {
@@ -71,17 +62,8 @@
         }
       ],
       "expo-secure-store",
-      [
-        "react-native-ble-plx",
-        {
-          "isBackgroundEnabled": true,
-          "modes": ["peripheral", "central"],
-          "bluetoothAlwaysPermission": "Allow Jarvis Controller to connect to bluetooth devices"
-        }
-      ],
-      "./plugins/withAndroidBlePermissions",
-      "./plugins/withAndroidBuildGradleTweaks",
-      "./plugins/withPodfileBleCleanup"
+      "expo-screen-orientation",
+      "./plugins/withAndroidBuildGradleTweaks"
     ],
     "experiments": {
       "typedRoutes": true,

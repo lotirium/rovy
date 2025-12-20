@@ -513,7 +513,10 @@ export class RobotAPI {
       if (deviceInfo.app_version) payload.app_version = deviceInfo.app_version;
     }
 
-    const response = await this.post<ClaimConfirmResponse>("/claim/confirm", payload);
+    const response = await this.post<ClaimConfirmResponse>(
+      "/claim/confirm",
+      payload
+    );
     if (response.error) {
       throw new Error(response.error);
     }

@@ -1,12 +1,8 @@
 const baseConfig = require("./app.json");
-const withAndroidBlePermissions = require("./plugins/withAndroidBlePermissions");
 const withAndroidBuildGradleTweaks = require("./plugins/withAndroidBuildGradleTweaks");
-const withPodfileBleCleanup = require("./plugins/withPodfileBleCleanup");
 
 const LOCAL_PLUGIN_MAP = {
-  "./plugins/withAndroidBlePermissions": withAndroidBlePermissions,
   "./plugins/withAndroidBuildGradleTweaks": withAndroidBuildGradleTweaks,
-  "./plugins/withPodfileBleCleanup": withPodfileBleCleanup,
 };
 
 module.exports = () => {

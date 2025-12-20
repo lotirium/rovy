@@ -129,7 +129,11 @@ export interface DiscoveryOptions {
   /** Maximum IPs to scan (default: 254) */
   maxHosts?: number;
   /** Callback for progress updates */
-  onProgress?: (scanned: number, total: number, found: DiscoveredRobot[]) => void;
+  onProgress?: (
+    scanned: number,
+    total: number,
+    found: DiscoveredRobot[]
+  ) => void;
   /** Abort signal to cancel discovery */
   signal?: AbortSignal;
 }
@@ -148,12 +152,7 @@ export interface DiscoveryResult {
 export async function discoverRobotsOnNetwork(
   options: DiscoveryOptions = {}
 ): Promise<DiscoveryResult> {
-  const {
-    port = DEFAULT_PORT,
-    maxHosts = 254,
-    onProgress,
-    signal,
-  } = options;
+  const { port = DEFAULT_PORT, maxHosts = 254, onProgress, signal } = options;
 
   const startTime = Date.now();
   const foundRobots: DiscoveredRobot[] = [];
@@ -250,14 +249,14 @@ export async function tryMdnsHostname(
 /**
  * Known Tailscale hostnames and IPs for ROVY robots.
  * Hostnames are more reliable than IPs as they don't change.
- * 
+ *
  * With MagicDNS enabled, short hostname works from any device on the tailnet.
  * Current robot: rovy-2.tail535f32.ts.net (100.72.107.106)
  */
 const KNOWN_TAILSCALE_HOSTS = [
-  "rovy-2",  // Short hostname (works with MagicDNS)
-  "rovy-2.tail535f32.ts.net",  // Full MagicDNS hostname
-  "100.72.107.106",  // Fallback to IP
+  "rovy-2", // Short hostname (works with MagicDNS)
+  "rovy-2.tail535f32.ts.net", // Full MagicDNS hostname
+  "100.72.107.106", // Fallback to IP
 ];
 
 /**
@@ -265,7 +264,7 @@ const KNOWN_TAILSCALE_HOSTS = [
  * These are tried in addition to subnet scanning.
  */
 const KNOWN_LOCAL_IPS = [
-  "172.19.24.56",  // ROVY Pi on UTD network
+  "172.19.24.56", // ROVY Pi on UTD network
 ];
 
 /**
@@ -276,7 +275,7 @@ export async function tryTailscaleHosts(
   port: number = DEFAULT_PORT
 ): Promise<DiscoveredRobot | null> {
   console.log("Trying Tailscale hosts:", KNOWN_TAILSCALE_HOSTS);
-  
+
   for (const host of KNOWN_TAILSCALE_HOSTS) {
     console.log(`  Probing Tailscale host: ${host}:${port}`);
     const robot = await probeHost(host, port);
@@ -285,7 +284,7 @@ export async function tryTailscaleHosts(
       return robot;
     }
   }
-  
+
   console.log("  ✗ No Tailscale hosts responded");
   return null;
 }
@@ -353,7 +352,9 @@ export async function discoverRobots(
       durationMs: Date.now() - startTime,
     };
   }
-  console.log("✗ Tailscale discovery failed - robot may not be on Tailscale network");
+  console.log(
+    "✗ Tailscale discovery failed - robot may not be on Tailscale network"
+  );
 
   // 3. Try known local IPs (for larger subnets like /19)
   console.log("Trying known local IPs...");
@@ -375,4 +376,3 @@ export async function discoverRobots(
   console.log("Falling back to subnet scan...");
   return discoverRobotsOnNetwork(options);
 }
-
